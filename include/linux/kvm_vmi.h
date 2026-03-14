@@ -96,6 +96,10 @@ struct kvm_vcpu_vmi {
 	wait_queue_head_t *ack_wqh;	/* ack_fd's waitqueue head */
 	wait_queue_head_t wq;
 
+	/* Fast singlestep: step one insn, then switch back to original view */
+	bool fast_singlestep_active;
+	u32  fast_singlestep_restore_view;
+
 	/* Lifecycle / teardown */
 	bool teardown;		/* ring deliver-fence: ring page freed */
 	bool session_teardown;	/* set only by kvm_vmi_release(); ring-scoped
@@ -131,6 +135,10 @@ int kvm_vmi_deliver_via_ring(struct kvm_vcpu *vcpu,
 /* View management */
 int kvm_vmi_vcpu_switch_view(struct kvm_vcpu *vcpu, u32 view_id);
 void kvm_vmi_propagate_change(struct kvm *kvm, gfn_t start, gfn_t end);
+
+/* Fast single-step (in-kernel) */
+void kvm_vmi_begin_fast_singlestep(struct kvm_vcpu *vcpu, u32 target_view);
+bool kvm_vmi_complete_fast_singlestep(struct kvm_vcpu *vcpu);
 
 /* Pause support (called from vcpu_run) */
 bool kvm_vmi_vcpu_paused(struct kvm_vcpu *vcpu);

@@ -200,6 +200,71 @@ void kvm_vmi_vcpu_destroy(struct kvm_vcpu *vcpu)
 	vcpu->vmi = NULL;
 }
 
+static int __kvm_vmi_vcpu_switch_view_locked(struct kvm_vcpu *vcpu, u32 view_id);
+
+/**
+ * kvm_vmi_begin_fast_singlestep - Arm a one-shot single-step in another view
+ * @vcpu: The vCPU to single-step.
+ * @target_view: View to run the single instruction in (0 = default/host view).
+ *
+ * Remembers the current view, arms a one-shot hardware single-step, and
+ * switches to @target_view. The vCPU executes one instruction there; the arch
+ * single-step handler then switches back to the remembered view and suppresses
+ * the single-step event. Used both by the KVM_VMI_RESPONSE_SINGLESTEP_FAST
+ * response.
+ *
+ * The whole arm sequence runs under view_lock so the snapshot of the current
+ * view (the restore target) and the switch to @target_view are atomic with
+ * respect to a concurrent VM-wide switch.
+ */
+void kvm_vmi_begin_fast_singlestep(struct kvm_vcpu *vcpu, u32 target_view)
+{
+	struct kvm_vcpu_vmi *vcpu_vmi = vcpu->vmi;
+
+	if (!vcpu_vmi)
+		return;
+
+	spin_lock(&vcpu_vmi->view_lock);
+	vcpu_vmi->fast_singlestep_active = true;
+	vcpu_vmi->fast_singlestep_restore_view = vcpu_vmi->current_view_id;
+	kvm_arch_vmi_set_singlestep(vcpu, true);
+	__kvm_vmi_vcpu_switch_view_locked(vcpu, target_view);
+	spin_unlock(&vcpu_vmi->view_lock);
+}
+
+/**
+ * kvm_vmi_complete_fast_singlestep - Finish an in-kernel fast single-step
+ * @vcpu: The vCPU whose single-step just completed.
+ *
+ * If a fast single-step is armed, switch back to the recorded restore view and
+ * disarm it. Runs under view_lock so the read of the restore target, the
+ * switch-back, and clearing the armed flag are atomic against a concurrent
+ * VM-wide switch, which thus either precedes this (and has redirected the
+ * restore target) or follows it (and sees the disarmed state) -- never landing
+ * mid-sequence to resurrect a refcount on a view being torn down.
+ *
+ * Return: true if a fast single-step was active and was completed here.
+ */
+bool kvm_vmi_complete_fast_singlestep(struct kvm_vcpu *vcpu)
+{
+	struct kvm_vcpu_vmi *vcpu_vmi = vcpu->vmi;
+	bool was_active;
+
+	if (!vcpu_vmi)
+		return false;
+
+	spin_lock(&vcpu_vmi->view_lock);
+	was_active = vcpu_vmi->fast_singlestep_active;
+	if (was_active) {
+		__kvm_vmi_vcpu_switch_view_locked(vcpu,
+					vcpu_vmi->fast_singlestep_restore_view);
+		vcpu_vmi->fast_singlestep_active = false;
+	}
+	spin_unlock(&vcpu_vmi->view_lock);
+
+	return was_active;
+}
+
 /**
  * kvm_vmi_apply_ring_response - Apply agent response from ring event
  * @vcpu: The vCPU whose event was processed.
@@ -213,6 +278,7 @@ static int kvm_vmi_apply_ring_response(struct kvm_vcpu *vcpu,
 {
 	u32 resp = READ_ONCE(event->response);
 	u32 event_type = event->type;
+	struct kvm_vcpu_vmi *vcpu_vmi = vcpu->vmi;
 
 	/* Mask to known flags */
 	resp &= KVM_VMI_RESPONSE_MASK;
@@ -229,7 +295,23 @@ static int kvm_vmi_apply_ring_response(struct kvm_vcpu *vcpu,
 	if (resp & KVM_VMI_RESPONSE_SINGLESTEP)
 		kvm_arch_vmi_set_singlestep(vcpu, true);
 
-	if (resp & KVM_VMI_RESPONSE_SWITCH_VIEW) {
+	/*
+	 * Fast singlestep: execute one instruction in a target view,
+	 * then auto-switch back and suppress the singlestep event.
+	 *
+	 * With SWITCH_VIEW: step in the specified view_id.
+	 * Without SWITCH_VIEW: step in view 0 (default/host view).
+	 */
+	if ((resp & KVM_VMI_RESPONSE_SINGLESTEP_FAST) && vcpu_vmi) {
+		u32 target_view;
+
+		if (resp & KVM_VMI_RESPONSE_SWITCH_VIEW)
+			target_view = READ_ONCE(event->view_id);
+		else
+			target_view = 0;
+
+		kvm_vmi_begin_fast_singlestep(vcpu, target_view);
+	} else if (resp & KVM_VMI_RESPONSE_SWITCH_VIEW) {
 		u32 view_id = READ_ONCE(event->view_id);
 
 		kvm_vmi_vcpu_switch_view(vcpu, view_id);
@@ -1335,6 +1417,23 @@ static int kvm_vmi_switch_view(struct kvm *kvm,
 
 		vcpu_vmi->current_view_id = sv->view_id;
 		rcu_assign_pointer(vcpu_vmi->current_view, new_view);
+
+		/*
+		 * A vCPU mid in-kernel fast-singlestep has snapshotted the view
+		 * to return to when the step completes. An explicit VM-wide
+		 * switch supersedes that intent: redirect the pending restore to
+		 * the new view so the completing step does not resurrect the
+		 * vCPU onto the view the agent just switched away from. Without
+		 * this, a teardown switch to view 0 is silently undone by the
+		 * restore, leaving the vCPU on the old (alternate) view after
+		 * breakpoint monitoring has been disabled, so the next planted
+		 * BRK is delivered to the guest instead of the agent and the
+		 * old view cannot be destroyed (its vcpu_count never drops).
+		 * The view_lock above makes this redirect atomic with the
+		 * completion's read of the restore target.
+		 */
+		if (vcpu_vmi->fast_singlestep_active)
+			vcpu_vmi->fast_singlestep_restore_view = sv->view_id;
 
 		/*
 		 * When switching back to view 0, ask the arch layer

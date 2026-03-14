@@ -126,6 +126,129 @@ static void test_session_close_frees(void)
 	pr_info("PASS: test_session_close_frees\n");
 }
 
+/*
+ * Test 4: Full shadow breakpoint workflow using alloc_gfn.
+ *
+ * Equivalent to vmi_breakpoint_workflow_test but uses ALLOC_GFN
+ * instead of vm_userspace_mem_region_add for the shadow page.
+ */
+#define FUNC_GPA	0x900000
+#define COUNTER_GPA	0x901000
+
+static const uint8_t func_code[] = {
+	0x48, 0xFF, 0x04, 0x25,
+	(COUNTER_GPA >>  0) & 0xFF,
+	(COUNTER_GPA >>  8) & 0xFF,
+	(COUNTER_GPA >> 16) & 0xFF,
+	(COUNTER_GPA >> 24) & 0xFF,
+	0xC3,
+};
+
+#define INT3_OPCODE 0xCC
+
+static void guest_bp_code(void)
+{
+	typedef void (*func_t)(void);
+	func_t fn = (func_t)FUNC_GPA;
+	volatile uint64_t *counter = (volatile uint64_t *)COUNTER_GPA;
+
+	GUEST_SYNC(1);
+
+	fn();
+	fn();
+
+	GUEST_SYNC(*counter);
+	GUEST_DONE();
+}
+
+static void test_shadow_breakpoint_workflow(void)
+{
+	struct kvm_vm *vm;
+	struct kvm_vcpu *vcpu;
+	struct vmi_test_ring ring;
+	struct vmi_vcpu_thread_arg targ;
+	pthread_t thread;
+	struct kvm_vmi_ring_event *ev;
+	int vmi_fd;
+	uint32_t clean_view_id, trap_view_id;
+	uint8_t *func_hva;
+	uint64_t *counter_hva;
+	uint64_t func_gfn = FUNC_GPA >> 12;
+	uint64_t shadow_gfn;
+	uint8_t *shadow_hva;
+	int bp_count = 0;
+
+	vm = vm_create_with_one_vcpu(&vcpu, guest_bp_code);
+	vmi_fd = vmi_create(vm);
+	vmi_setup_ring(vmi_fd, 0, &ring);
+
+	/* Map function code and counter pages */
+	vm_userspace_mem_region_add(vm, VM_MEM_SRC_ANONYMOUS,
+				    FUNC_GPA, 20, 1, 0);
+	virt_map(vm, FUNC_GPA, FUNC_GPA, 1);
+	vm_userspace_mem_region_add(vm, VM_MEM_SRC_ANONYMOUS,
+				    COUNTER_GPA, 21, 1, 0);
+	virt_map(vm, COUNTER_GPA, COUNTER_GPA, 1);
+
+	func_hva = addr_gpa2hva(vm, FUNC_GPA);
+	counter_hva = addr_gpa2hva(vm, COUNTER_GPA);
+	memcpy(func_hva, func_code, sizeof(func_code));
+	*counter_hva = 0;
+
+	/* Allocate shadow page via ALLOC_GFN (no memslot needed!) */
+	shadow_gfn = vmi_alloc_gfn(vmi_fd);
+
+	/* mmap shadow page, copy code, patch INT3 */
+	shadow_hva = mmap(NULL, getpagesize(), PROT_READ | PROT_WRITE,
+			  MAP_SHARED, vmi_fd, shadow_gfn * getpagesize());
+	TEST_ASSERT(shadow_hva != MAP_FAILED, "mmap shadow page failed");
+	memcpy(shadow_hva, func_code, sizeof(func_code));
+	shadow_hva[0] = INT3_OPCODE;
+	munmap(shadow_hva, getpagesize());
+
+	/* Create views and remap */
+	clean_view_id = vmi_create_view(vmi_fd, KVM_VMI_ACCESS_RWX);
+	trap_view_id = vmi_create_view(vmi_fd, KVM_VMI_ACCESS_RWX);
+	vmi_change_gfn(vmi_fd, trap_view_id, func_gfn, shadow_gfn);
+
+	vmi_control_event(vmi_fd, KVM_VMI_EVENT_BREAKPOINT, 1);
+	vmi_switch_view(vmi_fd, trap_view_id);
+
+	targ.vcpu = vcpu;
+	targ.done = 0;
+	pthread_create(&thread, NULL, vmi_vcpu_thread_fn, &targ);
+
+	while (!targ.done) {
+		ev = vmi_wait_event_timeout(&ring, 5000);
+		if (ev == NULL)
+			break;
+		TEST_ASSERT(ev->type == KVM_VMI_EVENT_BREAKPOINT,
+			    "Expected breakpoint, got %u", ev->type);
+		bp_count++;
+		ev->response = KVM_VMI_RESPONSE_SWITCH_VIEW |
+			       KVM_VMI_RESPONSE_SINGLESTEP_FAST;
+		ev->view_id = clean_view_id;
+		vmi_ack_event(&ring, 0);
+	}
+
+	pthread_join(thread, NULL);
+	TEST_ASSERT(targ.done, "Guest should have completed");
+	TEST_ASSERT(bp_count == 2, "Expected 2 breakpoints, got %d", bp_count);
+	TEST_ASSERT(*counter_hva == 2, "Counter=%lu, expected 2",
+		    (unsigned long)*counter_hva);
+
+	/* Clean up: revert remap, free shadow, destroy views */
+	vmi_change_gfn(vmi_fd, trap_view_id, func_gfn, KVM_VMI_INVALID_GFN);
+	vmi_free_gfn(vmi_fd, shadow_gfn);
+	vmi_switch_view(vmi_fd, 0);
+	vmi_destroy_view(vmi_fd, trap_view_id);
+	vmi_destroy_view(vmi_fd, clean_view_id);
+	vmi_teardown_ring(&ring);
+	close(vmi_fd);
+	kvm_vm_free(vm);
+	pr_info("PASS: test_shadow_breakpoint_workflow\n");
+}
+
 int main(int argc, char *argv[])
 {
 	TEST_REQUIRE(kvm_has_cap(KVM_CAP_VMI));
@@ -134,6 +257,7 @@ int main(int argc, char *argv[])
 	test_alloc_free();
 	test_free_while_remapped();
 	test_session_close_frees();
+	test_shadow_breakpoint_workflow();
 
 	return 0;
 }

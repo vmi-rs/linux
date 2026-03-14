@@ -554,8 +554,10 @@ void kvm_arch_vmi_reset_vcpu_state(struct kvm_vcpu *vcpu)
 {
 	struct kvm_vcpu_vmi *vcpu_vmi = vcpu->vmi;
 
-	if (vcpu_vmi)
+	if (vcpu_vmi) {
 		vcpu_vmi->arch.singlestep_active = false;
+		vcpu_vmi->fast_singlestep_active = false;
+	}
 }
 
 /*
@@ -807,6 +809,15 @@ int kvm_vmi_singlestep(struct kvm_vcpu *vcpu)
 
 	/* Disable MTF (one-shot: fires once per enable) */
 	kvm_arch_vmi_set_singlestep(vcpu, false);
+
+	/*
+	 * Fast singlestep: the guest executed one instruction in the
+	 * target view. Switch back to the original view and suppress
+	 * the singlestep event. Runs under the per-vCPU view_lock so the
+	 * switch-back cannot race a concurrent VM-wide KVM_VMI_SWITCH_VIEW.
+	 */
+	if (kvm_vmi_complete_fast_singlestep(vcpu))
+		return 1;
 
 	/* Deliver singlestep event if monitoring is enabled */
 	if (!kvm_vmi_event_enabled(vcpu, KVM_VMI_EVENT_SINGLESTEP))
