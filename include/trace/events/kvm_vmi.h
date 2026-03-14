@@ -138,6 +138,29 @@ TRACE_EVENT(kvm_vmi_view_switch,
 );
 
 /*
+ * Trace GFN remapping in a view.
+ */
+TRACE_EVENT(kvm_vmi_change_gfn,
+	TP_PROTO(__u32 view_id, __u64 old_gfn, __u64 new_gfn),
+	TP_ARGS(view_id, old_gfn, new_gfn),
+
+	TP_STRUCT__entry(
+		__field(__u32,	view_id)
+		__field(__u64,	old_gfn)
+		__field(__u64,	new_gfn)
+	),
+
+	TP_fast_assign(
+		__entry->view_id = view_id;
+		__entry->old_gfn = old_gfn;
+		__entry->new_gfn = new_gfn;
+	),
+
+	TP_printk("view %u gfn 0x%llx -> 0x%llx",
+		  __entry->view_id, __entry->old_gfn, __entry->new_gfn)
+);
+
+/*
  * Trace per-GFN memory access permission change.
  */
 TRACE_EVENT(kvm_vmi_set_mem_access,
