@@ -178,6 +178,108 @@ void kvm_vmi_handle_event_response(struct kvm_vcpu *vcpu, u32 event_type,
 	}
 }
 
+/**
+ * kvm_vmi_inject_event - Inject an exception, interrupt, or NMI
+ * @vcpu: The target vCPU.
+ * @inject: Injection parameters from userspace.
+ *
+ * Type values match the VMCS VM-entry interruption-information field encoding.
+ * Uses KVM's standard injection helpers to queue the event.
+ *
+ * Return: 0 on success, -EINVAL for invalid parameters.
+ */
+int kvm_vmi_inject_event(struct kvm_vcpu *vcpu,
+			 struct kvm_vmi_inject_event *inject)
+{
+	if (inject->pad)
+		return -EINVAL;
+
+	switch (inject->type) {
+	case KVM_VMI_EVENT_TYPE_EXT_INT:
+		/*
+		 * External interrupt - any vector 0-255, delivered as
+		 * a hardware interrupt (not soft). No insn_len needed.
+		 *
+		 * Intel SDM 26.3.1.4 requires RFLAGS.IF=1 for VM-entry
+		 * injection of external interrupts. Check here rather
+		 * than failing with a cryptic VM-entry failure.
+		 */
+		if (inject->insn_len != 0)
+			return -EINVAL;
+		if (!(kvm_get_rflags(vcpu) & X86_EFLAGS_IF))
+			return -EBUSY;
+		kvm_queue_interrupt(vcpu, inject->vector, false);
+		kvm_make_request(KVM_REQ_EVENT, vcpu);
+		break;
+	case KVM_VMI_EVENT_TYPE_NMI:
+		if (inject->insn_len != 0)
+			return -EINVAL;
+		kvm_inject_nmi(vcpu);
+		break;
+	case KVM_VMI_EVENT_TYPE_HW_EXCEPT:
+		if (inject->vector > 31)
+			return -EINVAL;
+		if (inject->insn_len != 0)
+			return -EINVAL;
+		/*
+		 * Enforce architectural error code rules: DF, TS, NP,
+		 * SS, GP, PF, AC must have error codes; all others
+		 * must not.
+		 */
+		if (inject->has_error !=
+		    x86_exception_has_error_code(inject->vector))
+			return -EINVAL;
+		if (inject->vector == PF_VECTOR) {
+			kvm_queue_exception_e_p(vcpu, PF_VECTOR,
+						inject->error_code,
+						inject->cr2);
+		} else if (inject->has_error) {
+			kvm_queue_exception_e(vcpu, inject->vector,
+					      inject->error_code);
+		} else {
+			kvm_queue_exception(vcpu, inject->vector);
+		}
+		break;
+	case KVM_VMI_EVENT_TYPE_SW_INT:
+		/*
+		 * Software interrupt (INT nn) - any vector 0-255.
+		 * Requires insn_len for VMCS VM-entry instruction
+		 * length. Uses KVM's soft interrupt injection path.
+		 *
+		 * SDM 26.3.1.5 prohibits injection of SW_INT when
+		 * blocking by STI or MOV SS is active.
+		 */
+		if (inject->insn_len < 1 || inject->insn_len > 15)
+			return -EINVAL;
+		vcpu->arch.event_exit_inst_len = inject->insn_len;
+		kvm_queue_interrupt(vcpu, inject->vector, true);
+		kvm_make_request(KVM_REQ_EVENT, vcpu);
+		break;
+	case KVM_VMI_EVENT_TYPE_PRIV_SW_INT:
+		return -EOPNOTSUPP;
+	case KVM_VMI_EVENT_TYPE_SW_EXCEPT:
+		/*
+		 * Software exceptions: #BP (INT3, vector 3) and
+		 * #OF (INTO, vector 4). Requires insn_len for the
+		 * VMCS VM-entry instruction length field.
+		 */
+		if (inject->vector != BP_VECTOR &&
+		    inject->vector != OF_VECTOR)
+			return -EINVAL;
+		if (inject->insn_len < 1 || inject->insn_len > 15)
+			return -EINVAL;
+		if (inject->has_error)
+			return -EINVAL;
+		vcpu->arch.event_exit_inst_len = inject->insn_len;
+		kvm_queue_exception(vcpu, inject->vector);
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
 bool kvm_arch_vmi_supported(void)
 {
 	return kvm_x86_call(vmi_has_cap)();

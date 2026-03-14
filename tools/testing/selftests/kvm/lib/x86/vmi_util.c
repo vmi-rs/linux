@@ -172,6 +172,27 @@ void vmi_unpause_vcpu(int vmi_fd, uint32_t vcpu_id)
 /*
  * Inject event helper.
  */
+void vmi_inject_event(int vmi_fd, uint32_t vcpu_id, uint8_t vector,
+		      uint8_t type, uint32_t error_code, int has_error,
+		      uint8_t insn_len)
+{
+	struct kvm_vmi_inject_event inject = {};
+	int ret;
+
+	inject.vcpu_id = vcpu_id;
+	inject.vector = vector;
+	inject.type = type;
+	inject.error_code = error_code;
+	inject.has_error = has_error;
+	inject.insn_len = insn_len;
+
+	ret = ioctl(vmi_fd, KVM_VMI_INJECT_EVENT, &inject);
+	TEST_ASSERT(ret == 0, "KVM_VMI_INJECT_EVENT failed: %d", ret);
+}
+
+/*
+ * Clean up ring resources.
+ */
 void vmi_teardown_ring(struct vmi_test_ring *r)
 {
 	if (r->ring && r->ring != MAP_FAILED)

@@ -43,6 +43,22 @@ static void test_cap_vmi(void)
 }
 
 /*
+ * Test 2: Sub-capabilities are reported
+ */
+static void test_sub_caps(void)
+{
+	TEST_ASSERT(kvm_check_cap(KVM_CAP_VMI_RING) > 0,
+		    "KVM_CAP_VMI_RING should be supported");
+	TEST_ASSERT(kvm_check_cap(KVM_CAP_VMI_GUEST_MMAP) > 0,
+		    "KVM_CAP_VMI_GUEST_MMAP should be supported");
+	TEST_ASSERT(kvm_check_cap(KVM_CAP_VMI_PAUSE) > 0,
+		    "KVM_CAP_VMI_PAUSE should be supported");
+	TEST_ASSERT(kvm_check_cap(KVM_CAP_VMI_INJECT) > 0,
+		    "KVM_CAP_VMI_INJECT should be supported");
+	pr_info("PASS: All VMI sub-capabilities are supported\n");
+}
+
+/*
  * Test 3: KVM_CREATE_VMI succeeds on a fresh VM and returns fd >= 0
  */
 static void test_vmi_create(void)
@@ -139,6 +155,7 @@ int main(int argc, char *argv[])
 	TEST_REQUIRE(kvm_has_cap(KVM_CAP_VMI));
 
 	test_cap_vmi();
+	test_sub_caps();
 	test_vmi_create();
 	test_vmi_create_twice();
 	test_vmi_create_close_recreate();
