@@ -99,6 +99,8 @@ int kvm_create_vmi(struct kvm *kvm)
 		goto err_rollback;
 	}
 
+	xa_init(&vmi->shadow_pages);
+	vmi->next_shadow_gfn = KVM_VMI_SHADOW_GFN_BASE;
 	mutex_unlock(&vmi->lock);
 
 	trace_kvm_vmi_session(true);
@@ -144,6 +146,7 @@ void kvm_vmi_destroy(struct kvm *kvm)
 		kvm_vmi_vcpu_destroy(vcpu);
 
 	rcu_assign_pointer(kvm->vmi, NULL);
+	xa_destroy(&vmi->shadow_pages);
 	kvm_arch_vmi_session_cleanup(vmi);
 	xa_destroy(&vmi->views);
 	mutex_destroy(&vmi->lock);
@@ -1513,6 +1516,65 @@ out:
 	return ret;
 }
 
+static int kvm_vmi_alloc_gfn(struct kvm *kvm, struct kvm_vmi_alloc_gfn *alloc)
+{
+	struct kvm_vmi *vmi = kvm->vmi;
+	struct page *page;
+	u64 shadow_gfn;
+	int ret;
+
+	if (!vmi)
+		return -EINVAL;
+
+	page = alloc_page(GFP_KERNEL_ACCOUNT | __GFP_ZERO);
+	if (!page)
+		return -ENOMEM;
+
+	mutex_lock(&vmi->lock);
+	shadow_gfn = vmi->next_shadow_gfn++;
+	ret = xa_err(xa_store(&vmi->shadow_pages, shadow_gfn, page, GFP_KERNEL));
+	mutex_unlock(&vmi->lock);
+
+	if (ret) {
+		__free_page(page);
+		return ret;
+	}
+
+	alloc->gfn = shadow_gfn;
+	return 0;
+}
+
+static int kvm_vmi_free_gfn(struct kvm *kvm, struct file *file,
+			    struct kvm_vmi_free_gfn *free_req)
+{
+	struct kvm_vmi *vmi = kvm->vmi;
+	struct page *page;
+
+	if (!vmi)
+		return -EINVAL;
+
+	if (free_req->gfn < KVM_VMI_SHADOW_GFN_BASE)
+		return -EINVAL;
+
+	mutex_lock(&vmi->lock);
+
+	page = xa_load(&vmi->shadow_pages, free_req->gfn);
+	if (!page) {
+		mutex_unlock(&vmi->lock);
+		return -ENOENT;
+	}
+
+	xa_erase(&vmi->shadow_pages, free_req->gfn);
+	mutex_unlock(&vmi->lock);
+
+	/* Forcibly unmap from any agent userspace mappings */
+	unmap_mapping_range(file->f_mapping,
+			    (loff_t)free_req->gfn << PAGE_SHIFT, PAGE_SIZE, 1);
+
+	__free_page(page);
+	return 0;
+}
+
 static void free_vcpu_vmi(struct rcu_head *head)
 {
 	kfree(container_of(head, struct kvm_vcpu_vmi, rcu_head));
@@ -1533,6 +1595,7 @@ static int kvm_vmi_release(struct inode *inode, struct file *file)
 	struct kvm_vcpu *vcpu;
 	struct kvm_vmi_view_data *view;
 	struct kvm_vmi *vmi;
+	struct page *page;
 	unsigned long i, index;
 	int srcu_idx;
 
@@ -1611,6 +1674,13 @@ static int kvm_vmi_release(struct inode *inode, struct file *file)
 	 */
 	write_lock(&kvm->mmu_lock);
 	write_unlock(&kvm->mmu_lock);
+
+	/* Free all shadow pages */
+	xa_for_each(&vmi->shadow_pages, index, page) {
+		xa_erase(&vmi->shadow_pages, index);
+		__free_page(page);
+	}
+	xa_destroy(&vmi->shadow_pages);
 
 	/*
 	 * Destroy all non-zero views. release runs with all vCPUs paused, so
@@ -1798,6 +1868,24 @@ static long kvm_vmi_ioctl(struct file *file, unsigned int ioctl,
 			return -EFAULT;
 		return kvm_vmi_set_mem_access(kvm, &ma);
 	}
+	case KVM_VMI_ALLOC_GFN: {
+		struct kvm_vmi_alloc_gfn alloc = {};
+		int r;
+
+		r = kvm_vmi_alloc_gfn(kvm, &alloc);
+		if (r)
+			return r;
+		if (copy_to_user(argp, &alloc, sizeof(alloc)))
+			return -EFAULT;
+		return 0;
+	}
+	case KVM_VMI_FREE_GFN: {
+		struct kvm_vmi_free_gfn free_req;
+
+		if (copy_from_user(&free_req, argp, sizeof(free_req)))
+			return -EFAULT;
+		return kvm_vmi_free_gfn(kvm, file, &free_req);
+	}
 	default:
 		return -ENOTTY;
 	}
@@ -1813,6 +1901,15 @@ static vm_fault_t kvm_vmi_guest_fault(struct vm_fault *vmf)
 	bool same_mm;
 	int srcu_idx;
 	int r;
+
+	/* Check if this is a VMI-allocated shadow page */
+	if (gfn >= KVM_VMI_SHADOW_GFN_BASE && kvm->vmi) {
+		page = xa_load(&kvm->vmi->shadow_pages, gfn);
+		if (!page)
+			return VM_FAULT_SIGBUS;
+		return vmf_insert_pfn(vmf->vma, vmf->address,
+				      page_to_pfn(page));
+	}
 
 	/* gfn_to_hva() walks the memslots; hold kvm->srcu across the lookup. */
 	srcu_idx = srcu_read_lock(&kvm->srcu);
