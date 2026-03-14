@@ -87,6 +87,8 @@ void kvm_vmi_capture_regs(struct kvm_vcpu *vcpu, struct kvm_vmi_regs *regs);
 void kvm_vmi_restore_regs(struct kvm_vcpu *vcpu, struct kvm_vmi_regs *regs);
 void kvm_vmi_handle_event_response(struct kvm_vcpu *vcpu,
 				   u32 event_type, u32 resp);
+int kvm_vmi_inject_event(struct kvm_vcpu *vcpu,
+			 struct kvm_vmi_inject_event *inject);
 
 /* Arch callbacks (generic -> arch contract) */
 bool kvm_arch_vmi_supported(void);
