@@ -81,6 +81,10 @@ struct kvm_vcpu_vmi {
 	wait_queue_head_t *ack_wqh;	/* ack_fd's waitqueue head */
 	wait_queue_head_t wq;
 
+	/* Fast singlestep: step one instruction then switch back to original view */
+	bool fast_singlestep_active;
+	u32  fast_singlestep_restore_view;
+
 	/* Lifecycle / teardown */
 	bool teardown;
 	atomic_t pause_count;

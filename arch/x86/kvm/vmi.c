@@ -642,8 +642,10 @@ void kvm_arch_vmi_reset_vcpu_state(struct kvm_vcpu *vcpu)
 {
 	struct kvm_vcpu_vmi *vcpu_vmi = vcpu->vmi;
 
-	if (vcpu_vmi)
+	if (vcpu_vmi) {
 		vcpu_vmi->arch.singlestep_active = false;
+		vcpu_vmi->fast_singlestep_active = false;
+	}
 }
 
 int kvm_arch_vmi_create_view(struct kvm *kvm, struct kvm_vmi_view_data *view)
@@ -768,11 +770,13 @@ EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_vmi_desc_intercept);
  * @vcpu: The vCPU that triggered the MTF exit.
  *
  * Called from handle_monitor_trap() when VMI singlestepping is active.
- * Disables MTF (one-shot behavior) and delivers the singlestep event
- * via the ring.
+ * Disables MTF (one-shot behavior). If this was a fast singlestep
+ * (SINGLESTEP_FAST response), switches back to the original view and
+ * suppresses the singlestep event. Otherwise delivers the event via ring.
  */
 int kvm_vmi_singlestep(struct kvm_vcpu *vcpu)
 {
+	struct kvm_vcpu_vmi *vcpu_vmi = vcpu->vmi;
 	struct kvm_vmi_ring_event ring_event = {};
 	struct x86_exception exception;
 	gva_t rip;
@@ -780,6 +784,18 @@ int kvm_vmi_singlestep(struct kvm_vcpu *vcpu)
 
 	/* Disable MTF (one-shot: fires once per enable) */
 	kvm_arch_vmi_set_singlestep(vcpu, false);
+
+	/*
+	 * Fast singlestep: the guest executed one instruction in the
+	 * target view. Switch back to the original view and suppress
+	 * the singlestep event.
+	 */
+	if (vcpu_vmi->fast_singlestep_active) {
+		kvm_vmi_vcpu_switch_view(vcpu,
+					 vcpu_vmi->fast_singlestep_restore_view);
+		vcpu_vmi->fast_singlestep_active = false;
+		return 1;
+	}
 
 	/* Deliver singlestep event if monitoring is enabled */
 	if (!kvm_vmi_event_enabled(vcpu, KVM_VMI_EVENT_SINGLESTEP))
