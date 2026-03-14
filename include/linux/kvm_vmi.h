@@ -154,6 +154,7 @@ int kvm_vmi_inject_event(struct kvm_vcpu *vcpu,
 
 /* Arch callbacks (generic -> arch contract) */
 bool kvm_arch_vmi_supported(void);
+bool kvm_arch_vmi_has_paging_write(void);
 bool kvm_arch_vmi_has_auto_step(void);
 
 void kvm_arch_vmi_session_init(struct kvm_vmi *vmi);

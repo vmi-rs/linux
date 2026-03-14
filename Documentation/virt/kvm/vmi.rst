@@ -146,6 +146,14 @@ with ``-EOPNOTSUPP`` (see the per-ioctl descriptions).
    * - ``KVM_CAP_VMI_ALLOC_GFN``
      - 505
      - Shadow-frame allocation for guest-frame remapping workflows.
+   * - ``KVM_CAP_VMI_EPT_PW``
+     - 506
+     - EPT paging-write (A/D-bit) monitoring. Requires CPU support for the
+       tertiary execution control.
+
+``KVM_CAP_VMI``, ``_RING``, ``_GUEST_MMAP``, ``_PAUSE``, ``_INJECT`` and
+``_ALLOC_GFN`` all report the same underlying support value on a given host.
+``KVM_CAP_VMI_EPT_PW`` is reported independently.
 
 Configuration: ``CONFIG_KVM_VMI`` depends on ``KVM_INTEL && X86_64`` (no SVM/AMD
 support).
@@ -895,6 +903,11 @@ Access flags:
    * - ``KVM_VMI_ACCESS_X``
      - 1 << 2
      - Allow execute
+   * - ``KVM_VMI_ACCESS_PW``
+     - 1 << 3
+     - Allow CPU paging-write (A/D-bit updates) without a violation while
+       software writes still trap. Requires ``KVM_CAP_VMI_EPT_PW``; otherwise
+       ``-EOPNOTSUPP``.
 
 Convenience combinations ``KVM_VMI_ACCESS_RW/RX/WX/RWX`` are also defined.
 
