@@ -158,6 +158,7 @@ TEST_GEN_PROGS_x86 += system_counter_offset_test
 TEST_GEN_PROGS_x86 += pre_fault_memory_test
 TEST_GEN_PROGS_x86 += x86/vmi_basic_test
 TEST_GEN_PROGS_x86 += x86/vmi_ring_test
+TEST_GEN_PROGS_x86 += x86/vmi_guest_mmap_test
 TEST_GEN_PROGS_x86 += x86/vmi_lifecycle_test
 
 # Compiled outputs used by test targets

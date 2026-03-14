@@ -134,6 +134,9 @@ with ``-EOPNOTSUPP`` (see the per-ioctl descriptions).
    * - ``KVM_CAP_VMI_RING``
      - 501
      - Ring-based event delivery (per-vCPU shared rings + eventfd).
+   * - ``KVM_CAP_VMI_GUEST_MMAP``
+     - 502
+     - Guest physical memory mapping via ``vmi_fd`` mmap.
 
 Configuration: ``CONFIG_KVM_VMI`` depends on ``KVM_INTEL && X86_64`` (no SVM/AMD
 support).
@@ -452,4 +455,44 @@ up. The ``arch`` union carries event-specific parameters (x86 CR/MSR). ``-EINVAL
 implicitly enabled and fires whenever a vCPU on an alternate view touches a
 frame whose per-view permissions deny the access (section 7). Configure it with
 ``KVM_VMI_SET_MEM_ACCESS``.
+
+8. Guest memory access
+======================
+
+Guest physical memory is mapped into the agent by calling ``mmap()`` on the
+``vmi_fd`` with the offset equal to the guest physical address::
+
+    /* map 4 KiB at guest physical address 0x1000 */
+    void *page = mmap(NULL, PAGE_SIZE, PROT_READ | PROT_WRITE,
+                      MAP_SHARED, vmi_fd, 0x1000);
+
+The mapping is fault-based: a page is resolved on first access (no pages are
+pinned at mmap time). For a normal GFN the kernel resolves the host page through
+the VM owner's address space; for an unbacked or invalid GFN the access faults
+with ``SIGBUS``. Shadow frames (``>= KVM_VMI_SHADOW_GFN_BASE``) are accessible
+through the same mmap at offset ``shadow_gfn << PAGE_SHIFT``, letting the agent
+write patched code into them.
+
+The mapping uses ``VM_PFNMAP``, so mapped pages do not count toward the agent's
+RSS. ``mmap`` requires an active session (else ``-EINVAL``). Requires
+``KVM_CAP_VMI_GUEST_MMAP``.
+
+**KVM_VMI_GET_MEM_INFO** (``_IOR(KVMIO, 0xee, struct kvm_vmi_mem_info)``)
+
+:Type: vmi_fd ioctl
+:Parameters: ``struct kvm_vmi_mem_info`` (OUT)
+:Returns: 0 on success, < 0 on error
+
+::
+
+    struct kvm_vmi_mem_info {
+        __u64 max_gfn;   /* exclusive upper-bound GFN of guest RAM */
+        __u64 pad;
+    };
+
+Reports the guest RAM extent so the agent can avoid faulting unbacked frames.
+``max_gfn`` is the **exclusive** upper bound, computed as the maximum of
+``base_gfn + npages`` over all memslots; frames at or above ``max_gfn`` are not
+backed by guest RAM. KVM has no memslot-enumeration ioctl, so this is the
+agent's way to learn the layout the VMM programmed.
 

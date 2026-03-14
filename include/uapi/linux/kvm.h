@@ -992,6 +992,7 @@ struct kvm_enable_cap {
 #define KVM_CAP_S390_KEYOP 247
 #define KVM_CAP_VMI 500
 #define KVM_CAP_VMI_RING         501
+#define KVM_CAP_VMI_GUEST_MMAP   502
 
 struct kvm_irq_routing_irqchip {
 	__u32 irqchip;
