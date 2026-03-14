@@ -126,6 +126,49 @@ static void test_destroy_without_release(void)
 	pr_info("PASS: vmi_destroy_without_release\n");
 }
 
+/*
+ * Test 6: Release with active views and shadow pages.
+ *
+ * Creates alternate views and allocates shadow GFNs, then closes
+ * vmi_fd.  Release must destroy views and free shadow pages.
+ */
+static void test_release_with_views(void)
+{
+	struct kvm_vm *vm;
+	struct kvm_vcpu *vcpu;
+	struct vmi_test_ring ring;
+	int vmi_fd;
+	uint32_t view1, view2;
+	uint64_t shadow1, shadow2;
+
+	vmi_fd = vmi_test_setup(&vm, &vcpu, guest_counter, &ring);
+
+	/* Create views */
+	view1 = vmi_create_view(vmi_fd, KVM_VMI_ACCESS_RWX);
+	view2 = vmi_create_view(vmi_fd, KVM_VMI_ACCESS_RWX);
+	TEST_ASSERT(view1 > 0, "View 1 should have non-zero ID");
+	TEST_ASSERT(view2 > 0, "View 2 should have non-zero ID");
+
+	/* Allocate shadow GFNs */
+	shadow1 = vmi_alloc_gfn(vmi_fd);
+	shadow2 = vmi_alloc_gfn(vmi_fd);
+
+	/* Set some per-view memory access permissions */
+	vmi_set_mem_access(vmi_fd, view1, 0, KVM_VMI_ACCESS_R);
+	vmi_set_mem_access(vmi_fd, view2, 0, KVM_VMI_ACCESS_RW);
+
+	/*
+	 * Close vmi_fd with views, shadow pages, and access overrides
+	 * all active.  Release must clean up everything.
+	 */
+	vmi_teardown_ring(&ring);
+	close(vmi_fd);
+
+	/* VM should still be usable after release */
+	kvm_vm_free(vm);
+	pr_info("PASS: vmi_release_with_views\n");
+}
+
 int main(int argc, char *argv[])
 {
 	TEST_REQUIRE(kvm_has_cap(KVM_CAP_VMI));
@@ -133,6 +176,7 @@ int main(int argc, char *argv[])
 
 	test_release_while_paused();
 	test_destroy_without_release();
+	test_release_with_views();
 
 	return 0;
 }

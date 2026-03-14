@@ -191,6 +191,30 @@ void vmi_set_mem_access(int vmi_fd, uint32_t view_id, uint64_t gfn,
 	TEST_ASSERT(ret == 0, "KVM_VMI_SET_MEM_ACCESS failed: %d", ret);
 }
 
+uint64_t vmi_alloc_gfn(int vmi_fd)
+{
+	struct kvm_vmi_alloc_gfn alloc = {};
+	int ret;
+
+	ret = ioctl(vmi_fd, KVM_VMI_ALLOC_GFN, &alloc);
+	TEST_ASSERT(ret == 0,
+		    "KVM_VMI_ALLOC_GFN failed: %d (errno=%d)", ret, errno);
+	return alloc.gfn;
+}
+
+void vmi_free_gfn(int vmi_fd, uint64_t gfn)
+{
+	struct kvm_vmi_free_gfn free_req = { .gfn = gfn };
+	int ret;
+
+	ret = ioctl(vmi_fd, KVM_VMI_FREE_GFN, &free_req);
+	TEST_ASSERT(ret == 0,
+		    "KVM_VMI_FREE_GFN failed: %d (errno=%d)", ret, errno);
+}
+
+/*
+ * Pause/unpause helpers.
+ */
 void vmi_pause_vm(int vmi_fd)
 {
 	int ret;
