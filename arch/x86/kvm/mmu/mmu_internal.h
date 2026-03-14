@@ -4,6 +4,7 @@
 
 #include <linux/types.h>
 #include <linux/kvm_host.h>
+#include <linux/kvm_vmi.h>
 #include <asm/kvm_host.h>
 
 #include "mmu.h"
@@ -288,6 +289,15 @@ struct kvm_page_fault {
 	 * is changing its own translation in the guest page tables.
 	 */
 	bool write_fault_to_shadow_pgtable;
+
+#ifdef CONFIG_KVM_VMI
+	/*
+	 * VMI access mask for this GFN in the current view (combination
+	 * of KVM_VMI_ACCESS_R/W/X). Set by kvm_vmi_setup_page_fault()
+	 * for alternate views; 0 means no VMI restriction.
+	 */
+	u8 vmi_access;
+#endif
 };
 
 int kvm_tdp_page_fault(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault);
@@ -372,6 +382,15 @@ static inline int kvm_mmu_do_page_fault(struct kvm_vcpu *vcpu, gpa_t cr2_or_gpa,
 		fault.gfn = gpa_to_gfn(fault.addr) & ~kvm_gfn_direct_bits(vcpu->kvm);
 		fault.slot = kvm_vcpu_gfn_to_memslot(vcpu, fault.gfn);
 	}
+
+#ifdef CONFIG_KVM_VMI
+	/*
+	 * For alternate VMI views, resolve the access restrictions for
+	 * this GFN. The TDP MMU will use vmi_access to restrict the
+	 * SPTE permissions when installing the mapping.
+	 */
+	kvm_vmi_setup_page_fault(vcpu, &fault);
+#endif
 
 	/*
 	 * With retpoline being active an indirect call is rather expensive,

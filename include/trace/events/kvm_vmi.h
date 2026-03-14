@@ -8,10 +8,14 @@
 #undef TRACE_SYSTEM
 #define TRACE_SYSTEM kvm_vmi
 
+#define kvm_vmi_event_types				\
+	{ KVM_VMI_EVENT_MEM_ACCESS,	"mem_access" }
+
 #define kvm_vmi_response_flags				\
 	{ KVM_VMI_RESPONSE_DENY,		"DENY" },	\
 	{ KVM_VMI_RESPONSE_SET_REGS,		"SET_REGS" },	\
-	{ KVM_VMI_RESPONSE_SWITCH_VIEW,		"SWITCH_VIEW" }
+	{ KVM_VMI_RESPONSE_SWITCH_VIEW,		"SWITCH_VIEW" },\
+	{ KVM_VMI_RESPONSE_EMULATE,		"EMULATE" }
 
 #define kvm_vmi_access_flags					\
 	{ KVM_VMI_ACCESS_R,		"R" },			\
@@ -56,9 +60,9 @@ TRACE_EVENT(kvm_vmi_event_deliver,
 		__entry->data = data;
 	),
 
-	TP_printk("vcpu %u event %u data 0x%llx",
+	TP_printk("vcpu %u %s data 0x%llx",
 		  __entry->vcpu_id,
-		  __entry->event_type,
+		  __print_symbolic(__entry->event_type, kvm_vmi_event_types),
 		  __entry->data)
 );
 
@@ -81,9 +85,9 @@ TRACE_EVENT(kvm_vmi_event_response,
 		__entry->response = response;
 	),
 
-	TP_printk("vcpu %u event %u response %s",
+	TP_printk("vcpu %u %s response %s",
 		  __entry->vcpu_id,
-		  __entry->event_type,
+		  __print_symbolic(__entry->event_type, kvm_vmi_event_types),
 		  __print_flags(__entry->response, "|", kvm_vmi_response_flags))
 );
 
@@ -173,6 +177,57 @@ TRACE_EVENT(kvm_vmi_view_switch,
 
 	TP_printk("vcpu %u view %u -> %u",
 		  __entry->vcpu_id, __entry->old_view, __entry->new_view)
+);
+
+/*
+ * Trace per-GFN memory access permission change.
+ */
+TRACE_EVENT(kvm_vmi_set_mem_access,
+	TP_PROTO(__u32 view_id, __u64 gfn, __u8 access),
+	TP_ARGS(view_id, gfn, access),
+
+	TP_STRUCT__entry(
+		__field(__u32,	view_id)
+		__field(__u64,	gfn)
+		__field(__u8,	access)
+	),
+
+	TP_fast_assign(
+		__entry->view_id = view_id;
+		__entry->gfn = gfn;
+		__entry->access = access;
+	),
+
+	TP_printk("view %u gfn 0x%llx access %s",
+		  __entry->view_id, __entry->gfn,
+		  __print_flags(__entry->access, "|", kvm_vmi_access_flags))
+);
+
+/*
+ * Trace memory access violations detected by VMI.
+ */
+TRACE_EVENT(kvm_vmi_mem_violation,
+	TP_PROTO(unsigned int vcpu_id, __u64 gpa, __u8 required, __u8 allowed),
+	TP_ARGS(vcpu_id, gpa, required, allowed),
+
+	TP_STRUCT__entry(
+		__field(unsigned int,	vcpu_id)
+		__field(__u64,		gpa)
+		__field(__u8,		required)
+		__field(__u8,		allowed)
+	),
+
+	TP_fast_assign(
+		__entry->vcpu_id = vcpu_id;
+		__entry->gpa = gpa;
+		__entry->required = required;
+		__entry->allowed = allowed;
+	),
+
+	TP_printk("vcpu %u gpa 0x%llx required %s allowed %s",
+		  __entry->vcpu_id, __entry->gpa,
+		  __print_flags(__entry->required, "|", kvm_vmi_access_flags),
+		  __print_flags(__entry->allowed, "|", kvm_vmi_access_flags))
 );
 
 #endif /* _TRACE_KVM_VMI_H */
