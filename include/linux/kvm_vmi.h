@@ -27,6 +27,9 @@ struct eventfd_ctx;
  * @dying: Set under vmi->lock before xa_erase to back off the lock-free view
  *	switch from incrementing vcpu_count on a view committed to free.
  * @access_overrides: Xarray mapping GFN -> u8 access permissions.
+ * @gfn_overrides: Xarray mapping GFN -> HPA for change_gfn remappings.
+ * @gfn_override_pages: Xarray mapping GFN -> struct page* pinning non-shadow
+ *	change_gfn remap targets; dropped on revert/destroy.
  * @arch: Architecture-specific view data.
  * @rcu_head: Deferred free via call_srcu(&kvm->srcu): the struct must outlive
  *	an SRCU grace period for lock-free fault-path readers.
@@ -38,6 +41,8 @@ struct kvm_vmi_view_data {
 	bool visible;
 	bool dying;
 	struct xarray access_overrides;
+	struct xarray gfn_overrides;
+	struct xarray gfn_override_pages;
 	struct kvm_arch_vmi_view arch;
 	struct rcu_head rcu_head;	/* deferred free via call_srcu */
 };
@@ -124,6 +129,7 @@ int kvm_vmi_deliver_via_ring(struct kvm_vcpu *vcpu,
 
 /* View management */
 int kvm_vmi_vcpu_switch_view(struct kvm_vcpu *vcpu, u32 view_id);
+void kvm_vmi_propagate_change(struct kvm *kvm, gfn_t start, gfn_t end);
 
 /* Pause support (called from vcpu_run) */
 bool kvm_vmi_vcpu_paused(struct kvm_vcpu *vcpu);
@@ -167,6 +173,9 @@ void kvm_arch_vmi_invalidate_gfn(struct kvm *kvm,
 void kvm_arch_vmi_invalidate_gfn_locked(struct kvm *kvm,
 					 struct kvm_vmi_view_data *view,
 					 gfn_t gfn);
+void kvm_arch_vmi_invalidate_gfn_revert(struct kvm *kvm,
+					struct kvm_vmi_view_data *view,
+					gfn_t gfn);
 
 #else /* !CONFIG_KVM_VMI */
 
