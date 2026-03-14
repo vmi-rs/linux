@@ -492,6 +492,59 @@ void kvm_vmi_vcpu_pause_wait(struct kvm_vcpu *vcpu)
 	vcpu_load(vcpu);
 }
 
+/**
+ * kvm_vmi_propagate_change - Invalidate view EPT entries when host mapping changes
+ * @kvm: The VM whose views to update.
+ * @start: Start GFN of the invalidated range.
+ * @end: End GFN (exclusive) of the invalidated range.
+ *
+ * Called from the mmu_notifier path when host memory mappings change
+ * (page migration, swap, etc). Zaps the affected GFN entries in all
+ * alternate views so they get lazily re-populated with the new HPAs.
+ *
+ * Remapped GFNs (via change_gfn) are skipped since they intentionally
+ * point to different physical pages.
+ *
+ * Invoked from the shared kvm_mmu_unmap_gfn_range() handler under
+ * kvm->mmu_lock. The srcu rationale for the kvm_vmi_get() read is at the
+ * lock below.
+ */
+void kvm_vmi_propagate_change(struct kvm *kvm, gfn_t start, gfn_t end)
+{
+	struct kvm_vmi *vmi;
+	struct kvm_vmi_view_data *view;
+	unsigned long index;
+	gfn_t gfn;
+	int srcu_idx;
+
+	/*
+	 * kvm_vmi_get() srcu_dereferences kvm->vmi, which mmu_lock alone does
+	 * not protect against the synchronize_srcu()-gated free in
+	 * kvm_vmi_release(). Some callers (e.g. the guest_memfd invalidate
+	 * path) reach here under mmu_lock only, so take kvm->srcu locally; it
+	 * is non-blocking under mmu_lock and nests harmlessly otherwise.
+	 */
+	srcu_idx = srcu_read_lock(&kvm->srcu);
+	vmi = kvm_vmi_get(kvm);
+	if (!vmi)
+		goto out;
+
+	/* TODO: batched range zap instead of per-GFN walks for large ranges */
+	xa_for_each(&vmi->views, index, view) {
+		if (!kvm_arch_vmi_view_has_root(view))
+			continue;
+		for (gfn = start; gfn < end; gfn++) {
+			/* Skip remapped GFNs - they have intentional overrides */
+			if (xa_load(&view->gfn_overrides, gfn))
+				continue;
+
+			kvm_arch_vmi_invalidate_gfn_locked(kvm, view, gfn);
+		}
+	}
+out:
+	srcu_read_unlock(&kvm->srcu, srcu_idx);
+}
+
 /*
  * vmi_fd ioctl handlers
  */
@@ -1029,6 +1082,17 @@ static int kvm_vmi_inject_event_ioctl(struct kvm *kvm,
 	return r;
 }
 
+/* Drop all non-shadow target pins held by a view and free the tracking xarray. */
+static void kvm_vmi_drop_override_pins(struct kvm_vmi_view_data *view)
+{
+	struct page *page;
+	unsigned long idx;
+
+	xa_for_each(&view->gfn_override_pages, idx, page)
+		put_page(page);
+	xa_destroy(&view->gfn_override_pages);
+}
+
 /**
  * kvm_vmi_create_view - Create an alternate memory view
  * @kvm: The target VM.
@@ -1061,10 +1125,14 @@ static int kvm_vmi_create_view(struct kvm *kvm, struct kvm_vmi_view *uview)
 	view->default_access = uview->default_access;
 	view->visible = true;
 	xa_init(&view->access_overrides);
+	xa_init(&view->gfn_overrides);
+	xa_init(&view->gfn_override_pages);
 
 	/* Allocate arch-specific EPT root */
 	ret = kvm_arch_vmi_create_view(kvm, view);
 	if (ret) {
+		kvm_vmi_drop_override_pins(view);
+		xa_destroy(&view->gfn_overrides);
 		xa_destroy(&view->access_overrides);
 		kfree(view);
 		return ret;
@@ -1078,6 +1146,8 @@ static int kvm_vmi_create_view(struct kvm *kvm, struct kvm_vmi_view *uview)
 
 	if (ret) {
 		kvm_arch_vmi_destroy_view(kvm, view);
+		kvm_vmi_drop_override_pins(view);
+		xa_destroy(&view->gfn_overrides);
 		xa_destroy(&view->access_overrides);
 		kfree(view);
 		return ret;
@@ -1101,6 +1171,8 @@ static void free_view(struct rcu_head *rcu)
 	struct kvm_vmi_view_data *view =
 		container_of(rcu, struct kvm_vmi_view_data, rcu_head);
 
+	kvm_vmi_drop_override_pins(view);
+	xa_destroy(&view->gfn_overrides);
 	xa_destroy(&view->access_overrides);
 	kfree(view);
 }
@@ -1548,7 +1620,10 @@ static int kvm_vmi_free_gfn(struct kvm *kvm, struct file *file,
 			    struct kvm_vmi_free_gfn *free_req)
 {
 	struct kvm_vmi *vmi = kvm->vmi;
+	struct kvm_vmi_view_data *view;
 	struct page *page;
+	unsigned long view_idx;
+	hpa_t shadow_hpa;
 
 	if (!vmi)
 		return -EINVAL;
@@ -1564,6 +1639,21 @@ static int kvm_vmi_free_gfn(struct kvm *kvm, struct file *file,
 		return -ENOENT;
 	}
 
+	shadow_hpa = page_to_phys(page);
+
+	/* Check if any view's gfn_overrides references this page */
+	xa_for_each(&vmi->views, view_idx, view) {
+		void *entry;
+		unsigned long gfn;
+
+		xa_for_each(&view->gfn_overrides, gfn, entry) {
+			if ((hpa_t)(unsigned long)entry == shadow_hpa) {
+				mutex_unlock(&vmi->lock);
+				return -EBUSY;
+			}
+		}
+	}
+
 	xa_erase(&vmi->shadow_pages, free_req->gfn);
 	mutex_unlock(&vmi->lock);
 
@@ -1573,6 +1663,150 @@ static int kvm_vmi_free_gfn(struct kvm *kvm, struct file *file,
 
 	__free_page(page);
 	return 0;
+}
+
+/**
+ * kvm_vmi_change_gfn - Remap a GFN in an alternate view
+ * @kvm: The target VM.
+ * @change: Change descriptor with view_id, old_gfn, new_gfn.
+ *
+ * Maps old_gfn to the physical page backing new_gfn in this view.
+ * When new_gfn is KVM_VMI_INVALID_GFN, reverts to the host mapping.
+ *
+ * This is the core mechanism for shadow page breakpoints:
+ *   1. Allocate shadow GFN, copy original page
+ *   2. Patch shadow page (e.g., insert INT3)
+ *   3. change_gfn(view, original_gfn, shadow_gfn)
+ *   4. Guest on this view now sees shadow page at original_gfn
+ *
+ * Return: 0 on success, negative errno on failure.
+ */
+static int kvm_vmi_change_gfn(struct kvm *kvm, struct kvm_vmi_change_gfn *change)
+{
+	struct page *refcounted_page = NULL;
+	struct kvm_vmi *vmi = kvm->vmi;
+	struct kvm_vmi_view_data *view;
+	struct kvm_memory_slot *slot;
+	struct page *shadow;
+	struct page *prev;
+	bool writable;
+	kvm_pfn_t pfn;
+	hpa_t new_hpa;
+	int srcu_idx;
+	int err;
+
+	if (!vmi)
+		return -EINVAL;
+
+	if (change->view_id == 0)
+		return -EINVAL; /* Cannot remap in host view */
+
+	/*
+	 * Hold vmi->lock for the whole view lifetime and kvm->srcu for the
+	 * memslot lookup/faultin below. kvm_vmi_destroy_view() erases the view
+	 * under vmi->lock and frees it (and its arch stage-2 root) right after,
+	 * so without the lock this otherwise lock-free xa_load() + dereference
+	 * races the free -> use-after-free in the arch invalidate path (proven
+	 * by vmi_change_gfn_uaf_test; KASAN slab-use-after-free in
+	 * __unmap_stage2_range). gfn_to_memslot()/__kvm_faultin_pfn() require
+	 * the SRCU read side so the memslots array cannot be swapped under us.
+	 */
+	srcu_idx = srcu_read_lock(&kvm->srcu);
+	mutex_lock(&vmi->lock);
+
+	view = xa_load(&vmi->views, change->view_id);
+	if (!view) {
+		err = -ENOENT;
+		goto out;
+	}
+
+	trace_kvm_vmi_change_gfn(change->view_id, change->old_gfn,
+				 change->new_gfn);
+
+	if (change->new_gfn == KVM_VMI_INVALID_GFN) {
+		/* Revert: remove remapping, restore host mapping */
+		prev = xa_erase(&view->gfn_override_pages, change->old_gfn);
+		xa_erase(&view->gfn_overrides, change->old_gfn);
+		if (prev)
+			put_page(prev);
+
+		if (kvm_arch_vmi_view_has_root(view))
+			kvm_arch_vmi_invalidate_gfn_revert(kvm, view,
+							   change->old_gfn);
+		kvm_flush_remote_tlbs(kvm);
+		err = 0;
+		goto out;
+	}
+
+	/*
+	 * Resolve new_gfn to HPA. If new_gfn is a VMI-allocated shadow
+	 * page, use it directly. Otherwise resolve via host memslots.
+	 */
+	if (change->new_gfn >= KVM_VMI_SHADOW_GFN_BASE) {
+		shadow = xa_load(&vmi->shadow_pages, change->new_gfn);
+		if (!shadow) {
+			err = -ENOENT;
+			goto out;
+		}
+		new_hpa = page_to_phys(shadow);
+	} else {
+		slot = gfn_to_memslot(kvm, change->new_gfn);
+		if (!slot) {
+			err = -EFAULT;
+			goto out;
+		}
+
+		pfn = __kvm_faultin_pfn(slot, change->new_gfn, 0,
+					&writable, &refcounted_page);
+		if (is_error_noslot_pfn(pfn)) {
+			err = -EFAULT;
+			goto out;
+		}
+		new_hpa = (hpa_t)pfn << PAGE_SHIFT;
+	}
+
+	/* Drop any prior non-shadow pin before overwriting this GFN. */
+	prev = xa_erase(&view->gfn_override_pages, change->old_gfn);
+	if (prev)
+		put_page(prev);
+
+	/* Store the remapping: old_gfn -> new_hpa */
+	xa_store(&view->gfn_overrides, change->old_gfn,
+		 (void *)(unsigned long)new_hpa, GFP_KERNEL);
+
+	/*
+	 * Pin a non-shadow target for the override's lifetime by retaining the
+	 * faultin ref (recorded in gfn_override_pages). The mmu_notifier skips
+	 * remapped GFNs, so without this the stored HPA could go stale on
+	 * migration/swap. Shadow targets (refcounted_page == NULL) are already
+	 * pinned kernel pages.
+	 */
+	if (refcounted_page) {
+		err = xa_err(xa_store(&view->gfn_override_pages,
+				      change->old_gfn, refcounted_page,
+				      GFP_KERNEL));
+		if (err) {
+			xa_erase(&view->gfn_overrides, change->old_gfn);
+			put_page(refcounted_page);
+			refcounted_page = NULL;
+			goto out;
+		}
+		refcounted_page = NULL;	/* ref transferred to the xarray */
+	}
+
+	/* Zap old mapping so next fault installs with remap PFN */
+	if (kvm_arch_vmi_view_has_root(view))
+		kvm_arch_vmi_invalidate_gfn(kvm, view, change->old_gfn);
+
+	kvm_flush_remote_tlbs(kvm);
+	err = 0;
+
+out:
+	mutex_unlock(&vmi->lock);
+	srcu_read_unlock(&kvm->srcu, srcu_idx);
+	if (refcounted_page)
+		put_page(refcounted_page);
+	return err;
 }
 
 static void free_vcpu_vmi(struct rcu_head *head)
@@ -1885,6 +2119,13 @@ static long kvm_vmi_ioctl(struct file *file, unsigned int ioctl,
 		if (copy_from_user(&free_req, argp, sizeof(free_req)))
 			return -EFAULT;
 		return kvm_vmi_free_gfn(kvm, file, &free_req);
+	}
+	case KVM_VMI_CHANGE_GFN: {
+		struct kvm_vmi_change_gfn change;
+
+		if (copy_from_user(&change, argp, sizeof(change)))
+			return -EFAULT;
+		return kvm_vmi_change_gfn(kvm, &change);
 	}
 	default:
 		return -ENOTTY;
