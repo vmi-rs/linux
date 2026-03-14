@@ -157,6 +157,9 @@ int kvm_arch_vmi_control_event(struct kvm *kvm,
 			       struct kvm_vmi_control_event *ctrl);
 void kvm_arch_vmi_update(struct kvm *kvm);
 
+void kvm_arch_vmi_set_singlestep(struct kvm_vcpu *vcpu, bool enable);
+void kvm_arch_vmi_restore_singlestep(struct kvm_vcpu *vcpu);
+
 /* Shed/re-take per-vCPU read locks the arch holds, around a VMI op that
  * blocks the vCPU thread. */
 void kvm_arch_vmi_block_begin(struct kvm_vcpu *vcpu);

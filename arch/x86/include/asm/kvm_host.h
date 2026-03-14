@@ -1973,6 +1973,7 @@ struct kvm_x86_ops {
 	void (*vmi_destroy_view)(struct kvm *kvm, struct kvm_vmi_view_data *view);
 	void (*vmi_switch_view)(struct kvm_vcpu *vcpu,
 				struct kvm_vmi_view_data *view);
+	void (*vmi_set_singlestep)(struct kvm_vcpu *vcpu, bool enable);
 #endif
 };
 

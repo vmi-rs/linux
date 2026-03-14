@@ -5496,6 +5496,18 @@ void vmx_vmi_apply_vmcs_state(struct kvm_vcpu *vcpu)
 	vmx_vmi_update_cr3_intercept(vcpu,
 				     kvm_vmi_cr3_intercept(vcpu->kvm));
 
+	/*
+	 * Monitor Trap Flag: controlled by singlestep_active (per-vCPU).
+	 * Write the VMCS bit directly - the enable/disable helpers have
+	 * guards that skip writes when the in-memory state already matches,
+	 * but apply_vmcs_state is the sync point where we materialize
+	 * in-memory state into VMCS, so we must write unconditionally.
+	 */
+	if (vcpu_vmi->arch.singlestep_active)
+		exec_controls_setbit(to_vmx(vcpu), CPU_BASED_MONITOR_TRAP_FLAG);
+	else
+		exec_controls_clearbit(to_vmx(vcpu), CPU_BASED_MONITOR_TRAP_FLAG);
+
 	/* Descriptor table exiting: VM-wide config */
 	vmx_vmi_set_desc_exiting(vcpu, kvm_vmi_desc_intercept(vcpu->kvm));
 
@@ -5604,6 +5616,29 @@ void vmx_vmi_switch_view(struct kvm_vcpu *vcpu,
 
 	/* Flush TLB to pick up the new EPTP */
 	kvm_make_request(KVM_REQ_TLB_FLUSH_GUEST, vcpu);
+}
+
+/**
+ * vmx_vmi_set_singlestep - Enable or disable MTF for VMI singlestepping
+ * @vcpu: The vCPU to update.
+ * @enable: true to enable, false to disable.
+ *
+ * Sets/clears the Monitor Trap Flag in the VMCS primary processor-based
+ * controls. MTF causes a VM-exit after executing exactly one guest instruction.
+ */
+void vmx_vmi_set_singlestep(struct kvm_vcpu *vcpu, bool enable)
+{
+	struct vcpu_vmx *vmx = to_vmx(vcpu);
+	struct kvm_vcpu_vmi *vcpu_vmi = vcpu->vmi;
+
+	if (!vcpu_vmi || vcpu_vmi->arch.singlestep_active == enable)
+		return;
+
+	if (enable)
+		exec_controls_setbit(vmx, CPU_BASED_MONITOR_TRAP_FLAG);
+	else
+		exec_controls_clearbit(vmx, CPU_BASED_MONITOR_TRAP_FLAG);
+	vcpu_vmi->arch.singlestep_active = enable;
 }
 #endif
 
@@ -6522,6 +6557,10 @@ static int handle_pause(struct kvm_vcpu *vcpu)
 
 static int handle_monitor_trap(struct kvm_vcpu *vcpu)
 {
+#ifdef CONFIG_KVM_VMI
+	if (vcpu->vmi && vcpu->vmi->arch.singlestep_active)
+		return kvm_vmi_singlestep(vcpu);
+#endif
 	return 1;
 }
 
