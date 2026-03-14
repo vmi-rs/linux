@@ -4662,6 +4662,18 @@ static int kvm_mmu_faultin_pfn(struct kvm_vcpu *vcpu,
 	fault->mmu_seq = vcpu->kvm->mmu_invalidate_seq;
 	smp_rmb();
 
+#ifdef CONFIG_KVM_VMI
+	/*
+	 * For VMI GFN remaps, skip expensive host PFN resolution and use
+	 * the pre-resolved PFN set by kvm_vmi_setup_page_fault().
+	 */
+	if (fault->vmi_pfn_valid) {
+		fault->pfn = fault->vmi_pfn;
+		fault->map_writable = true;
+		return RET_PF_CONTINUE;
+	}
+#endif
+
 	/*
 	 * Now that we have a snapshot of mmu_invalidate_seq we can check for a
 	 * private vs. shared mismatch.

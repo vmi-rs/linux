@@ -38,6 +38,11 @@
 #define KVM_VMI_ACCESS_DEFAULT		0xff  /* Use view's default access */
 
 /*
+ * Special GFN value indicating "revert to host mapping"
+ */
+#define KVM_VMI_INVALID_GFN		(~(__u64)0)
+
+/*
  * Base GFN for VMI-allocated shadow pages. Shadow GFNs live in a
  * reserved range above guest physical memory and are backed by
  * kernel-allocated pages rather than guest memslots.
@@ -62,6 +67,7 @@
 #define KVM_VMI_SET_MEM_ACCESS    _IOW(KVMIO,  0xf8, struct kvm_vmi_mem_access)
 #define KVM_VMI_ALLOC_GFN         _IOWR(KVMIO, 0xf9, struct kvm_vmi_alloc_gfn)
 #define KVM_VMI_FREE_GFN          _IOW(KVMIO,  0xfa, struct kvm_vmi_free_gfn)
+#define KVM_VMI_CHANGE_GFN        _IOW(KVMIO,  0xfb, struct kvm_vmi_change_gfn)
 
 /* Ring event response flags (bitmask, combinable) */
 #define KVM_VMI_RESPONSE_CONTINUE          (0)  /* Default: proceed with normal handling */
@@ -205,6 +211,21 @@ struct kvm_vmi_alloc_gfn {
 
 struct kvm_vmi_free_gfn {
 	__u64 gfn;	/* in: shadow GFN to free */
+};
+
+/**
+ * struct kvm_vmi_change_gfn - Remap a GFN in an alternate view
+ * @view_id: Target view (must not be 0).
+ * @pad: Reserved padding, must be zero.
+ * @old_gfn: The GFN whose mapping to override.
+ * @new_gfn: The GFN whose backing page should be used instead.
+ *           Set to KVM_VMI_INVALID_GFN to revert to host mapping.
+ */
+struct kvm_vmi_change_gfn {
+	__u32 view_id;
+	__u32 pad;
+	__u64 old_gfn;
+	__u64 new_gfn;
 };
 
 /*

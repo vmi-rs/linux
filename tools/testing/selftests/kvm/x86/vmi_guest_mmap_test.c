@@ -283,6 +283,54 @@ static void test_guest_mmap_large_range(void)
 	kvm_vm_free(vm);
 	pr_info("PASS: test_guest_mmap_large_range\n");
 }
+
+/*
+ * Test 6: Create a view, remap a GFN to a shadow page, verify
+ * mmap on original GFN sees original data (not shadow).
+ * vmi_fd mmap reflects host memslots, not view overrides.
+ */
+static void test_guest_mmap_gfn_remap(void)
+{
+	struct kvm_vm *vm;
+	struct kvm_vcpu *vcpu;
+	int vmi_fd;
+	void *hva_orig, *hva_shadow, *mapped;
+	uint32_t view_id;
+	uint64_t val;
+
+	vm = vm_create_with_one_vcpu(&vcpu, guest_read_test_page);
+	vmi_fd = vmi_create(vm);
+
+	vm_userspace_mem_region_add(vm, VM_MEM_SRC_ANONYMOUS,
+				    TEST_GPA, TEST_MEMSLOT, 1, 0);
+	vm_userspace_mem_region_add(vm, VM_MEM_SRC_ANONYMOUS,
+				    SHADOW_GPA, SHADOW_MEMSLOT, 1, 0);
+
+	hva_orig = addr_gpa2hva(vm, TEST_GPA);
+	*(uint64_t *)hva_orig = 0x1111111111111111ULL;
+
+	hva_shadow = addr_gpa2hva(vm, SHADOW_GPA);
+	*(uint64_t *)hva_shadow = 0x2222222222222222ULL;
+
+	view_id = vmi_create_view(vmi_fd, KVM_VMI_ACCESS_RWX);
+	vmi_change_gfn(vmi_fd, view_id, TEST_GFN, SHADOW_GFN);
+
+	mapped = mmap(NULL, getpagesize(), PROT_READ, MAP_SHARED,
+		      vmi_fd, TEST_GFN * getpagesize());
+	TEST_ASSERT(mapped != MAP_FAILED,
+		    "mmap via vmi_fd failed: errno=%d", errno);
+
+	val = *(volatile uint64_t *)mapped;
+	TEST_ASSERT(val == 0x1111111111111111ULL,
+		    "mmap should see original (0x1111...), got 0x%lx", val);
+
+	munmap(mapped, getpagesize());
+	vmi_destroy_view(vmi_fd, view_id);
+	close(vmi_fd);
+	kvm_vm_free(vm);
+	pr_info("PASS: test_guest_mmap_gfn_remap\n");
+}
+
 int main(int argc, char *argv[])
 {
 	TEST_REQUIRE(kvm_has_cap(KVM_CAP_VMI));
@@ -293,6 +341,7 @@ int main(int argc, char *argv[])
 	test_guest_mmap_invalid_gfn();
 	test_guest_mmap_unmap_remap();
 	test_guest_mmap_large_range();
+	test_guest_mmap_gfn_remap();
 
 	return 0;
 }

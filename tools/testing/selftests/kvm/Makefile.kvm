@@ -170,6 +170,7 @@ TEST_GEN_PROGS_x86 += x86/vmi_inject_test
 TEST_GEN_PROGS_x86 += x86/vmi_alloc_gfn_test
 TEST_GEN_PROGS_x86 += x86/vmi_default_access_test
 TEST_GEN_PROGS_x86 += x86/vmi_lifecycle_test
+TEST_GEN_PROGS_x86 += x86/vmi_hugepage_remap_test
 TEST_GEN_PROGS_x86 += x86/vmi_teardown_race_test
 
 # Compiled outputs used by test targets
