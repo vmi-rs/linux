@@ -30,6 +30,7 @@
 #define KVM_VMI_ACCESS_R		(1 << 0)
 #define KVM_VMI_ACCESS_W		(1 << 1)
 #define KVM_VMI_ACCESS_X		(1 << 2)
+#define KVM_VMI_ACCESS_PW		(1 << 3)  /* Allow CPU paging-write (A/D updates) */
 #define KVM_VMI_ACCESS_RW		(KVM_VMI_ACCESS_R | KVM_VMI_ACCESS_W)
 #define KVM_VMI_ACCESS_RX		(KVM_VMI_ACCESS_R | KVM_VMI_ACCESS_X)
 #define KVM_VMI_ACCESS_WX		(KVM_VMI_ACCESS_W | KVM_VMI_ACCESS_X)

@@ -525,6 +525,11 @@ bool kvm_arch_vmi_supported(void)
 	return kvm_x86_call(vmi_has_cap)();
 }
 
+bool kvm_arch_vmi_has_paging_write(void)
+{
+	return kvm_x86_call(vmi_has_ept_paging_write)();
+}
+
 /*
  * x86 EPT uses 4K leaves matching the guest granule, so a view's per-GFN
  * protection never spills onto neighbor guest pages -- there is no fusion to

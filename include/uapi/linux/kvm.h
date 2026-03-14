@@ -996,6 +996,7 @@ struct kvm_enable_cap {
 #define KVM_CAP_VMI_PAUSE        503
 #define KVM_CAP_VMI_INJECT       504
 #define KVM_CAP_VMI_ALLOC_GFN   505
+#define KVM_CAP_VMI_EPT_PW      506
 
 struct kvm_irq_routing_irqchip {
 	__u32 irqchip;

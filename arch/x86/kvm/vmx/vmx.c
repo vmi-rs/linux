@@ -4772,6 +4772,15 @@ static u64 vmx_tertiary_exec_control(struct vcpu_vmx *vmx)
 	if (!enable_ipiv || !kvm_vcpu_apicv_active(&vmx->vcpu))
 		exec_control &= ~TERTIARY_EXEC_IPI_VIRT;
 
+	/*
+	 * EPT paging-write allows hardware page-table walker writes (A/D
+	 * bit updates) to read-only EPT entries. Only enable when EPT is
+	 * active and a VMI session exists, as bit 58 in EPT leaf entries
+	 * gains hardware semantics when this control is set.
+	 */
+	if (!cpu_has_vmx_ept() || !vmx->vcpu.vmi)
+		exec_control &= ~TERTIARY_EXEC_EPT_PAGING_WRITE;
+
 	return exec_control;
 }
 
@@ -5516,6 +5525,18 @@ void vmx_vmi_apply_vmcs_state(struct kvm_vcpu *vcpu)
 
 	/* MSR write intercepts: VM-wide config */
 	vmx_vmi_apply_msr_intercepts(vcpu);
+
+	/*
+	 * Tertiary execution controls: recalculate to pick up
+	 * TERTIARY_EXEC_EPT_PAGING_WRITE state changes. This control
+	 * is enabled only when a VMI session is active and the hardware
+	 * supports it. vmx_tertiary_exec_control() checks vcpu->vmi (per-vCPU VMI state).
+	 */
+	if (cpu_has_tertiary_exec_ctrls()) {
+		struct vcpu_vmx *vmx = to_vmx(vcpu);
+
+		tertiary_exec_controls_set(vmx, vmx_tertiary_exec_control(vmx));
+	}
 
 	/*
 	 * EPTP for current view. Only write EPTP when the vCPU is on an

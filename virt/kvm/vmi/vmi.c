@@ -84,6 +84,13 @@ int kvm_create_vmi(struct kvm *kvm)
 			goto err_rollback;
 	}
 
+	/*
+	 * Request VMCS recalculation on all vCPUs so tertiary execution
+	 * controls pick up the new VMI session state (e.g., enabling
+	 * TERTIARY_EXEC_EPT_PAGING_WRITE when supported by hardware).
+	 */
+	kvm_arch_vmi_update(kvm);
+
 	mutex_unlock(&kvm->lock);
 
 	/* Create the session fd */
@@ -1198,6 +1205,11 @@ static int kvm_vmi_create_view(struct kvm *kvm, struct kvm_vmi_view *uview)
 	if (!vmi)
 		return -EINVAL;
 
+	/* Reject PW flag in default_access when hardware doesn't support it */
+	if ((uview->default_access & KVM_VMI_ACCESS_PW) &&
+	    !kvm_arch_vmi_has_paging_write())
+		return -EOPNOTSUPP;
+
 	/* Reject W without R - EPT cannot encode this combination */
 	if ((uview->default_access & KVM_VMI_ACCESS_W) &&
 	    !(uview->default_access & KVM_VMI_ACCESS_R))
@@ -1575,6 +1587,11 @@ out:
 
 static int kvm_vmi_validate_access(u8 access)
 {
+	/* Reject PW flag when hardware doesn't support EPT paging-write */
+	if ((access & KVM_VMI_ACCESS_PW) &&
+	    !kvm_arch_vmi_has_paging_write())
+		return -EOPNOTSUPP;
+
 	/* Reject W without R - EPT cannot encode this combination */
 	if ((access & KVM_VMI_ACCESS_W) && !(access & KVM_VMI_ACCESS_R))
 		return -EINVAL;

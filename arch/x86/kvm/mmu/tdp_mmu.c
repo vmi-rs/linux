@@ -1210,6 +1210,22 @@ static int tdp_mmu_map_handle_target_level(struct kvm_vcpu *vcpu,
 				   iter->gfn, fault->pfn, iter->old_spte,
 				   fault->prefetch, false,
 				   fault->map_writable, &new_spte);
+
+#ifdef CONFIG_KVM_VMI
+		/*
+		 * Set EPT paging-write bit (bit 58) whenever KVM_VMI_ACCESS_PW
+		 * is set for this GFN.  This lets the CPU update guest
+		 * page-table A/D bits without triggering EPT violations.
+		 * When KVM_VMI_ACCESS_W is absent, normal software writes
+		 * are still trapped via the missing W bit.
+		 *
+		 * The TERTIARY_EXEC_EPT_PAGING_WRITE VMCS control must
+		 * be enabled for bit 58 to have hardware semantics; the
+		 * kernel validates this when the agent sets PW access.
+		 */
+		if (fault->vmi_access & KVM_VMI_ACCESS_PW)
+			new_spte |= VMX_EPT_PAGING_WRITE_BIT;
+#endif
 	}
 
 	if (new_spte == iter->old_spte)

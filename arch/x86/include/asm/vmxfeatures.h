@@ -89,5 +89,6 @@
 #define VMX_FEATURE_NOTIFY_VM_EXITING	( 2*32+ 31) /* "notify_vm_exiting" VM-Exit when no event windows after notify window */
 
 /* Tertiary Processor-Based VM-Execution Controls, word 3 */
+#define VMX_FEATURE_EPT_PAGING_WRITE	( 3*32+  2) /* "ept_paging_write" EPT paging-write */
 #define VMX_FEATURE_IPI_VIRT		( 3*32+  4) /* "ipi_virt" Enable IPI virtualization */
 #endif /* _ASM_X86_VMXFEATURES_H */
