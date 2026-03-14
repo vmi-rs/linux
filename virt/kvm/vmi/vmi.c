@@ -719,6 +719,37 @@ out_srcu:
 	return r;
 }
 
+/*
+ * KVM_VMI_GET_MEM_INFO: report the guest RAM extent.
+ *
+ * Returns the exclusive upper-bound GFN of guest RAM, the maximum of
+ * base_gfn + npages over all memslots. The agent rejects reads of frames at or
+ * above this bound (which the VMM did not back with RAM) instead of faulting
+ * the vmi_fd mmap. KVM has no memslot-enumeration ioctl, so the agent cannot
+ * otherwise learn the layout the VMM programmed.
+ */
+static int kvm_vmi_get_mem_info(struct kvm *kvm, struct kvm_vmi_mem_info *info)
+{
+	struct kvm_memory_slot *memslot;
+	struct kvm_memslots *slots;
+	gfn_t max_gfn = 0;
+	int bkt, idx;
+
+	idx = srcu_read_lock(&kvm->srcu);
+	slots = kvm_memslots(kvm);
+	kvm_for_each_memslot(memslot, bkt, slots) {
+		gfn_t end = memslot->base_gfn + memslot->npages;
+
+		if (end > max_gfn)
+			max_gfn = end;
+	}
+	srcu_read_unlock(&kvm->srcu, idx);
+
+	info->max_gfn = max_gfn;
+	info->pad = 0;
+	return 0;
+}
+
 static void free_vcpu_vmi(struct rcu_head *head)
 {
 	kfree(container_of(head, struct kvm_vcpu_vmi, rcu_head));
@@ -849,14 +880,108 @@ static long kvm_vmi_ioctl(struct file *file, unsigned int ioctl,
 			return -EFAULT;
 		return kvm_vmi_control_event(kvm, &ctrl);
 	}
+	case KVM_VMI_GET_MEM_INFO: {
+		struct kvm_vmi_mem_info info = {};
+		int r;
+
+		r = kvm_vmi_get_mem_info(kvm, &info);
+		if (r)
+			return r;
+		if (copy_to_user(argp, &info, sizeof(info)))
+			return -EFAULT;
+		return 0;
+	}
 	default:
 		return -ENOTTY;
 	}
+}
+
+static vm_fault_t kvm_vmi_guest_fault(struct vm_fault *vmf)
+{
+	struct kvm *kvm = vmf->vma->vm_private_data;
+	gfn_t gfn = vmf->pgoff;
+	unsigned long hva;
+	struct page *page;
+	vm_fault_t ret;
+	bool same_mm;
+	int srcu_idx;
+	int r;
+
+	/* gfn_to_hva() walks the memslots; hold kvm->srcu across the lookup. */
+	srcu_idx = srcu_read_lock(&kvm->srcu);
+	hva = gfn_to_hva(kvm, gfn);
+	srcu_read_unlock(&kvm->srcu, srcu_idx);
+	if (kvm_is_error_hva(hva))
+		return VM_FAULT_SIGBUS;
+
+	/*
+	 * Resolve the guest page via the VM owner's address space.
+	 *
+	 * Use vmf_insert_pfn() rather than returning the page via
+	 * vmf->page to avoid RSS counter mismatches: foreign anonymous
+	 * pages returned via vmf->page are accounted as MM_SHMEMPAGES
+	 * on fault (swapbacked), but classified as MM_ANONPAGES on
+	 * unmap (folio_test_anon), causing "Bad rss-counter state"
+	 * warnings on process exit. PFN mappings bypass RSS accounting.
+	 *
+	 * get_user_pages_remote() with locked==NULL requires mmap_lock held but
+	 * does not drop it. The page-fault path that invokes this .fault handler
+	 * already holds the faulting VMA's mm (vmf->vma->vm_mm) mmap_lock for
+	 * read. So when GUP below would walk that very mm -- i.e. kvm->mm ==
+	 * vmf->vma->vm_mm, the single-process case where one task both created
+	 * the VM and mmap'd its own guest memory (the selftests) -- re-taking it
+	 * here would be a recursive read_lock (deadlock-prone if a writer queues).
+	 * Only acquire it when GUP walks a different mm than the fault path holds
+	 * -- the normal reactor case, where a separate agent process maps and
+	 * faults the guest's memory.
+	 *
+	 * Key the test on vmf->vma->vm_mm (the mm whose mmap_lock the fault path
+	 * actually holds), NOT current->mm (the faulting *task*). They coincide
+	 * for every path that can reach here today: a VM_PFNMAP VMA is faulted
+	 * only by a direct CPU access in the task's own address space, because GUP
+	 * rejects VM_PFNMAP in check_vma_flags() before ever calling .fault, so no
+	 * foreign-current remote faulter (process_vm_readv, /proc/pid/mem, ptrace)
+	 * reaches this handler. But vmf->vma->vm_mm is the only correct expression
+	 * of "is the lock already held": should the VMA's flags or vm_ops ever
+	 * change to admit a remote faulter, current->mm would mis-detect the held
+	 * lock and reintroduce the recursive read_lock.
+	 */
+	same_mm = kvm->mm == vmf->vma->vm_mm;
+	if (!same_mm)
+		mmap_read_lock(kvm->mm);
+	r = get_user_pages_remote(kvm->mm, hva, 1,
+				  FOLL_WRITE, &page, NULL);
+	if (!same_mm)
+		mmap_read_unlock(kvm->mm);
+	if (r < 0)
+		return VM_FAULT_SIGBUS;
+
+	ret = vmf_insert_pfn(vmf->vma, vmf->address, page_to_pfn(page));
+	put_page(page);
+	return ret;
+}
+
+static const struct vm_operations_struct kvm_vmi_guest_vm_ops = {
+	.fault = kvm_vmi_guest_fault,
+};
+
+static int kvm_vmi_mmap(struct file *file, struct vm_area_struct *vma)
+{
+	struct kvm *kvm = file->private_data;
+
+	if (!kvm->vmi)
+		return -EINVAL;
+
+	vma->vm_ops = &kvm_vmi_guest_vm_ops;
+	vma->vm_private_data = kvm;
+	vm_flags_set(vma, VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP);
+	return 0;
 }
 
 static const struct file_operations kvm_vmi_fops = {
 	.owner = THIS_MODULE,
 	.release = kvm_vmi_release,
 	.unlocked_ioctl = kvm_vmi_ioctl,
+	.mmap = kvm_vmi_mmap,
 	.llseek = noop_llseek,
 };
