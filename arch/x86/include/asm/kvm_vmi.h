@@ -56,6 +56,7 @@ struct kvm_arch_vmi {
  * @cr_event_new_val: New CR value saved for CONTINUE.
  * @bp_insn_length: INT3 instruction length for #BP reinject.
  * @dbg_dr6: DR6 value for #DB reinject.
+ * @singlestep_active: Whether MTF singlestepping is currently active in VMCS.
  */
 struct kvm_arch_vcpu_vmi {
 	gpa_t emul_gpa;
@@ -65,6 +66,7 @@ struct kvm_arch_vcpu_vmi {
 	u64 cr_event_new_val;
 	u32 bp_insn_length;
 	u64 dbg_dr6;
+	bool singlestep_active;
 };
 
 #ifdef CONFIG_KVM_VMI
@@ -90,6 +92,7 @@ bool kvm_vmi_bp_intercept(struct kvm *kvm);
 bool kvm_vmi_desc_intercept(struct kvm *kvm);
 
 /* Event handlers - VM-exit intercepts (arch/x86/kvm/vmi.c) */
+int kvm_vmi_singlestep(struct kvm_vcpu *vcpu);
 int kvm_vmi_cr_write(struct kvm_vcpu *vcpu, int cr_num, u64 old_val,
 		     u64 new_val);
 int kvm_vmi_msr_write(struct kvm_vcpu *vcpu, u32 msr, u64 old_val, u64 new_val);

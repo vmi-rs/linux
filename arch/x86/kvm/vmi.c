@@ -374,6 +374,9 @@ void kvm_vmi_handle_event_response(struct kvm_vcpu *vcpu, u32 event_type,
 		if (resp & KVM_VMI_RESPONSE_EMULATE)
 			handle_emulate(vcpu);
 		break;
+	case KVM_VMI_EVENT_SINGLESTEP:
+		/* No special response handling for singlestep */
+		break;
 	case KVM_VMI_EVENT_CR:
 		handle_cr_response(vcpu, resp);
 		break;
@@ -555,6 +558,10 @@ void kvm_arch_vmi_session_reset(struct kvm_vmi *vmi)
  */
 void kvm_arch_vmi_reset_vcpu_state(struct kvm_vcpu *vcpu)
 {
+	struct kvm_vcpu_vmi *vcpu_vmi = vcpu->vmi;
+
+	if (vcpu_vmi)
+		vcpu_vmi->arch.singlestep_active = false;
 }
 
 /*
@@ -642,6 +649,20 @@ void kvm_arch_vmi_update(struct kvm *kvm)
 		kvm_make_request(KVM_REQ_VMI_UPDATE, vcpu);
 		kvm_vcpu_kick(vcpu);
 	}
+}
+
+void kvm_arch_vmi_set_singlestep(struct kvm_vcpu *vcpu, bool enable)
+{
+	kvm_x86_call(vmi_set_singlestep)(vcpu, enable);
+}
+
+/*
+ * No-op on x86: VMI single-step does not mask guest interrupts, so there is no
+ * per-session CPU state to restore synchronously on teardown. See the arm64
+ * implementation and kvm_vmi_release().
+ */
+void kvm_arch_vmi_restore_singlestep(struct kvm_vcpu *vcpu)
+{
 }
 
 /*
@@ -772,6 +793,43 @@ bool kvm_vmi_desc_intercept(struct kvm *kvm)
 	return vmi && (vmi->enabled_events & BIT_ULL(KVM_VMI_EVENT_DESC_ACCESS));
 }
 EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_vmi_desc_intercept);
+
+/* Event handlers */
+
+/**
+ * kvm_vmi_singlestep - Handle an MTF VM-exit for VMI singlestepping
+ * @vcpu: The vCPU that triggered the MTF exit.
+ *
+ * Called from handle_monitor_trap() when VMI singlestepping is active.
+ * Disables MTF (one-shot behavior). If this was a fast singlestep
+ * (SINGLESTEP_FAST response), switches back to the original view and
+ * suppresses the singlestep event. Otherwise delivers the event via ring.
+ */
+int kvm_vmi_singlestep(struct kvm_vcpu *vcpu)
+{
+	struct kvm_vmi_ring_event ring_event = {};
+	struct x86_exception exception;
+	gva_t rip;
+	gpa_t gpa;
+
+	/* Disable MTF (one-shot: fires once per enable) */
+	kvm_arch_vmi_set_singlestep(vcpu, false);
+
+	/* Deliver singlestep event if monitoring is enabled */
+	if (!kvm_vmi_event_enabled(vcpu, KVM_VMI_EVENT_SINGLESTEP))
+		return 1; /* Resume guest */
+
+	rip = kvm_get_linear_rip(vcpu);
+	gpa = kvm_mmu_gva_to_gpa_fetch(vcpu, rip, &exception);
+
+	ring_event.type = KVM_VMI_EVENT_SINGLESTEP;
+	ring_event.vcpu_id = vcpu->vcpu_id;
+	ring_event.singlestep.gpa = gpa;
+	trace_kvm_vmi_event_deliver(vcpu->vcpu_id, KVM_VMI_EVENT_SINGLESTEP, gpa);
+	kvm_vmi_deliver_via_ring(vcpu, &ring_event);
+	return 1;
+}
+EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_vmi_singlestep);
 
 /**
  * kvm_vmi_cr_write - Check if a CR write should generate a VMI event
