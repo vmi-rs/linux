@@ -47,7 +47,9 @@ struct kvm_vcpu_vmi {
 	wait_queue_head_t wq;
 
 	/* Lifecycle / teardown */
-	bool teardown;
+	bool teardown;		/* ring deliver-fence: ring page freed */
+	bool session_teardown;	/* set only by kvm_vmi_release(); ring-scoped
+				 * @teardown must not drive the pause escape */
 	atomic_t pause_count;
 	wait_queue_head_t pause_wq;
 
@@ -65,6 +67,8 @@ bool kvm_vmi_has_cap(void);
 /* Session lifecycle */
 int kvm_create_vmi(struct kvm *kvm);
 void kvm_vmi_destroy(struct kvm *kvm);
+int kvm_vmi_pause_vm(struct kvm *kvm);
+int kvm_vmi_unpause_vm(struct kvm *kvm);
 
 /* vCPU lifecycle */
 int kvm_vmi_vcpu_init(struct kvm_vcpu *vcpu);
@@ -73,6 +77,10 @@ void kvm_vmi_vcpu_destroy(struct kvm_vcpu *vcpu);
 /* Event delivery */
 int kvm_vmi_deliver_via_ring(struct kvm_vcpu *vcpu,
 			     struct kvm_vmi_ring_event *event);
+
+/* Pause support (called from vcpu_run) */
+bool kvm_vmi_vcpu_paused(struct kvm_vcpu *vcpu);
+void kvm_vmi_vcpu_pause_wait(struct kvm_vcpu *vcpu);
 
 /* Per-arch functions (implemented per-arch, not a generic->arch contract) */
 void kvm_vmi_capture_regs(struct kvm_vcpu *vcpu, struct kvm_vmi_regs *regs);
