@@ -909,8 +909,8 @@ void kvm_queue_exception_p(struct kvm_vcpu *vcpu, unsigned nr,
 }
 EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_queue_exception_p);
 
-static void kvm_queue_exception_e_p(struct kvm_vcpu *vcpu, unsigned nr,
-				    u32 error_code, unsigned long payload)
+void kvm_queue_exception_e_p(struct kvm_vcpu *vcpu, unsigned nr,
+			    u32 error_code, unsigned long payload)
 {
 	kvm_multiple_exception(vcpu, nr, true, error_code, true, payload);
 }
@@ -4866,6 +4866,7 @@ int kvm_vm_ioctl_check_extension(struct kvm *kvm, long ext)
 	case KVM_CAP_VMI_RING:
 	case KVM_CAP_VMI_GUEST_MMAP:
 	case KVM_CAP_VMI_PAUSE:
+	case KVM_CAP_VMI_INJECT:
 		r = kvm_vmi_has_cap();
 		break;
 #endif
