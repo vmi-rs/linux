@@ -36,10 +36,11 @@
 	{ KVM_VMI_RESPONSE_SINGLESTEP,		"SINGLESTEP" },	\
 	{ KVM_VMI_RESPONSE_SINGLESTEP_FAST,	"FAST_SS" }
 
-#define kvm_vmi_access_flags					\
-	{ KVM_VMI_ACCESS_R,		"R" },			\
-	{ KVM_VMI_ACCESS_W,		"W" },			\
-	{ KVM_VMI_ACCESS_X,		"X" }
+#define kvm_vmi_access_flags				\
+	{ KVM_VMI_ACCESS_R,	"R" },			\
+	{ KVM_VMI_ACCESS_W,	"W" },			\
+	{ KVM_VMI_ACCESS_X,	"X" },			\
+	{ KVM_VMI_ACCESS_PW,	"PW" }
 
 /*
  * Trace VMI session create/release.
