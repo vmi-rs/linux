@@ -794,9 +794,62 @@ static long kvm_vmi_ioctl(struct file *file, unsigned int ioctl,
 	}
 }
 
+static vm_fault_t kvm_vmi_guest_fault(struct vm_fault *vmf)
+{
+	struct kvm *kvm = vmf->vma->vm_private_data;
+	gfn_t gfn = vmf->pgoff;
+	unsigned long hva;
+	struct page *page;
+	vm_fault_t ret;
+	int r;
+
+	hva = gfn_to_hva(kvm, gfn);
+	if (kvm_is_error_hva(hva))
+		return VM_FAULT_SIGBUS;
+
+	/*
+	 * Resolve the guest page via the VM owner's address space.
+	 *
+	 * Use vmf_insert_pfn() rather than returning the page via
+	 * vmf->page to avoid RSS counter mismatches: foreign anonymous
+	 * pages returned via vmf->page are accounted as MM_SHMEMPAGES
+	 * on fault (swapbacked), but classified as MM_ANONPAGES on
+	 * unmap (folio_test_anon), causing "Bad rss-counter state"
+	 * warnings on process exit. PFN mappings bypass RSS accounting.
+	 */
+	mmap_read_lock(kvm->mm);
+	r = get_user_pages_remote(kvm->mm, hva, 1,
+				  FOLL_WRITE, &page, NULL);
+	mmap_read_unlock(kvm->mm);
+	if (r < 0)
+		return VM_FAULT_SIGBUS;
+
+	ret = vmf_insert_pfn(vmf->vma, vmf->address, page_to_pfn(page));
+	put_page(page);
+	return ret;
+}
+
+static const struct vm_operations_struct kvm_vmi_guest_vm_ops = {
+	.fault = kvm_vmi_guest_fault,
+};
+
+static int kvm_vmi_mmap(struct file *file, struct vm_area_struct *vma)
+{
+	struct kvm *kvm = file->private_data;
+
+	if (!kvm->vmi)
+		return -EINVAL;
+
+	vma->vm_ops = &kvm_vmi_guest_vm_ops;
+	vma->vm_private_data = kvm;
+	vm_flags_set(vma, VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP);
+	return 0;
+}
+
 static const struct file_operations kvm_vmi_fops = {
 	.owner = THIS_MODULE,
 	.release = kvm_vmi_release,
 	.unlocked_ioctl = kvm_vmi_ioctl,
+	.mmap = kvm_vmi_mmap,
 	.llseek = noop_llseek,
 };

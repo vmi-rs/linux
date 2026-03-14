@@ -4875,6 +4875,7 @@ int kvm_vm_ioctl_check_extension(struct kvm *kvm, long ext)
 #ifdef CONFIG_KVM_VMI
 	case KVM_CAP_VMI:
 	case KVM_CAP_VMI_RING:
+	case KVM_CAP_VMI_GUEST_MMAP:
 		r = kvm_vmi_has_cap();
 		break;
 #endif
