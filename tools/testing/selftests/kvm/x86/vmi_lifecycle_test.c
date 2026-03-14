@@ -54,6 +54,49 @@ static void guest_counter(void)
  */
 
 /*
+ * Test 2: Close vmi_fd while vCPU is VMI-paused.
+ *
+ * The vCPU thread is inside KVM_RUN, blocked in kvm_vmi_vcpu_pause_wait().
+ * Release must clear pause_count and wake the vCPU.
+ */
+static void test_release_while_paused(void)
+{
+	struct kvm_vm *vm;
+	struct kvm_vcpu *vcpu;
+	struct vmi_test_ring ring;
+	struct vmi_vcpu_thread_arg targ;
+	pthread_t thread;
+	int vmi_fd;
+
+	vmi_fd = vmi_test_setup(&vm, &vcpu, guest_counter, &ring);
+
+	/* Pause the VM before starting the vCPU thread */
+	vmi_pause_vm(vmi_fd);
+
+	/* Start vCPU thread - it will block immediately in pause_wait */
+	targ.vcpu = vcpu;
+	targ.done = 0;
+	pthread_create(&thread, NULL, vmi_vcpu_thread_fn, &targ);
+
+	/* Let the vCPU thread enter the pause wait */
+	usleep(50000);
+
+	/*
+	 * Close vmi_fd while vCPU is paused.  Release must clear
+	 * pause_count and wake the vCPU so it can resume.
+	 */
+	vmi_teardown_ring(&ring);
+	close(vmi_fd);
+
+	/* vCPU should unblock and guest should complete */
+	pthread_join(thread, NULL);
+	TEST_ASSERT(targ.done, "Guest should complete after release unpauses");
+
+	kvm_vm_free(vm);
+	pr_info("PASS: vmi_release_while_paused\n");
+}
+
+/*
  * Test 3: Destroy VM without closing vmi_fd first.
  *
  * This simulates QEMU being killed while a VMI agent still has vmi_fd open.
@@ -88,6 +131,7 @@ int main(int argc, char *argv[])
 	TEST_REQUIRE(kvm_has_cap(KVM_CAP_VMI));
 	TEST_REQUIRE(kvm_has_cap(KVM_CAP_VMI_RING));
 
+	test_release_while_paused();
 	test_destroy_without_release();
 
 	return 0;

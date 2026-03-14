@@ -137,6 +137,9 @@ with ``-EOPNOTSUPP`` (see the per-ioctl descriptions).
    * - ``KVM_CAP_VMI_GUEST_MMAP``
      - 502
      - Guest physical memory mapping via ``vmi_fd`` mmap.
+   * - ``KVM_CAP_VMI_PAUSE``
+     - 503
+     - VM-wide and per-vCPU pause support with refcounting.
 
 Configuration: ``CONFIG_KVM_VMI`` depends on ``KVM_INTEL && X86_64`` (no SVM/AMD
 support).
@@ -495,4 +498,39 @@ Reports the guest RAM extent so the agent can avoid faulting unbacked frames.
 ``base_gfn + npages`` over all memslots; frames at or above ``max_gfn`` are not
 backed by guest RAM. KVM has no memslot-enumeration ioctl, so this is the
 agent's way to learn the layout the VMM programmed.
+
+9. vCPU pause
+=============
+
+Pause stops vCPU execution so the agent can safely inspect or modify guest
+state. It is refcounted per vCPU (an atomic ``pause_count``): a vCPU stays
+parked while its count is non-zero, so nested pause/unpause from different parts
+of the agent compose correctly. A parked vCPU releases ``vcpu->mutex`` inside
+the run loop, so the agent's ``KVM_GET_REGS`` (etc.) on the vCPU fd serializes
+naturally on that mutex. Requires ``KVM_CAP_VMI_PAUSE``.
+
+**KVM_VMI_PAUSE_VM** (``_IO(KVMIO, 0xef)``) / **KVM_VMI_UNPAUSE_VM**
+(``_IO(KVMIO, 0xf0)``)
+
+:Type: vmi_fd ioctl
+:Parameters: none
+:Returns: 0
+
+``PAUSE_VM`` increments ``pause_count`` on every vCPU that has VMI state, forces
+in-guest vCPUs out synchronously (``KVM_REQ_OUTSIDE_GUEST_MODE``) and wakes
+halted/sleeping ones
+(``KVM_REQ_UNBLOCK``). It returns immediately without itself taking
+``vcpu->mutex``; a subsequent agent vCPU ioctl blocks on that mutex until the
+vCPU has parked. ``UNPAUSE_VM`` decrements each ``pause_count`` (never below 0)
+and wakes any vCPU reaching 0.
+
+**KVM_VMI_PAUSE_VCPU** (``_IOW(KVMIO, 0xf1, struct kvm_vmi_vcpu)``) /
+**KVM_VMI_UNPAUSE_VCPU** (``_IOW(KVMIO, 0xf2, struct kvm_vmi_vcpu)``)
+
+:Type: vmi_fd ioctl
+:Parameters: ``struct kvm_vmi_vcpu`` (``vcpu_id``)
+:Returns: 0 on success, < 0 on error
+
+Pause/unpause a single vCPU with the same refcount semantics. Errors:
+``-EINVAL`` (unknown ``vcpu_id`` or vCPU without VMI state).
 

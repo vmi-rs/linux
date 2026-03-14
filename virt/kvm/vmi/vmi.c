@@ -324,6 +324,57 @@ int kvm_vmi_deliver_via_ring(struct kvm_vcpu *vcpu,
 	return kvm_vmi_apply_ring_response(vcpu, slot);
 }
 
+/**
+ * kvm_vmi_vcpu_paused - Check if a vCPU is currently VMI-paused.
+ * @vcpu: The vCPU to check.
+ *
+ * Returns true if the vCPU has VMI state and its pause_count > 0.
+ * When VMI is not active, vcpu->vmi is NULL so this returns
+ * false immediately.
+ */
+bool kvm_vmi_vcpu_paused(struct kvm_vcpu *vcpu)
+{
+	return vcpu->vmi &&
+	       atomic_read(&vcpu->vmi->pause_count) > 0;
+}
+
+/**
+ * kvm_vmi_vcpu_pause_wait - Sleep until a paused vCPU is unpaused.
+ * @vcpu: The vCPU to sleep.
+ *
+ * Called from the vCPU run loop when kvm_vmi_vcpu_paused() returns true.
+ * Releases vcpu->mutex and unloads vCPU state so the VMI agent can call
+ * KVM ioctls (register reads, etc.) on this vCPU while it sleeps, and
+ * re-acquires them before returning.  The caller owns any per-vCPU SRCU
+ * read lock held across the run loop (x86 drops and re-takes it around
+ * this call; arm64 holds none here), since that is arch-specific.
+ */
+void kvm_vmi_vcpu_pause_wait(struct kvm_vcpu *vcpu)
+{
+	struct kvm_vcpu_vmi *vcpu_vmi = vcpu->vmi;
+
+	vcpu_put(vcpu);
+	mutex_unlock(&vcpu->mutex);
+
+	/*
+	 * Escape on session_teardown, not the ring-scoped teardown flag: a
+	 * KVM_VMI_TEARDOWN_RING leaves teardown=true on a live session, so
+	 * keying off it would let this vCPU spin out of a later pause. Only
+	 * kvm_vmi_release() sets session_teardown, and it wakes this waitqueue
+	 * before call_srcu(), so the wait completes while the struct is alive.
+	 */
+	wait_event(vcpu_vmi->pause_wq,
+		atomic_read(&vcpu_vmi->pause_count) == 0 ||
+		vcpu_vmi->session_teardown);
+
+	/*
+	 * Don't touch vcpu_vmi past this point - call_srcu() may
+	 * have freed it while we were outside SRCU.
+	 */
+	mutex_lock(&vcpu->mutex);
+	vcpu_load(vcpu);
+}
+
 /*
  * vmi_fd ioctl handlers
  */
@@ -542,6 +593,25 @@ static void kvm_vmi_free_ring(struct kvm_vcpu *vcpu)
 	if (!vcpu_vmi)
 		return;
 
+	/*
+	 * Precondition: the caller has paused the VM, so this vCPU is parked in
+	 * kvm_vmi_vcpu_pause_wait() with vcpu->mutex droppable. That lets the
+	 * mutex_lock() below acquire promptly instead of deadlocking against an
+	 * arm64 WFI-halted vCPU that would otherwise hold the mutex.
+	 */
+	WARN_ON_ONCE(!kvm_vmi_vcpu_paused(vcpu));
+
+	/*
+	 * Take vcpu->mutex to exclude the kvm_vmi_deliver_via_ring() producer
+	 * top section that writes the ring page in HOST mode -- pausing the VM
+	 * does not wait for it. KVM_REQ_OUTSIDE_GUEST_MODE only forces vCPUs
+	 * out of GUEST mode, but that section runs post-vmexit with vcpu->mode
+	 * already OUTSIDE_GUEST_MODE, so kvm_make_all_cpus_request() skips it.
+	 * The mutex is the barrier that waits for that writer before we free
+	 * the page. (Other ring accessors check the teardown flag set below.)
+	 */
+	mutex_lock(&vcpu->mutex);
+
 	vcpu_vmi->teardown = true;
 	wake_up(&vcpu_vmi->wq);
 	wake_up(&vcpu_vmi->pause_wq);
@@ -566,6 +636,8 @@ static void kvm_vmi_free_ring(struct kvm_vcpu *vcpu)
 	}
 	vcpu_vmi->ring = NULL;
 	vcpu_vmi->ring_file = NULL;
+
+	mutex_unlock(&vcpu->mutex);
 }
 
 /**
@@ -589,7 +661,16 @@ static int kvm_vmi_teardown_ring(struct kvm *kvm, u32 vcpu_id)
 	if (!vcpu->vmi || !vcpu->vmi->ring_page)
 		return -ENOENT;
 
+	/*
+	 * Pause the VM so every vCPU parks in the run-loop pause check with
+	 * vcpu->mutex dropped before kvm_vmi_free_ring() takes it. A WFI-halted
+	 * vCPU holds vcpu->mutex across KVM_RUN and a bare kick can't drop it
+	 * on arm64, so free_ring would otherwise deadlock. close(vmi_fd) is
+	 * safe only because release() pauses first; this ioctl does not.
+	 */
+	kvm_vmi_pause_vm(kvm);
 	kvm_vmi_free_ring(vcpu);
+	kvm_vmi_unpause_vm(kvm);
 	return 0;
 }
 
@@ -721,6 +802,101 @@ out_srcu:
 }
 
 /*
+ * The single VMI teardown-quiesce primitive: park every vCPU off its
+ * vcpu->mutex so a non-run-loop teardown thread can take that mutex. All
+ * teardown paths route through this (release, teardown_ring, free_ring's
+ * precondition). A bare kvm_vcpu_kick() does not drop the mutex on an arm64
+ * WFI-halted vCPU, so both requests below are needed.
+ *
+ * Increments pause_count on all vCPUs, then handles three vCPU states:
+ *  - In guest mode: KVM_REQ_OUTSIDE_GUEST_MODE forces a VM-exit and
+ *    waits for acknowledgement (Dekker barrier pattern).
+ *  - Halted/sleeping (HLT, kvm_vcpu_block): KVM_REQ_UNBLOCK wakes
+ *    them (KVM_REQ_OUTSIDE_GUEST_MODE has KVM_REQUEST_NO_WAKEUP).
+ *  - Not in KVM_RUN: vcpu->mutex is already free.
+ *
+ * After return, vCPUs reach the pause check at the top of vcpu_run() and
+ * release vcpu->mutex. KVM_GET_REGS from the VMI agent serializes on
+ * vcpu->mutex, so no explicit barrier is needed here.
+ */
+int kvm_vmi_pause_vm(struct kvm *kvm)
+{
+	struct kvm_vcpu *vcpu;
+	unsigned long i;
+
+	trace_kvm_vmi_pause(-1, true);
+	kvm_for_each_vcpu(i, vcpu, kvm) {
+		if (vcpu->vmi)
+			atomic_inc(&vcpu->vmi->pause_count);
+	}
+
+	/* Force in-guest vCPUs out synchronously. */
+	kvm_make_all_cpus_request(kvm, KVM_REQ_OUTSIDE_GUEST_MODE);
+
+	/*
+	 * Wake halted/sleeping vCPUs.  KVM_REQ_OUTSIDE_GUEST_MODE has
+	 * KVM_REQUEST_NO_WAKEUP so it skips sleeping vCPUs.
+	 * KVM_REQ_UNBLOCK wakes them from kvm_vcpu_block/halt.
+	 */
+	kvm_make_all_cpus_request(kvm, KVM_REQ_UNBLOCK);
+
+	/*
+	 * At this point:
+	 * - In-guest vCPUs have exited (KVM_REQ_OUTSIDE_GUEST_MODE is sync)
+	 * - Halted vCPUs have been woken (KVM_REQ_UNBLOCK)
+	 * - vCPUs will reach the pause check and release vcpu->mutex
+	 *
+	 * KVM_GET_REGS from the VMI agent will wait for vcpu->mutex
+	 * if the vCPU hasn't released it yet, providing the necessary
+	 * synchronization without us touching vcpu->mutex here.
+	 */
+	return 0;
+}
+
+int kvm_vmi_unpause_vm(struct kvm *kvm)
+{
+	struct kvm_vcpu *vcpu;
+	unsigned long i;
+
+	trace_kvm_vmi_pause(-1, false);
+	kvm_for_each_vcpu(i, vcpu, kvm) {
+		if (vcpu->vmi) {
+			atomic_dec_if_positive(&vcpu->vmi->pause_count);
+			wake_up(&vcpu->vmi->pause_wq);
+		}
+	}
+	return 0;
+}
+
+static int kvm_vmi_pause_vcpu_ioctl(struct kvm *kvm, u32 vcpu_id)
+{
+	struct kvm_vcpu *vcpu;
+
+	vcpu = kvm_get_vcpu_by_id(kvm, vcpu_id);
+	if (!vcpu || !vcpu->vmi)
+		return -EINVAL;
+
+	atomic_inc(&vcpu->vmi->pause_count);
+	kvm_vcpu_kick(vcpu);
+	trace_kvm_vmi_pause(vcpu_id, true);
+	return 0;
+}
+
+static int kvm_vmi_unpause_vcpu_ioctl(struct kvm *kvm, u32 vcpu_id)
+{
+	struct kvm_vcpu *vcpu;
+
+	vcpu = kvm_get_vcpu_by_id(kvm, vcpu_id);
+	if (!vcpu || !vcpu->vmi)
+		return -EINVAL;
+
+	atomic_dec_if_positive(&vcpu->vmi->pause_count);
+	wake_up(&vcpu->vmi->pause_wq);
+	trace_kvm_vmi_pause(vcpu_id, false);
+	return 0;
+}
+
+/*
  * KVM_VMI_GET_MEM_INFO: report the guest RAM extent.
  *
  * Returns the exclusive upper-bound GFN of guest RAM, the maximum of
@@ -790,16 +966,16 @@ static int kvm_vmi_release(struct inode *inode, struct file *file)
 	if (!vmi)
 		goto out;
 
-	/* Signal all vCPUs to teardown and wake any blocked ones */
-	kvm_for_each_vcpu(i, vcpu, kvm) {
-		if (!vcpu->vmi)
-			continue;
-		vcpu->vmi->teardown = true;
-		atomic_set(&vcpu->vmi->pause_count, 0);
-		wake_up(&vcpu->vmi->wq);
-		wake_up(&vcpu->vmi->pause_wq);
-		kvm_vcpu_kick(vcpu);
-	}
+	/*
+	 * Pause every vCPU so it parks with vcpu->mutex dropped before the
+	 * mutex_lock()s below (free_ring later) take
+	 * it. A WFI-halted or in-guest vCPU holds vcpu->mutex across KVM_RUN,
+	 * and a bare kick can't drop it on arm64, so those would deadlock and
+	 * wedge close(vmi_fd) in 'D'. The pause escape keys on
+	 * session_teardown, which the loop below sets only after free_ring
+	 * returns, so every vCPU stays parked through the whole teardown.
+	 */
+	kvm_vmi_pause_vm(kvm);
 
 	/* Clear VM-wide event monitoring state */
 	vmi->enabled_events = 0;
@@ -818,6 +994,16 @@ static int kvm_vmi_release(struct inode *inode, struct file *file)
 		if (!vcpu_vmi)
 			continue;
 		kvm_vmi_free_ring(vcpu);
+		/*
+		 * Now release the parked vCPU: free_ring() ran while it was
+		 * still parked. Set session_teardown and clear pause_count, and
+		 * wake; the vCPU sees pause_count==0 and exits the pause check.
+		 * Order pause_count=0 before NULLing vcpu->vmi so the woken
+		 * run-loop pause check does not spin awaiting the NULL.
+		 */
+		vcpu_vmi->session_teardown = true;
+		atomic_set(&vcpu_vmi->pause_count, 0);
+		wake_up(&vcpu_vmi->pause_wq);
 		WRITE_ONCE(vcpu->vmi, NULL);
 		call_srcu(&kvm->srcu, &vcpu_vmi->rcu_head, free_vcpu_vmi);
 	}
@@ -881,6 +1067,24 @@ static long kvm_vmi_ioctl(struct file *file, unsigned int ioctl,
 		if (copy_from_user(&ctrl, argp, sizeof(ctrl)))
 			return -EFAULT;
 		return kvm_vmi_control_event(kvm, &ctrl);
+	}
+	case KVM_VMI_PAUSE_VM:
+		return kvm_vmi_pause_vm(kvm);
+	case KVM_VMI_UNPAUSE_VM:
+		return kvm_vmi_unpause_vm(kvm);
+	case KVM_VMI_PAUSE_VCPU: {
+		struct kvm_vmi_vcpu v;
+
+		if (copy_from_user(&v, argp, sizeof(v)))
+			return -EFAULT;
+		return kvm_vmi_pause_vcpu_ioctl(kvm, v.vcpu_id);
+	}
+	case KVM_VMI_UNPAUSE_VCPU: {
+		struct kvm_vmi_vcpu v;
+
+		if (copy_from_user(&v, argp, sizeof(v)))
+			return -EFAULT;
+		return kvm_vmi_unpause_vcpu_ioctl(kvm, v.vcpu_id);
 	}
 	case KVM_VMI_GET_MEM_INFO: {
 		struct kvm_vmi_mem_info info = {};
