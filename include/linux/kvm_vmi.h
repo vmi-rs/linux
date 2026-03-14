@@ -24,6 +24,7 @@ struct eventfd_ctx;
  * @default_access: Default R/W/X permissions for lazily-populated entries.
  * @visible: VMFUNC visibility (for future EPTP list, currently unused).
  * @access_overrides: Xarray mapping GFN -> u8 access permissions.
+ * @gfn_overrides: Xarray mapping GFN -> HPA for change_gfn remappings.
  * @arch: Architecture-specific view data.
  */
 struct kvm_vmi_view_data {
@@ -32,6 +33,7 @@ struct kvm_vmi_view_data {
 	u8 default_access;
 	bool visible;
 	struct xarray access_overrides;
+	struct xarray gfn_overrides;
 	struct kvm_arch_vmi_view arch;
 };
 
@@ -109,6 +111,7 @@ int kvm_vmi_deliver_via_ring(struct kvm_vcpu *vcpu,
 
 /* View management */
 int kvm_vmi_vcpu_switch_view(struct kvm_vcpu *vcpu, u32 view_id);
+void kvm_vmi_propagate_change(struct kvm *kvm, gfn_t start, gfn_t end);
 
 /* Pause support (called from vcpu_run) */
 bool kvm_vmi_vcpu_paused(struct kvm_vcpu *vcpu);
@@ -146,6 +149,9 @@ void kvm_arch_vmi_invalidate_gfn(struct kvm *kvm,
 void kvm_arch_vmi_invalidate_gfn_locked(struct kvm *kvm,
 					 struct kvm_vmi_view_data *view,
 					 gfn_t gfn);
+void kvm_arch_vmi_invalidate_gfn_revert(struct kvm *kvm,
+					struct kvm_vmi_view_data *view,
+					gfn_t gfn);
 
 #else /* !CONFIG_KVM_VMI */
 
