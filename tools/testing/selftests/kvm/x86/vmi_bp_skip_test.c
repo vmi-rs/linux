@@ -183,11 +183,160 @@ static void test_bp_set_regs_no_skip(void)
 	kvm_vm_free(vm);
 }
 
+/* ------------------------------------------------------------------ */
+/* Test 2: SINGLESTEP_FAST from breakpoint preserves RIP              */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Guest sets RAX to MAGIC via inline asm, then calls func_b.
+ * In the trap view, func_b's code page is remapped to a shadow page
+ * where byte 0 (REX.W) is replaced with INT3. View 0 has the original
+ * code.
+ */
+static void guest_fast_singlestep(void)
+{
+	volatile uint64_t *result = (volatile uint64_t *)RESULT_GPA;
+
+	*result = SENTINEL;
+	GUEST_SYNC(1);
+
+	/*
+	 * Set RAX = MAGIC and call func_b.
+	 *
+	 * In the trap view, byte 0 is INT3 (shadow page), triggering a
+	 * breakpoint. The agent responds with SINGLESTEP_FAST, so the
+	 * kernel switches to view 0 (original code, REX.W at byte 0)
+	 * and steps one instruction. With the fix, that instruction is
+	 * the full 64-bit "mov [RESULT], rax". With the bug, RIP is
+	 * advanced to byte 1 (32-bit "mov [RESULT], eax").
+	 */
+	asm volatile(
+		"movabs $0xDEADBEEF00000042, %%rax\n\t"
+		"call *%0"
+		:
+		: "r"((uint64_t)FUNC_B_GPA)
+		: "rax", "rcx", "rdx", "rsi", "rdi",
+		  "r8", "r9", "r10", "r11", "memory"
+	);
+
+	GUEST_DONE();
+}
+
+/*
+ * Shadow-page breakpoint with SINGLESTEP_FAST but no SWITCH_VIEW.
+ *
+ * Setup:
+ *   - func_b page: original code (48 89 04 25 <addr> C3)
+ *   - Shadow page: INT3 at byte 0 (CC 89 04 25 <addr> C3)
+ *   - Trap view: GFN remap func_b -> shadow
+ *   - View 0: original code (default)
+ *
+ * On breakpoint, agent responds with SINGLESTEP_FAST only. The kernel
+ * defaults to view 0 for the step. With the fix, the step executes the
+ * 64-bit MOV from byte 0. With the bug, the step starts at byte 1
+ * (32-bit MOV).
+ */
+static void test_bp_fast_singlestep_no_skip(void)
+{
+	struct kvm_vm *vm;
+	struct kvm_vcpu *vcpu;
+	struct vmi_test_ring ring;
+	struct vmi_vcpu_thread_arg targ;
+	pthread_t thread;
+	struct kvm_vmi_ring_event *ev;
+	int vmi_fd;
+	uint32_t trap_view_id;
+	uint8_t *func_b_hva, *shadow_hva;
+	uint64_t *result_hva;
+	uint64_t func_b_gfn = FUNC_B_GPA >> 12;
+	uint64_t shadow_gfn = SHADOW_GPA >> 12;
+
+	vm = vm_create_with_one_vcpu(&vcpu, guest_fast_singlestep);
+	vmi_fd = vmi_create(vm);
+	vmi_setup_ring(vmi_fd, 0, &ring);
+
+	/* Map func_b page */
+	vm_userspace_mem_region_add(vm, VM_MEM_SRC_ANONYMOUS,
+				    FUNC_B_GPA, 21, 1, 0);
+	virt_map(vm, FUNC_B_GPA, FUNC_B_GPA, 1);
+
+	/* Map result page */
+	vm_userspace_mem_region_add(vm, VM_MEM_SRC_ANONYMOUS,
+				    RESULT_GPA, 22, 1, 0);
+	virt_map(vm, RESULT_GPA, RESULT_GPA, 1);
+
+	/* Map shadow page (used via GFN remap only, no guest VA) */
+	vm_userspace_mem_region_add(vm, VM_MEM_SRC_ANONYMOUS,
+				    SHADOW_GPA, 23, 1, 0);
+
+	/* Write original code to func_b page */
+	func_b_hva = addr_gpa2hva(vm, FUNC_B_GPA);
+	memcpy(func_b_hva, func_b_code, sizeof(func_b_code));
+
+	/* Create shadow: copy func_b, replace byte 0 (REX.W) with INT3 */
+	shadow_hva = addr_gpa2hva(vm, SHADOW_GPA);
+	memcpy(shadow_hva, func_b_code, sizeof(func_b_code));
+	shadow_hva[0] = 0xCC;	/* INT3 replaces REX.W prefix */
+
+	/* Initialize result */
+	result_hva = addr_gpa2hva(vm, RESULT_GPA);
+	*result_hva = SENTINEL;
+
+	/* Create trap view and remap func_b GFN to shadow */
+	trap_view_id = vmi_create_view(vmi_fd, KVM_VMI_ACCESS_RWX);
+	vmi_change_gfn(vmi_fd, trap_view_id, func_b_gfn, shadow_gfn);
+
+	/* Enable breakpoint monitoring */
+	vmi_control_event(vmi_fd, KVM_VMI_EVENT_BREAKPOINT, 1);
+
+	/* Switch vCPU to trap view */
+	vmi_switch_view(vmi_fd, trap_view_id);
+
+	/* Start vCPU thread */
+	targ.vcpu = vcpu;
+	targ.done = 0;
+	pthread_create(&thread, NULL, vmi_vcpu_thread_fn, &targ);
+
+	/* Wait for breakpoint (INT3 at shadow page byte 0) */
+	ev = vmi_wait_event_timeout(&ring, 5000);
+	TEST_ASSERT(ev != NULL, "Timeout waiting for breakpoint");
+	TEST_ASSERT(ev->type == KVM_VMI_EVENT_BREAKPOINT,
+		    "Expected breakpoint, got %u", ev->type);
+
+	/*
+	 * Respond with SINGLESTEP_FAST only (no SWITCH_VIEW).
+	 * The kernel defaults to view 0 for the step.
+	 */
+	ev->response = KVM_VMI_RESPONSE_SINGLESTEP_FAST;
+	vmi_ack_event(&ring, 0);
+
+	pthread_join(thread, NULL);
+	TEST_ASSERT(targ.done, "Guest should have completed");
+
+	TEST_ASSERT(*result_hva == MAGIC,
+		    "RESULT = 0x%016lx, expected 0x%016lx "
+		    "(0x%016lx means the skip bug is present)",
+		    (unsigned long)*result_hva,
+		    (unsigned long)MAGIC,
+		    (unsigned long)0xCCCCCCCC00000042ULL);
+
+	pr_info("PASS: bp + SINGLESTEP_FAST (no SWITCH_VIEW) - RIP not skipped, "
+		"result=0x%lx\n", (unsigned long)*result_hva);
+
+	/* Cleanup */
+	vmi_switch_view(vmi_fd, 0);
+	vmi_destroy_view(vmi_fd, trap_view_id);
+	vmi_teardown_ring(&ring);
+	close(vmi_fd);
+	kvm_vm_free(vm);
+}
+
 int main(int argc, char *argv[])
 {
 	TEST_REQUIRE(kvm_has_cap(KVM_CAP_VMI));
 
 	test_bp_set_regs_no_skip();
+	test_bp_fast_singlestep_no_skip();
 
 	return 0;
 }

@@ -399,6 +399,17 @@ depends on the event (and the architecture) - see the per-event sections.
      - Single-step the next instruction (MTF). One-shot. If
        ``KVM_VMI_EVENT_SINGLESTEP`` is enabled, a singlestep event fires after
        the instruction.
+   * - ``KVM_VMI_RESPONSE_SINGLESTEP_FAST``
+     - 1 << 6
+     - Atomic single-step + view switch. Steps one instruction in a target view
+       (``slot->view_id`` if combined with SWITCH_VIEW, else view 0), then
+       automatically switches back to the view active at event time and
+       suppresses the resulting singlestep event. Used for transparent
+       breakpoint handling.
+
+There is no separate single-step ioctl: single-stepping is driven entirely by
+the ``SINGLESTEP`` / ``SINGLESTEP_FAST`` response flags.
+
 5.6 Register snapshot
 ---------------------
 
