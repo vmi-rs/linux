@@ -28,6 +28,7 @@
 #define KVM_VMI_UNPAUSE_VM        _IO(KVMIO,   0xef)
 #define KVM_VMI_PAUSE_VCPU        _IOW(KVMIO,  0xf0, struct kvm_vmi_vcpu)
 #define KVM_VMI_UNPAUSE_VCPU      _IOW(KVMIO,  0xf1, struct kvm_vmi_vcpu)
+#define KVM_VMI_INJECT_EVENT      _IOW(KVMIO,  0xf2, struct kvm_vmi_inject_event)
 
 /* Ring event response flags (bitmask, combinable) */
 #define KVM_VMI_RESPONSE_CONTINUE          (0)  /* Default: proceed with normal handling */

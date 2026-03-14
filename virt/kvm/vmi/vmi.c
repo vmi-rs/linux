@@ -816,6 +816,24 @@ static int kvm_vmi_unpause_vcpu_ioctl(struct kvm *kvm, u32 vcpu_id)
 	trace_kvm_vmi_pause(vcpu_id, false);
 	return 0;
 }
+
+static int kvm_vmi_inject_event_ioctl(struct kvm *kvm,
+				      struct kvm_vmi_inject_event *inject)
+{
+	struct kvm_vcpu *vcpu;
+	int r;
+
+	vcpu = kvm_get_vcpu_by_id(kvm, inject->vcpu_id);
+	if (!vcpu || !vcpu->vmi)
+		return -EINVAL;
+
+	/* Exception injection modifies vCPU exception state */
+	mutex_lock(&vcpu->mutex);
+	r = kvm_vmi_inject_event(vcpu, inject);
+	mutex_unlock(&vcpu->mutex);
+	return r;
+}
+
 static void free_vcpu_vmi(struct rcu_head *head)
 {
 	kfree(container_of(head, struct kvm_vcpu_vmi, rcu_head));
@@ -947,6 +965,13 @@ static long kvm_vmi_ioctl(struct file *file, unsigned int ioctl,
 		if (copy_from_user(&v, argp, sizeof(v)))
 			return -EFAULT;
 		return kvm_vmi_unpause_vcpu_ioctl(kvm, v.vcpu_id);
+	}
+	case KVM_VMI_INJECT_EVENT: {
+		struct kvm_vmi_inject_event inject;
+
+		if (copy_from_user(&inject, argp, sizeof(inject)))
+			return -EFAULT;
+		return kvm_vmi_inject_event_ioctl(kvm, &inject);
 	}
 	default:
 		return -ENOTTY;
