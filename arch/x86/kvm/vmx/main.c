@@ -1025,6 +1025,7 @@ struct kvm_x86_ops vt_x86_ops __initdata = {
 	.vmi_create_view = vmx_vmi_create_view,
 	.vmi_destroy_view = vmx_vmi_destroy_view,
 	.vmi_switch_view = vmx_vmi_switch_view,
+	.vmi_set_singlestep = vmx_vmi_set_singlestep,
 #endif
 };
 

@@ -741,6 +741,7 @@ int vmx_vmi_create_view(struct kvm *kvm, struct kvm_vmi_view_data *view);
 void vmx_vmi_destroy_view(struct kvm *kvm, struct kvm_vmi_view_data *view);
 void vmx_vmi_switch_view(struct kvm_vcpu *vcpu,
 			 struct kvm_vmi_view_data *view);
+void vmx_vmi_set_singlestep(struct kvm_vcpu *vcpu, bool enable);
 #else
 static inline void vmx_vmi_apply_msr_intercepts(struct kvm_vcpu *vcpu) {}
 #endif

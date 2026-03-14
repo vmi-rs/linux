@@ -137,6 +137,8 @@ int kvm_arch_vmi_control_event(struct kvm *kvm,
 			       struct kvm_vmi_control_event *ctrl);
 void kvm_arch_vmi_update(struct kvm *kvm);
 
+void kvm_arch_vmi_set_singlestep(struct kvm_vcpu *vcpu, bool enable);
+
 int kvm_arch_vmi_create_view(struct kvm *kvm, struct kvm_vmi_view_data *view);
 void kvm_arch_vmi_destroy_view(struct kvm *kvm, struct kvm_vmi_view_data *view);
 void kvm_arch_vmi_switch_view(struct kvm_vcpu *vcpu,

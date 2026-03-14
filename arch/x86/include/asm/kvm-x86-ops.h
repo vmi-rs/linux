@@ -156,6 +156,7 @@ KVM_X86_OP_OPTIONAL(vmi_apply_state)
 KVM_X86_OP_OPTIONAL(vmi_create_view)
 KVM_X86_OP_OPTIONAL(vmi_destroy_view)
 KVM_X86_OP_OPTIONAL(vmi_switch_view)
+KVM_X86_OP_OPTIONAL(vmi_set_singlestep)
 #endif
 
 #undef KVM_X86_OP
