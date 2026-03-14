@@ -135,6 +135,43 @@ int vmi_control_event_err(int vmi_fd, uint32_t event, int enable)
 	return ioctl(vmi_fd, KVM_VMI_CONTROL_EVENT, &ctl);
 }
 
+void vmi_pause_vm(int vmi_fd)
+{
+	int ret;
+
+	ret = ioctl(vmi_fd, KVM_VMI_PAUSE_VM);
+	TEST_ASSERT(ret == 0, "KVM_VMI_PAUSE_VM failed: %d", ret);
+}
+
+void vmi_unpause_vm(int vmi_fd)
+{
+	int ret;
+
+	ret = ioctl(vmi_fd, KVM_VMI_UNPAUSE_VM);
+	TEST_ASSERT(ret == 0, "KVM_VMI_UNPAUSE_VM failed: %d", ret);
+}
+
+void vmi_pause_vcpu(int vmi_fd, uint32_t vcpu_id)
+{
+	struct kvm_vmi_vcpu v = { .vcpu_id = vcpu_id };
+	int ret;
+
+	ret = ioctl(vmi_fd, KVM_VMI_PAUSE_VCPU, &v);
+	TEST_ASSERT(ret == 0, "KVM_VMI_PAUSE_VCPU failed: %d", ret);
+}
+
+void vmi_unpause_vcpu(int vmi_fd, uint32_t vcpu_id)
+{
+	struct kvm_vmi_vcpu v = { .vcpu_id = vcpu_id };
+	int ret;
+
+	ret = ioctl(vmi_fd, KVM_VMI_UNPAUSE_VCPU, &v);
+	TEST_ASSERT(ret == 0, "KVM_VMI_UNPAUSE_VCPU failed: %d", ret);
+}
+
+/*
+ * Inject event helper.
+ */
 void vmi_teardown_ring(struct vmi_test_ring *r)
 {
 	if (r->ring && r->ring != MAP_FAILED)

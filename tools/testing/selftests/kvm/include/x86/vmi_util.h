@@ -38,6 +38,10 @@ struct kvm_vmi_ring_event *vmi_wait_event_timeout(struct vmi_test_ring *r,
 void vmi_ack_event(struct vmi_test_ring *r, uint32_t vcpu_id);
 void vmi_control_event(int vmi_fd, uint32_t event, int enable);
 int vmi_control_event_err(int vmi_fd, uint32_t event, int enable);
+void vmi_pause_vm(int vmi_fd);
+void vmi_unpause_vm(int vmi_fd);
+void vmi_pause_vcpu(int vmi_fd, uint32_t vcpu_id);
+void vmi_unpause_vcpu(int vmi_fd, uint32_t vcpu_id);
 void vmi_teardown_ring(struct vmi_test_ring *r);
 void *vmi_vcpu_thread_fn(void *arg);
 int vmi_test_setup(struct kvm_vm **vm, struct kvm_vcpu **vcpu,
