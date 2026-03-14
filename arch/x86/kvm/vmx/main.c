@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 #include <linux/moduleparam.h>
+#include <linux/kvm_vmi.h>
 
 #include "x86_ops.h"
 #include "vmx.h"
@@ -1015,7 +1016,12 @@ struct kvm_x86_ops vt_x86_ops __initdata = {
 	.vcpu_mem_enc_ioctl = vt_op_tdx_only(vcpu_mem_enc_ioctl),
 	.vcpu_mem_enc_unlocked_ioctl = vt_op_tdx_only(vcpu_mem_enc_unlocked_ioctl),
 
-	.gmem_max_mapping_level = vt_op_tdx_only(gmem_max_mapping_level)
+	.gmem_max_mapping_level = vt_op_tdx_only(gmem_max_mapping_level),
+
+#ifdef CONFIG_KVM_VMI
+	.vmi_has_cap = vmx_vmi_has_cap,
+	.vmi_apply_state = vmx_vmi_apply_vmcs_state,
+#endif
 };
 
 struct kvm_x86_init_ops vt_init_ops __initdata = {

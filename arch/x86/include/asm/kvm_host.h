@@ -127,6 +127,7 @@
 	KVM_ARCH_REQ_FLAGS(31, KVM_REQUEST_WAIT | KVM_REQUEST_NO_WAKEUP)
 #define KVM_REQ_HV_TLB_FLUSH \
 	KVM_ARCH_REQ_FLAGS(32, KVM_REQUEST_WAIT | KVM_REQUEST_NO_WAKEUP)
+#define KVM_REQ_VMI_UPDATE		KVM_ARCH_REQ(33)
 #define KVM_REQ_UPDATE_PROTECTED_GUEST_STATE \
 	KVM_ARCH_REQ_FLAGS(34, KVM_REQUEST_WAIT)
 
@@ -300,6 +301,7 @@ enum x86_intercept_stage;
 
 struct kvm_kernel_irqfd;
 struct kvm_kernel_irq_routing_entry;
+struct kvm_vmi_view_data;
 
 /*
  * kvm_mmu_page_role tracks the properties of a shadow page (where shadow page
@@ -1947,6 +1949,11 @@ struct kvm_x86_ops {
 	int (*gmem_prepare)(struct kvm *kvm, kvm_pfn_t pfn, gfn_t gfn, int max_order);
 	void (*gmem_invalidate)(kvm_pfn_t start, kvm_pfn_t end);
 	int (*gmem_max_mapping_level)(struct kvm *kvm, kvm_pfn_t pfn, bool is_private);
+
+#ifdef CONFIG_KVM_VMI
+	bool (*vmi_has_cap)(void);
+	void (*vmi_apply_state)(struct kvm_vcpu *vcpu);
+#endif
 };
 
 struct kvm_x86_nested_ops {

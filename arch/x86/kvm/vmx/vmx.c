@@ -18,6 +18,7 @@
 #include <linux/hrtimer.h>
 #include <linux/kernel.h>
 #include <linux/kvm_host.h>
+#include <linux/kvm_vmi.h>
 #include <linux/module.h>
 #include <linux/moduleparam.h>
 #include <linux/mod_devicetable.h>
@@ -5243,6 +5244,17 @@ static bool rmode_exception(struct kvm_vcpu *vcpu, int vec)
 	}
 	return false;
 }
+
+#ifdef CONFIG_KVM_VMI
+bool vmx_vmi_has_cap(void)
+{
+	return enable_ept;
+}
+
+void vmx_vmi_apply_vmcs_state(struct kvm_vcpu *vcpu)
+{
+}
+#endif
 
 static int handle_rmode_exception(struct kvm_vcpu *vcpu,
 				  int vec, u32 err_code)
