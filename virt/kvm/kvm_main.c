@@ -722,6 +722,9 @@ void kvm_mmu_invalidate_range_add(struct kvm *kvm, gfn_t start, gfn_t end)
 bool kvm_mmu_unmap_gfn_range(struct kvm *kvm, struct kvm_gfn_range *range)
 {
 	kvm_mmu_invalidate_range_add(kvm, range->start, range->end);
+#ifdef CONFIG_KVM_VMI
+	kvm_vmi_propagate_change(kvm, range->start, range->end);
+#endif
 	return kvm_unmap_gfn_range(kvm, range);
 }
 

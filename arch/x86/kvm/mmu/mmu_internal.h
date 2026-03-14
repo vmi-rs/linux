@@ -297,6 +297,14 @@ struct kvm_page_fault {
 	 * for alternate views; 0 means no VMI restriction.
 	 */
 	u8 vmi_access;
+
+	/*
+	 * Pre-resolved PFN for GFN remaps (change_gfn). When
+	 * vmi_pfn_valid is true, kvm_mmu_faultin_pfn() skips the
+	 * normal host PFN resolution and uses this PFN directly.
+	 */
+	kvm_pfn_t vmi_pfn;
+	bool vmi_pfn_valid;
 #endif
 };
 

@@ -680,6 +680,53 @@ allocation failure).
 7.3 Guest-frame remapping
 -------------------------
 
+Remapping replaces a guest frame's backing in one view, enabling transparent
+code patching without touching the guest's original memory. The typical shadow
+workflow:
+
+1. Allocate a shadow frame::
+
+       struct kvm_vmi_alloc_gfn alloc = {};
+       ioctl(vmi_fd, KVM_VMI_ALLOC_GFN, &alloc);   /* alloc.gfn = shadow GFN */
+
+2. mmap the shadow frame and the original frame via ``vmi_fd`` (section 8), copy
+   the original content, and patch the shadow (e.g. write ``INT3``).
+
+3. Remap in the alternate view::
+
+       struct kvm_vmi_change_gfn change = {
+           .view_id = my_view,
+           .old_gfn = original_gfn,
+           .new_gfn = alloc.gfn,
+       };
+       ioctl(vmi_fd, KVM_VMI_CHANGE_GFN, &change);
+
+4. A vCPU on ``my_view`` now sees the patched shadow at ``original_gfn``; other
+   views (including view 0) still see the original page.
+
+**KVM_VMI_CHANGE_GFN** (``_IOW(KVMIO, 0xfb, struct kvm_vmi_change_gfn)``)
+
+:Type: vmi_fd ioctl
+:Parameters: ``struct kvm_vmi_change_gfn``
+:Returns: 0 on success, < 0 on error
+
+::
+
+    struct kvm_vmi_change_gfn {
+        __u32 view_id;   /* must not be 0 */
+        __u32 pad;
+        __u64 old_gfn;   /* frame whose mapping to override */
+        __u64 new_gfn;   /* backing frame (shadow or regular) */
+    };
+
+Remaps ``old_gfn`` to ``new_gfn``'s backing page in the view. ``new_gfn`` may be
+a shadow GFN (``>= KVM_VMI_SHADOW_GFN_BASE``) or a regular guest GFN (aliasing
+one guest page onto another). Setting ``new_gfn`` to ``KVM_VMI_INVALID_GFN``
+(``~0ULL``) reverts to the host mapping. Errors: ``-EINVAL`` (no session, view
+0), ``-ENOENT`` (unknown view, or unallocated shadow target), ``-EFAULT`` (no
+memslot / fault-in failure for a regular ``new_gfn``), ``-ENOMEM`` (pinning a
+regular ``new_gfn``).
+
 **KVM_VMI_ALLOC_GFN** (``_IOWR(KVMIO, 0xf9, struct kvm_vmi_alloc_gfn)``)
 
 :Type: vmi_fd ioctl

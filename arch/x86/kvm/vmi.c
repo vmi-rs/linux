@@ -447,6 +447,38 @@ void kvm_arch_vmi_invalidate_gfn_locked(struct kvm *kvm,
 	kvm_tdp_mmu_zap_vmi_leaf(kvm, view->arch.tdp_root, gfn);
 }
 
+void kvm_arch_vmi_invalidate_gfn_revert(struct kvm *kvm,
+					struct kvm_vmi_view_data *view,
+					gfn_t gfn)
+{
+	gfn_t block_start, block_end;
+	bool block_has_remaps = false;
+	unsigned long idx;
+	void *entry;
+
+	write_lock(&kvm->mmu_lock);
+
+	/* Zap old mapping so next fault installs from host */
+	kvm_tdp_mmu_zap_vmi_leaf(kvm, view->arch.tdp_root, gfn);
+
+	/*
+	 * If no other remaps exist in the same 2MB block,
+	 * zap the level-2 non-leaf SPTE to allow subsequent
+	 * faults to install 2MB huge pages again.
+	 */
+	block_start = gfn & ~(KVM_PAGES_PER_HPAGE(PG_LEVEL_2M) - 1);
+	block_end = block_start + KVM_PAGES_PER_HPAGE(PG_LEVEL_2M);
+	xa_for_each_range(&view->gfn_overrides, idx, entry,
+			  block_start, block_end - 1) {
+		block_has_remaps = true;
+		break;
+	}
+	if (!block_has_remaps)
+		kvm_tdp_mmu_zap_vmi_2m_block(kvm, view->arch.tdp_root, gfn);
+
+	write_unlock(&kvm->mmu_lock);
+}
+
 /**
  * kvm_vmi_event_enabled - Check if a VMI event can be delivered.
  * @vcpu: The vCPU to check.
@@ -563,6 +595,10 @@ void kvm_vmi_setup_page_fault(struct kvm_vcpu *vcpu,
 {
 	struct kvm_vcpu_vmi *vcpu_vmi = vcpu->vmi;
 	struct kvm_vmi_view_data *view;
+	gfn_t block_start, block_end;
+	unsigned long idx;
+	void *remap;
+	void *entry;
 
 	if (!vcpu_vmi || vcpu_vmi->current_view_id == 0)
 		return;
@@ -574,5 +610,34 @@ void kvm_vmi_setup_page_fault(struct kvm_vcpu *vcpu,
 
 	/* Set access restriction from view */
 	fault->vmi_access = vmi_resolve_access(view, fault->gfn);
+
+	/* Check for GFN remap (change_gfn) */
+	remap = xa_load(&view->gfn_overrides, fault->gfn);
+	if (remap) {
+		fault->vmi_pfn = ((hpa_t)(unsigned long)remap) >> PAGE_SHIFT;
+		fault->vmi_pfn_valid = true;
+		fault->max_level = PG_LEVEL_4K;
+	}
+
+	/*
+	 * If a GFN override exists in the same 2MB-aligned block as
+	 * the faulting GFN, limit to 4K pages. A 2MB SPTE would
+	 * cover the remapped GFN with the original (non-shadow)
+	 * mapping, bypassing the remap check which only fires on
+	 * per-GFN EPT violations.
+	 *
+	 * Only restrict the specific 2MB block, not the entire view,
+	 * to avoid massive TLB pressure from global 4K enforcement.
+	 */
+	if (!remap && fault->max_level > PG_LEVEL_4K) {
+		block_start = fault->gfn & ~(KVM_PAGES_PER_HPAGE(PG_LEVEL_2M) - 1);
+		block_end = block_start + KVM_PAGES_PER_HPAGE(PG_LEVEL_2M);
+
+		xa_for_each_range(&view->gfn_overrides,
+				  idx, entry, block_start, block_end - 1) {
+			fault->max_level = PG_LEVEL_4K;
+			break;
+		}
+	}
 }
 EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_vmi_setup_page_fault);

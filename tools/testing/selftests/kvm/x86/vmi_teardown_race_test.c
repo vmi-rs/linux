@@ -173,6 +173,61 @@ static void test_teardown_while_faulting(void)
 	kvm_vm_free(vm);
 }
 
+/*
+ * Test: Teardown with active GFN remaps while faulting.
+ *
+ * Adds GFN remaps to the mix - the view has both an empty EPT
+ * (generating faults) and active remaps (which access view
+ * structures during teardown).
+ */
+static void test_teardown_with_remaps(void)
+{
+	struct kvm_vm *vm;
+	struct kvm_vcpu *vcpu;
+	struct vmi_test_ring ring;
+	struct vcpu_thread_arg targ;
+	pthread_t thread;
+	int vmi_fd;
+	uint32_t view_id;
+	uint64_t shadow_gfn;
+	int i;
+
+	vm = vm_create_with_one_vcpu(&vcpu, guest_touch_pages);
+
+	/* Add memory and page table entries for the pages the guest touches */
+	vm_userspace_mem_region_add(vm, VM_MEM_SRC_ANONYMOUS,
+				    TOUCH_GPA, TOUCH_SLOT, NR_TOUCH_PAGES, 0);
+	for (i = 0; i < NR_TOUCH_PAGES; i++)
+		virt_map(vm, TOUCH_GPA + i * 4096, TOUCH_GPA + i * 4096, 1);
+
+	vmi_fd = vmi_create(vm);
+	vmi_setup_ring(vmi_fd, 0, &ring);
+
+	view_id = vmi_create_view(vmi_fd, KVM_VMI_ACCESS_RWX);
+
+	/* Allocate shadow page and set up a remap */
+	shadow_gfn = vmi_alloc_gfn(vmi_fd);
+	vmi_change_gfn(vmi_fd, view_id, 0x100, shadow_gfn);
+
+	/* Switch to alt view */
+	vmi_switch_view(vmi_fd, view_id);
+
+	/* Start vCPU */
+	targ.vcpu = vcpu;
+	targ.done = 0;
+	pthread_create(&thread, NULL, vcpu_thread_fn, &targ);
+
+	/* Let it fault for a bit */
+	usleep(10000);
+
+	/* Teardown while faulting with active remaps */
+	vmi_teardown_ring(&ring);
+	close(vmi_fd);
+
+	pthread_join(thread, NULL);
+	kvm_vm_free(vm);
+}
+
 int main(int argc, char *argv[])
 {
 	int i;
@@ -186,6 +241,7 @@ int main(int argc, char *argv[])
 	 */
 	for (i = 0; i < NR_ITERATIONS; i++) {
 		test_teardown_while_faulting();
+		test_teardown_with_remaps();
 	}
 
 	pr_info("PASS: %d iterations of teardown race tests completed\n",

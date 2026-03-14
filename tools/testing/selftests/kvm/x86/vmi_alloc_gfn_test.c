@@ -66,6 +66,44 @@ static void test_alloc_free(void)
 }
 
 /*
+ * Test 2: Free while remapped via change_gfn should fail with EBUSY.
+ */
+static void test_free_while_remapped(void)
+{
+	struct kvm_vm *vm;
+	struct kvm_vcpu *vcpu;
+	int vmi_fd, ret;
+	uint64_t shadow_gfn;
+	uint32_t view_id;
+	struct kvm_vmi_free_gfn free_req;
+
+	vm = vm_create_with_one_vcpu(&vcpu, guest_halt);
+	vmi_fd = vmi_create(vm);
+
+	shadow_gfn = vmi_alloc_gfn(vmi_fd);
+	view_id = vmi_create_view(vmi_fd, KVM_VMI_ACCESS_RWX);
+
+	/* Remap GFN 0 to our shadow page */
+	vmi_change_gfn(vmi_fd, view_id, 0, shadow_gfn);
+
+	/* Try to free - should fail */
+	free_req.gfn = shadow_gfn;
+	ret = ioctl(vmi_fd, KVM_VMI_FREE_GFN, &free_req);
+	TEST_ASSERT(ret == -1 && errno == EBUSY,
+		    "FREE_GFN while remapped should fail with EBUSY, "
+		    "got ret=%d errno=%d", ret, errno);
+
+	/* Revert the remap, then free should succeed */
+	vmi_change_gfn(vmi_fd, view_id, 0, KVM_VMI_INVALID_GFN);
+	vmi_free_gfn(vmi_fd, shadow_gfn);
+
+	vmi_destroy_view(vmi_fd, view_id);
+	close(vmi_fd);
+	kvm_vm_free(vm);
+	pr_info("PASS: test_free_while_remapped\n");
+}
+
+/*
  * Test 3: Session close auto-frees all shadow pages (no leak/crash).
  */
 static void test_session_close_frees(void)
@@ -94,6 +132,7 @@ int main(int argc, char *argv[])
 	TEST_REQUIRE(kvm_has_cap(KVM_CAP_VMI_ALLOC_GFN));
 
 	test_alloc_free();
+	test_free_while_remapped();
 	test_session_close_frees();
 
 	return 0;
