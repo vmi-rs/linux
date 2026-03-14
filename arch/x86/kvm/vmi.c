@@ -160,6 +160,28 @@ void kvm_vmi_restore_regs(struct kvm_vcpu *vcpu, struct kvm_vmi_regs *regs)
 }
 
 /**
+ * handle_emulate - Emulate faulting instruction for ACTION_EMULATE
+ * @vcpu: The vCPU that received ACTION_EMULATE response.
+ *
+ * Called when userspace returns ACTION_EMULATE after a mem_access event.
+ * The emulator executes the instruction that triggered the EPT violation
+ * using KVM's software emulation, reading/writing guest memory through the
+ * host mapping (bypassing the alternate view's EPT restrictions).
+ *
+ * x86_emulate_instruction() sets vcpu->run itself when it must exit to
+ * userspace (including on emulation failure), so its return value is not
+ * actionable here.
+ */
+static void handle_emulate(struct kvm_vcpu *vcpu)
+{
+	struct kvm_vcpu_vmi *vcpu_vmi = vcpu->vmi;
+
+	x86_emulate_instruction(vcpu, vcpu_vmi->arch.emul_gpa,
+				EMULTYPE_PF | EMULTYPE_ALLOW_RETRY_PF,
+				NULL, 0);
+}
+
+/**
  * kvm_vmi_handle_event_response - Dispatch event response to the right handler
  * @vcpu: The vCPU that delivered the event.
  * @event_type: The KVM_VMI_EVENT_* type of the original event.
@@ -173,6 +195,10 @@ void kvm_vmi_handle_event_response(struct kvm_vcpu *vcpu, u32 event_type,
 				   u32 resp)
 {
 	switch (event_type) {
+	case KVM_VMI_EVENT_MEM_ACCESS:
+		if (resp & KVM_VMI_RESPONSE_EMULATE)
+			handle_emulate(vcpu);
+		break;
 	default:
 		break;
 	}
@@ -283,6 +309,16 @@ int kvm_vmi_inject_event(struct kvm_vcpu *vcpu,
 bool kvm_arch_vmi_supported(void)
 {
 	return kvm_x86_call(vmi_has_cap)();
+}
+
+/*
+ * x86 EPT uses 4K leaves matching the guest granule, so a view's per-GFN
+ * protection never spills onto neighbor guest pages -- there is no fusion to
+ * absorb. The autostep_mask is unnecessary; report unsupported.
+ */
+bool kvm_arch_vmi_has_auto_step(void)
+{
+	return false;
 }
 
 void kvm_arch_vmi_session_init(struct kvm_vmi *vmi)
@@ -410,3 +446,133 @@ void kvm_arch_vmi_invalidate_gfn_locked(struct kvm *kvm,
 {
 	kvm_tdp_mmu_zap_vmi_leaf(kvm, view->arch.tdp_root, gfn);
 }
+
+/**
+ * kvm_vmi_event_enabled - Check if a VMI event can be delivered.
+ * @vcpu: The vCPU to check.
+ * @event_type: The KVM_VMI_EVENT_* type to check.
+ *
+ * Returns true if the vCPU has VMI state, the event type is enabled,
+ * and a ring is set up for delivery.
+ */
+static inline bool kvm_vmi_event_enabled(struct kvm_vcpu *vcpu, u32 event_type)
+{
+	struct kvm_vmi *vmi = kvm_vmi_get(vcpu->kvm);
+
+	return vmi && (vmi->enabled_events & BIT_ULL(event_type))
+		&& vcpu->vmi && vcpu->vmi->ring;
+}
+
+/* Memory access */
+
+/*
+ * Get the access permissions for a GFN in a view.
+ * Returns the explicit override if set, otherwise the view's default.
+ */
+static u8 vmi_resolve_access(struct kvm_vmi_view_data *view, gfn_t gfn)
+{
+	void *entry;
+
+	entry = xa_load(&view->access_overrides, gfn);
+	if (entry)
+		return (u8)xa_to_value(entry);
+
+	return view->default_access;
+}
+
+/*
+ * Check if an EPT violation on an alternate view is an access violation
+ * that should be reported to the VMI agent. Called from handle_ept_violation()
+ * before entering the TDP MMU fault path.
+ *
+ * Returns:
+ *   1 - Access violation, event delivered, don't install SPTE
+ *   0 - Access allowed (or page-walk lazy populate), proceed to TDP fault
+ */
+int kvm_vmi_check_mem_access(struct kvm_vcpu *vcpu, gpa_t gpa,
+			     unsigned long exit_qual)
+{
+	struct kvm_vcpu_vmi *vcpu_vmi = vcpu->vmi;
+	/* Fault path: the vCPU run loop holds kvm->srcu across VM-exit. */
+	struct kvm_vmi_view_data *view =
+		srcu_dereference(vcpu_vmi->current_view, &vcpu->kvm->srcu);
+	gfn_t gfn = gpa >> PAGE_SHIFT;
+	u8 access, required;
+
+	if (WARN_ON(!view))
+		return 0;
+
+	/*
+	 * If the SPTE is not present (PROT_MASK == 0), let the TDP MMU
+	 * fault path install it with the view's configured access
+	 * restrictions. Access violations can only be checked once the
+	 * SPTE is present - the next fault will have PROT_MASK set,
+	 * indicating the permissions that were on the existing entry.
+	 */
+	if (!(exit_qual & EPT_VIOLATION_PROT_MASK))
+		return 0;
+
+	access = vmi_resolve_access(view, gfn);
+
+	required = 0;
+	if (exit_qual & EPT_VIOLATION_ACC_READ)
+		required |= KVM_VMI_ACCESS_R;
+	if (exit_qual & EPT_VIOLATION_ACC_WRITE)
+		required |= KVM_VMI_ACCESS_W;
+	if (exit_qual & EPT_VIOLATION_ACC_INSTR)
+		required |= KVM_VMI_ACCESS_X;
+
+	if ((required & access) != required) {
+		struct kvm_vmi_ring_event ring_event = {};
+
+		trace_kvm_vmi_mem_violation(vcpu->vcpu_id, gpa, required,
+					   access);
+
+		/*
+		 * Access violation - always deliver mem_access event.
+		 * Unlike other event types, mem_access is implicitly enabled
+		 * whenever a VMI session with a ring exists.  The agent must
+		 * handle EPT violations (e.g. via fast singlestep) to avoid
+		 * an infinite re-fault loop.
+		 */
+		vcpu_vmi->arch.emul_gpa = gpa;
+		ring_event.type = KVM_VMI_EVENT_MEM_ACCESS;
+		ring_event.vcpu_id = vcpu->vcpu_id;
+		ring_event.mem_access.gpa = gpa;
+		ring_event.mem_access.access = required;
+		trace_kvm_vmi_event_deliver(vcpu->vcpu_id,
+					    KVM_VMI_EVENT_MEM_ACCESS,
+					    gpa);
+		kvm_vmi_deliver_via_ring(vcpu, &ring_event);
+		return 1;
+	}
+
+	return 0;
+}
+EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_vmi_check_mem_access);
+
+/*
+ * Prepare a page fault struct with VMI overrides for an alternate view.
+ * Called from kvm_mmu_do_page_fault() after the fault struct is created.
+ *
+ * Sets:
+ *   fault->vmi_access - View's access mask for this GFN
+ */
+void kvm_vmi_setup_page_fault(struct kvm_vcpu *vcpu,
+			      struct kvm_page_fault *fault)
+{
+	struct kvm_vcpu_vmi *vcpu_vmi = vcpu->vmi;
+	struct kvm_vmi_view_data *view;
+
+	if (!vcpu_vmi || vcpu_vmi->current_view_id == 0)
+		return;
+
+	/* Fault path: the vCPU run loop holds kvm->srcu across VM-exit. */
+	view = srcu_dereference(vcpu_vmi->current_view, &vcpu->kvm->srcu);
+	if (!view)
+		return;
+
+	/* Set access restriction from view */
+	fault->vmi_access = vmi_resolve_access(view, fault->gfn);
+}
+EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_vmi_setup_page_fault);

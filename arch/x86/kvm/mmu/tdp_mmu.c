@@ -1186,10 +1186,31 @@ static int tdp_mmu_map_handle_target_level(struct kvm_vcpu *vcpu,
 
 	if (unlikely(!fault->slot))
 		new_spte = make_mmio_spte(vcpu, iter->gfn, ACC_ALL);
-	else
-		wrprot = make_spte(vcpu, sp, fault->slot, ACC_ALL, iter->gfn,
-				   fault->pfn, iter->old_spte, fault->prefetch,
-				   false, fault->map_writable, &new_spte);
+	else {
+		unsigned int pte_access = ACC_ALL;
+
+#ifdef CONFIG_KVM_VMI
+		/*
+		 * Translate uAPI KVM_VMI_ACCESS_* to KVM-internal ACC_ flags.
+		 * In EPT mode, KVM repurposes ACC_ bits: ACC_USER_MASK encodes
+		 * read, ACC_WRITE_MASK encodes write, ACC_EXEC_MASK encodes
+		 * execute. See FNAME(gpte_access) in paging_tmpl.h.
+		 */
+		if (fault->vmi_access) {
+			pte_access = 0;
+			if (fault->vmi_access & KVM_VMI_ACCESS_R)
+				pte_access |= ACC_USER_MASK;
+			if (fault->vmi_access & KVM_VMI_ACCESS_W)
+				pte_access |= ACC_WRITE_MASK;
+			if (fault->vmi_access & KVM_VMI_ACCESS_X)
+				pte_access |= ACC_EXEC_MASK;
+		}
+#endif
+		wrprot = make_spte(vcpu, sp, fault->slot, pte_access,
+				   iter->gfn, fault->pfn, iter->old_spte,
+				   fault->prefetch, false,
+				   fault->map_writable, &new_spte);
+	}
 
 	if (new_spte == iter->old_spte)
 		ret = RET_PF_SPURIOUS;
