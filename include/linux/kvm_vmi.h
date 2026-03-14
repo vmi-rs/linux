@@ -40,6 +40,8 @@ struct kvm_vmi_view_data {
  * @lock: Protects VMI state modifications.
  * @views: Xarray of alternate memory views (struct kvm_vmi_view_data).
  * @next_view_id: Next view ID to allocate (starts at 1; 0 is the host view).
+ * @shadow_pages: Xarray mapping shadow_gfn -> struct page *.
+ * @next_shadow_gfn: Monotonic counter for shadow GFN allocation.
  * @enabled_events: Bitmask of enabled event types (BIT_ULL(KVM_VMI_EVENT_*)).
  * @arch: Architecture-specific VMI monitoring config (CR/MSR).
  */
@@ -47,6 +49,10 @@ struct kvm_vmi {
 	struct mutex lock;
 	struct xarray views;
 	u32 next_view_id;
+
+	/* Shadow page allocation */
+	struct xarray shadow_pages;	/* shadow_gfn -> struct page * */
+	u64 next_shadow_gfn;		/* monotonic counter */
 
 	/* Event monitoring config (VM-wide) */
 	u64 enabled_events;
