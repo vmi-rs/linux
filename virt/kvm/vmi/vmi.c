@@ -895,6 +895,23 @@ static int kvm_vmi_unpause_vcpu_ioctl(struct kvm *kvm, u32 vcpu_id)
 	return 0;
 }
 
+static int kvm_vmi_inject_event_ioctl(struct kvm *kvm,
+				      struct kvm_vmi_inject_event *inject)
+{
+	struct kvm_vcpu *vcpu;
+	int r;
+
+	vcpu = kvm_get_vcpu_by_id(kvm, inject->vcpu_id);
+	if (!vcpu || !vcpu->vmi)
+		return -EINVAL;
+
+	/* Exception injection modifies vCPU exception state */
+	mutex_lock(&vcpu->mutex);
+	r = kvm_vmi_inject_event(vcpu, inject);
+	mutex_unlock(&vcpu->mutex);
+	return r;
+}
+
 /*
  * KVM_VMI_GET_MEM_INFO: report the guest RAM extent.
  *
@@ -1083,6 +1100,13 @@ static long kvm_vmi_ioctl(struct file *file, unsigned int ioctl,
 		if (copy_from_user(&v, argp, sizeof(v)))
 			return -EFAULT;
 		return kvm_vmi_unpause_vcpu_ioctl(kvm, v.vcpu_id);
+	}
+	case KVM_VMI_INJECT_EVENT: {
+		struct kvm_vmi_inject_event inject;
+
+		if (copy_from_user(&inject, argp, sizeof(inject)))
+			return -EFAULT;
+		return kvm_vmi_inject_event_ioctl(kvm, &inject);
 	}
 	case KVM_VMI_GET_MEM_INFO: {
 		struct kvm_vmi_mem_info info = {};
