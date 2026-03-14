@@ -26,6 +26,7 @@ struct eventfd_ctx;
  * @visible: VMFUNC visibility (for future EPTP list, currently unused).
  * @dying: Set under vmi->lock before xa_erase to back off the lock-free view
  *	switch from incrementing vcpu_count on a view committed to free.
+ * @access_overrides: Xarray mapping GFN -> u8 access permissions.
  * @arch: Architecture-specific view data.
  * @rcu_head: Deferred free via call_srcu(&kvm->srcu): the struct must outlive
  *	an SRCU grace period for lock-free fault-path readers.
@@ -36,6 +37,7 @@ struct kvm_vmi_view_data {
 	u8 default_access;
 	bool visible;
 	bool dying;
+	struct xarray access_overrides;
 	struct kvm_arch_vmi_view arch;
 	struct rcu_head rcu_head;	/* deferred free via call_srcu */
 };
@@ -131,6 +133,7 @@ int kvm_vmi_inject_event(struct kvm_vcpu *vcpu,
 
 /* Arch callbacks (generic -> arch contract) */
 bool kvm_arch_vmi_supported(void);
+bool kvm_arch_vmi_has_auto_step(void);
 
 void kvm_arch_vmi_session_init(struct kvm_vmi *vmi);
 void kvm_arch_vmi_session_cleanup(struct kvm_vmi *vmi);
