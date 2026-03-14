@@ -13,6 +13,7 @@
 #include <kvm/iodev.h>
 
 #include <linux/kvm_host.h>
+#include <linux/kvm_vmi.h>
 #include <linux/kvm.h>
 #include <linux/module.h>
 #include <linux/errno.h>
@@ -4434,8 +4435,21 @@ static long kvm_vcpu_ioctl(struct file *filp,
 	struct kvm_fpu *fpu = NULL;
 	struct kvm_sregs *kvm_sregs = NULL;
 
-	if (vcpu->kvm->mm != current->mm || vcpu->kvm->vm_dead)
+	if (vcpu->kvm->vm_dead)
 		return -EIO;
+#ifdef CONFIG_KVM_VMI
+	/*
+	 * When a VMI session is active, allow read-only register access
+	 * from external processes.  The VMI agent duplicates QEMU's vCPU
+	 * fds via pidfd_getfd() and calls KVM_GET_REGS/SREGS/MSRS while
+	 * the vCPU is paused (vcpu->mutex released).
+	 */
+	if (vcpu->kvm->mm != current->mm && !kvm_vmi_get(vcpu->kvm))
+		return -EIO;
+#else
+	if (vcpu->kvm->mm != current->mm)
+		return -EIO;
+#endif
 
 	if (unlikely(_IOC_TYPE(ioctl) != KVMIO))
 		return -EINVAL;
@@ -5173,7 +5187,20 @@ static long kvm_vm_ioctl(struct file *filp,
 	void __user *argp = (void __user *)arg;
 	int r;
 
-	if (kvm->mm != current->mm || kvm->vm_dead)
+	if (kvm->vm_dead)
+		return -EIO;
+#ifdef CONFIG_KVM_VMI
+	/*
+	 * KVM_CREATE_VMI is explicitly allowed from external processes -
+	 * the VMI agent runs in a separate process and attaches to the
+	 * VM via pidfd_getfd() on QEMU's VM fd.  All other VM ioctls
+	 * require the creating process's mm.
+	 */
+	if (ioctl == KVM_CREATE_VMI) {
+		return kvm_arch_vm_ioctl(filp, ioctl, arg);
+	}
+#endif
+	if (kvm->mm != current->mm)
 		return -EIO;
 	switch (ioctl) {
 	case KVM_CREATE_VCPU:

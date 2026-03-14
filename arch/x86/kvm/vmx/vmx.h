@@ -740,4 +740,9 @@ static inline void vmx_segment_cache_clear(struct vcpu_vmx *vmx)
 int vmx_init(void);
 void vmx_exit(void);
 
+#ifdef CONFIG_KVM_VMI
+bool vmx_vmi_has_cap(void);
+void vmx_vmi_apply_vmcs_state(struct kvm_vcpu *vcpu);
+#endif
+
 #endif /* __KVM_X86_VMX_H */
