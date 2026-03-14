@@ -4891,6 +4891,9 @@ int kvm_vm_ioctl_check_extension(struct kvm *kvm, long ext)
 	case KVM_CAP_VMI_ALLOC_GFN:
 		r = kvm_vmi_has_cap();
 		break;
+	case KVM_CAP_VMI_EPT_PW:
+		r = kvm_x86_call(vmi_has_ept_paging_write)();
+		break;
 #endif
 	case KVM_CAP_PRE_FAULT_MEMORY:
 		r = tdp_enabled;

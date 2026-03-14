@@ -531,6 +531,11 @@ bool kvm_arch_vmi_supported(void)
 	return kvm_x86_call(vmi_has_cap)();
 }
 
+bool kvm_arch_vmi_has_paging_write(void)
+{
+	return kvm_x86_call(vmi_has_ept_paging_write)();
+}
+
 void kvm_arch_vmi_session_init(struct kvm_vmi *vmi)
 {
 	xa_init(&vmi->arch.msr_monitor);
