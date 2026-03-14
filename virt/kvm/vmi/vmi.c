@@ -212,6 +212,7 @@ static int kvm_vmi_apply_ring_response(struct kvm_vcpu *vcpu,
 {
 	u32 resp = READ_ONCE(event->response);
 	u32 event_type = event->type;
+	struct kvm_vcpu_vmi *vcpu_vmi = vcpu->vmi;
 
 	/* Mask to known flags */
 	resp &= KVM_VMI_RESPONSE_MASK;
@@ -228,7 +229,28 @@ static int kvm_vmi_apply_ring_response(struct kvm_vcpu *vcpu,
 	if (resp & KVM_VMI_RESPONSE_SINGLESTEP)
 		kvm_arch_vmi_set_singlestep(vcpu, true);
 
-	if (resp & KVM_VMI_RESPONSE_SWITCH_VIEW) {
+	/*
+	 * Fast singlestep: execute one instruction in a target view,
+	 * then auto-switch back and suppress the singlestep event.
+	 *
+	 * With SWITCH_VIEW: step in the specified view_id.
+	 * Without SWITCH_VIEW: step in view 0 (default/host view).
+	 */
+	if ((resp & KVM_VMI_RESPONSE_SINGLESTEP_FAST) && vcpu_vmi) {
+		u32 target_view;
+
+		vcpu_vmi->fast_singlestep_active = true;
+		vcpu_vmi->fast_singlestep_restore_view =
+			vcpu_vmi->current_view_id;
+		kvm_arch_vmi_set_singlestep(vcpu, true);
+
+		if (resp & KVM_VMI_RESPONSE_SWITCH_VIEW)
+			target_view = READ_ONCE(event->view_id);
+		else
+			target_view = 0;
+
+		kvm_vmi_vcpu_switch_view(vcpu, target_view);
+	} else if (resp & KVM_VMI_RESPONSE_SWITCH_VIEW) {
 		u32 view_id = READ_ONCE(event->view_id);
 
 		kvm_vmi_vcpu_switch_view(vcpu, view_id);
