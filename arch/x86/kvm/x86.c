@@ -4865,6 +4865,7 @@ int kvm_vm_ioctl_check_extension(struct kvm *kvm, long ext)
 	case KVM_CAP_VMI:
 	case KVM_CAP_VMI_RING:
 	case KVM_CAP_VMI_GUEST_MMAP:
+	case KVM_CAP_VMI_PAUSE:
 		r = kvm_vmi_has_cap();
 		break;
 #endif
@@ -11683,6 +11684,9 @@ static int vcpu_run(struct kvm_vcpu *vcpu)
 	vcpu->run->exit_reason = KVM_EXIT_UNKNOWN;
 
 	for (;;) {
+		if (kvm_vmi_vcpu_paused(vcpu))
+			kvm_vmi_vcpu_pause_wait(vcpu);
+
 		/*
 		 * If another guest vCPU requests a PV TLB flush in the middle
 		 * of instruction emulation, the rest of the emulation could

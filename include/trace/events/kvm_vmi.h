@@ -81,6 +81,30 @@ TRACE_EVENT(kvm_vmi_session,
 	TP_printk("%s", __entry->is_create ? "create" : "release")
 );
 
+/*
+ * Trace VM/vCPU pause and unpause.
+ * vcpu_id == -1 means VM-wide operation.
+ */
+TRACE_EVENT(kvm_vmi_pause,
+	TP_PROTO(int vcpu_id, bool is_pause),
+	TP_ARGS(vcpu_id, is_pause),
+
+	TP_STRUCT__entry(
+		__field(int,	vcpu_id)
+		__field(bool,	is_pause)
+	),
+
+	TP_fast_assign(
+		__entry->vcpu_id = vcpu_id;
+		__entry->is_pause = is_pause;
+	),
+
+	TP_printk("%s %s%d",
+		  __entry->is_pause ? "pause" : "unpause",
+		  __entry->vcpu_id == -1 ? "vm" : "vcpu ",
+		  __entry->vcpu_id == -1 ? 0 : __entry->vcpu_id)
+);
+
 #endif /* _TRACE_KVM_VMI_H */
 
 #undef TRACE_INCLUDE_PATH

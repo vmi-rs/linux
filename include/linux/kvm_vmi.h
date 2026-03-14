@@ -74,6 +74,10 @@ void kvm_vmi_vcpu_destroy(struct kvm_vcpu *vcpu);
 int kvm_vmi_deliver_via_ring(struct kvm_vcpu *vcpu,
 			     struct kvm_vmi_ring_event *event);
 
+/* Pause support (called from vcpu_run) */
+bool kvm_vmi_vcpu_paused(struct kvm_vcpu *vcpu);
+void kvm_vmi_vcpu_pause_wait(struct kvm_vcpu *vcpu);
+
 /* Per-arch functions (implemented per-arch, not a generic->arch contract) */
 void kvm_vmi_capture_regs(struct kvm_vcpu *vcpu, struct kvm_vmi_regs *regs);
 void kvm_vmi_restore_regs(struct kvm_vcpu *vcpu, struct kvm_vmi_regs *regs);

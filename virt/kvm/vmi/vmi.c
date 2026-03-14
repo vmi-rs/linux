@@ -318,6 +318,55 @@ int kvm_vmi_deliver_via_ring(struct kvm_vcpu *vcpu,
 }
 
 /**
+ * kvm_vmi_vcpu_paused - Check if a vCPU is currently VMI-paused.
+ * @vcpu: The vCPU to check.
+ *
+ * Returns true if the vCPU has VMI state and its pause_count > 0.
+ * When VMI is not active, vcpu->vmi is NULL so this returns
+ * false immediately.
+ */
+bool kvm_vmi_vcpu_paused(struct kvm_vcpu *vcpu)
+{
+	return vcpu->vmi &&
+	       atomic_read(&vcpu->vmi->pause_count) > 0;
+}
+
+/**
+ * kvm_vmi_vcpu_pause_wait - Sleep until a paused vCPU is unpaused.
+ * @vcpu: The vCPU to sleep.
+ *
+ * Called from vcpu_run() when kvm_vmi_vcpu_paused() returns true.
+ * Releases vcpu->mutex, VMCS state, and SRCU read lock so the VMI
+ * agent can call KVM ioctls (KVM_GET_REGS, etc.) on this vCPU while
+ * it sleeps.  Re-acquires everything before returning.
+ */
+void kvm_vmi_vcpu_pause_wait(struct kvm_vcpu *vcpu)
+{
+	struct kvm_vcpu_vmi *vcpu_vmi = vcpu->vmi;
+
+	kvm_vcpu_srcu_read_unlock(vcpu);
+	vcpu_put(vcpu);
+	mutex_unlock(&vcpu->mutex);
+
+	/*
+	 * Safe to access vcpu_vmi here: kvm_vmi_release() sets
+	 * teardown=true and wakes this waitqueue before call_srcu(),
+	 * so the wait completes while the struct is still alive.
+	 */
+	wait_event(vcpu_vmi->pause_wq,
+		atomic_read(&vcpu_vmi->pause_count) == 0 ||
+		vcpu_vmi->teardown);
+
+	/*
+	 * Don't touch vcpu_vmi past this point - call_srcu() may
+	 * have freed it while we were outside SRCU.
+	 */
+	mutex_lock(&vcpu->mutex);
+	vcpu_load(vcpu);
+	kvm_vcpu_srcu_read_lock(vcpu);
+}
+
+/**
  * kvm_vmi_control_event - Enable or disable VM-wide event monitoring
  * @kvm: The VM.
  * @ctrl: Event control parameters from userspace.
@@ -675,6 +724,98 @@ static int kvm_vmi_ack_event(struct kvm *kvm, struct kvm_vmi_vcpu *ack)
 	return 0;
 }
 
+/*
+ * VM-wide pause: increment pause_count on all vCPUs, force them out
+ * of guest mode and off waitqueues.
+ *
+ * Three vCPU states are handled:
+ *  - In guest mode: KVM_REQ_OUTSIDE_GUEST_MODE forces a VM-exit and
+ *    waits for acknowledgement (Dekker barrier pattern).
+ *  - Halted/sleeping (HLT, kvm_vcpu_block): KVM_REQ_UNBLOCK wakes
+ *    them (KVM_REQ_OUTSIDE_GUEST_MODE has KVM_REQUEST_NO_WAKEUP).
+ *  - Not in KVM_RUN: vcpu->mutex is already free.
+ *
+ * After return, vCPUs will reach the pause check at the top of
+ * vcpu_run() and release vcpu->mutex.  KVM_GET_REGS from the VMI
+ * agent naturally serializes on vcpu->mutex, so no explicit barrier
+ * is needed here.
+ */
+static int kvm_vmi_pause_vm(struct kvm *kvm)
+{
+	struct kvm_vcpu *vcpu;
+	unsigned long i;
+
+	trace_kvm_vmi_pause(-1, true);
+	kvm_for_each_vcpu(i, vcpu, kvm) {
+		if (vcpu->vmi)
+			atomic_inc(&vcpu->vmi->pause_count);
+	}
+
+	/* Force in-guest vCPUs out synchronously. */
+	kvm_make_all_cpus_request(kvm, KVM_REQ_OUTSIDE_GUEST_MODE);
+
+	/*
+	 * Wake halted/sleeping vCPUs.  KVM_REQ_OUTSIDE_GUEST_MODE has
+	 * KVM_REQUEST_NO_WAKEUP so it skips sleeping vCPUs.
+	 * KVM_REQ_UNBLOCK wakes them from kvm_vcpu_block/halt.
+	 */
+	kvm_make_all_cpus_request(kvm, KVM_REQ_UNBLOCK);
+
+	/*
+	 * At this point:
+	 * - In-guest vCPUs have exited (KVM_REQ_OUTSIDE_GUEST_MODE is sync)
+	 * - Halted vCPUs have been woken (KVM_REQ_UNBLOCK)
+	 * - vCPUs will reach the pause check and release vcpu->mutex
+	 *
+	 * KVM_GET_REGS from the VMI agent will wait for vcpu->mutex
+	 * if the vCPU hasn't released it yet, providing the necessary
+	 * synchronization without us touching vcpu->mutex here.
+	 */
+	return 0;
+}
+
+static int kvm_vmi_unpause_vm(struct kvm *kvm)
+{
+	struct kvm_vcpu *vcpu;
+	unsigned long i;
+
+	trace_kvm_vmi_pause(-1, false);
+	kvm_for_each_vcpu(i, vcpu, kvm) {
+		if (vcpu->vmi) {
+			atomic_dec_if_positive(&vcpu->vmi->pause_count);
+			wake_up(&vcpu->vmi->pause_wq);
+		}
+	}
+	return 0;
+}
+
+static int kvm_vmi_pause_vcpu_ioctl(struct kvm *kvm, u32 vcpu_id)
+{
+	struct kvm_vcpu *vcpu;
+
+	vcpu = kvm_get_vcpu_by_id(kvm, vcpu_id);
+	if (!vcpu || !vcpu->vmi)
+		return -EINVAL;
+
+	atomic_inc(&vcpu->vmi->pause_count);
+	kvm_vcpu_kick(vcpu);
+	trace_kvm_vmi_pause(vcpu_id, true);
+	return 0;
+}
+
+static int kvm_vmi_unpause_vcpu_ioctl(struct kvm *kvm, u32 vcpu_id)
+{
+	struct kvm_vcpu *vcpu;
+
+	vcpu = kvm_get_vcpu_by_id(kvm, vcpu_id);
+	if (!vcpu || !vcpu->vmi)
+		return -EINVAL;
+
+	atomic_dec_if_positive(&vcpu->vmi->pause_count);
+	wake_up(&vcpu->vmi->pause_wq);
+	trace_kvm_vmi_pause(vcpu_id, false);
+	return 0;
+}
 static void free_vcpu_vmi(struct rcu_head *head)
 {
 	kfree(container_of(head, struct kvm_vcpu_vmi, rcu_head));
@@ -788,6 +929,24 @@ static long kvm_vmi_ioctl(struct file *file, unsigned int ioctl,
 		if (copy_from_user(&ack, argp, sizeof(ack)))
 			return -EFAULT;
 		return kvm_vmi_ack_event(kvm, &ack);
+	}
+	case KVM_VMI_PAUSE_VM:
+		return kvm_vmi_pause_vm(kvm);
+	case KVM_VMI_UNPAUSE_VM:
+		return kvm_vmi_unpause_vm(kvm);
+	case KVM_VMI_PAUSE_VCPU: {
+		struct kvm_vmi_vcpu v;
+
+		if (copy_from_user(&v, argp, sizeof(v)))
+			return -EFAULT;
+		return kvm_vmi_pause_vcpu_ioctl(kvm, v.vcpu_id);
+	}
+	case KVM_VMI_UNPAUSE_VCPU: {
+		struct kvm_vmi_vcpu v;
+
+		if (copy_from_user(&v, argp, sizeof(v)))
+			return -EFAULT;
+		return kvm_vmi_unpause_vcpu_ioctl(kvm, v.vcpu_id);
 	}
 	default:
 		return -ENOTTY;
