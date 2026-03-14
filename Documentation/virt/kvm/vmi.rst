@@ -140,6 +140,9 @@ with ``-EOPNOTSUPP`` (see the per-ioctl descriptions).
    * - ``KVM_CAP_VMI_PAUSE``
      - 503
      - VM-wide and per-vCPU pause support with refcounting.
+   * - ``KVM_CAP_VMI_INJECT``
+     - 504
+     - Event injection (exception/interrupt/NMI).
 
 Configuration: ``CONFIG_KVM_VMI`` depends on ``KVM_INTEL && X86_64`` (no SVM/AMD
 support).
@@ -534,3 +537,63 @@ and wakes any vCPU reaching 0.
 Pause/unpause a single vCPU with the same refcount semantics. Errors:
 ``-EINVAL`` (unknown ``vcpu_id`` or vCPU without VMI state).
 
+10. Event injection
+===================
+
+**KVM_VMI_INJECT_EVENT** (``_IOW(KVMIO, 0xf3, struct kvm_vmi_inject_event)``)
+
+:Type: vmi_fd ioctl
+:Parameters: ``struct kvm_vmi_inject_event`` (architecture specific)
+:Returns: 0 on success, < 0 on error
+
+Injects an event into a guest vCPU. The ioctl resolves the target by
+``vcpu_id`` (``-EINVAL`` if unknown or without VMI state). Requires
+``KVM_CAP_VMI_INJECT``.
+
+::
+
+    struct kvm_vmi_inject_event {
+        __u32 vcpu_id;
+        __u8  vector;       /* interrupt/exception vector */
+        __u8  type;         /* KVM_VMI_EVENT_TYPE_* (VMCS interruption type) */
+        __u8  insn_len;     /* instruction length for SW_INT/SW_EXCEPT */
+        __u8  pad;          /* must be 0 */
+        __u32 error_code;
+        __u32 has_error;
+        __u64 cr2;          /* for #PF (vector 14) */
+    };
+
+``type`` matches the VMCS VM-entry interruption-type encoding:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 34 8 58
+
+   * - Type
+     - Value
+     - Description / constraints
+   * - ``KVM_VMI_EVENT_TYPE_EXT_INT``
+     - 0
+     - External interrupt. Requires ``RFLAGS.IF`` = 1 (else ``-EBUSY``);
+       ``insn_len`` must be 0.
+   * - ``KVM_VMI_EVENT_TYPE_NMI``
+     - 2
+     - NMI; ``insn_len`` must be 0.
+   * - ``KVM_VMI_EVENT_TYPE_HW_EXCEPT``
+     - 3
+     - Hardware exception; ``vector`` <= 31; ``insn_len`` must be 0;
+       ``has_error`` must match whether the vector takes an error code (DF, TS,
+       NP, SS, GP, PF, AC). For ``#PF`` set ``cr2``.
+   * - ``KVM_VMI_EVENT_TYPE_SW_INT``
+     - 4
+     - Software interrupt (``INT n``); ``insn_len`` 1-15.
+   * - ``KVM_VMI_EVENT_TYPE_PRIV_SW_INT``
+     - 5
+     - **Not supported on x86** - returns ``-EOPNOTSUPP``.
+   * - ``KVM_VMI_EVENT_TYPE_SW_EXCEPT``
+     - 6
+     - Software exception; ``vector`` must be 3 (``#BP``) or 4 (``#OF``);
+       ``insn_len`` 1-15; ``has_error`` must be 0.
+
+A non-zero ``pad`` or an out-of-range type/vector/insn_len/has_error returns
+``-EINVAL``.

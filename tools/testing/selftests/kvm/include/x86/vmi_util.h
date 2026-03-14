@@ -42,6 +42,9 @@ void vmi_pause_vm(int vmi_fd);
 void vmi_unpause_vm(int vmi_fd);
 void vmi_pause_vcpu(int vmi_fd, uint32_t vcpu_id);
 void vmi_unpause_vcpu(int vmi_fd, uint32_t vcpu_id);
+void vmi_inject_event(int vmi_fd, uint32_t vcpu_id, uint8_t vector,
+		      uint8_t type, uint32_t error_code, int has_error,
+		      uint8_t insn_len);
 void vmi_teardown_ring(struct vmi_test_ring *r);
 void *vmi_vcpu_thread_fn(void *arg);
 int vmi_test_setup(struct kvm_vm **vm, struct kvm_vcpu **vcpu,
