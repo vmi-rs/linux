@@ -225,6 +225,9 @@ static int kvm_vmi_apply_ring_response(struct kvm_vcpu *vcpu,
 	/* Dispatch to arch-specific response handler */
 	kvm_vmi_handle_event_response(vcpu, event_type, resp);
 
+	if (resp & KVM_VMI_RESPONSE_SINGLESTEP)
+		kvm_arch_vmi_set_singlestep(vcpu, true);
+
 	if (resp & KVM_VMI_RESPONSE_SWITCH_VIEW) {
 		u32 view_id = READ_ONCE(event->view_id);
 

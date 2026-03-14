@@ -22,7 +22,8 @@
 #endif
 
 #define kvm_vmi_event_types				\
-	{ KVM_VMI_EVENT_MEM_ACCESS,	"mem_access" }	\
+	{ KVM_VMI_EVENT_MEM_ACCESS,	"mem_access" },	\
+	{ KVM_VMI_EVENT_SINGLESTEP,	"singlestep" }	\
 	kvm_vmi_event_types_arch
 
 #define kvm_vmi_response_flags				\
@@ -30,7 +31,8 @@
 	{ KVM_VMI_RESPONSE_SET_REGS,		"SET_REGS" },	\
 	{ KVM_VMI_RESPONSE_SWITCH_VIEW,		"SWITCH_VIEW" },\
 	{ KVM_VMI_RESPONSE_EMULATE,		"EMULATE" },	\
-	{ KVM_VMI_RESPONSE_REINJECT,		"REINJECT" }
+	{ KVM_VMI_RESPONSE_REINJECT,		"REINJECT" },	\
+	{ KVM_VMI_RESPONSE_SINGLESTEP,		"SINGLESTEP" }
 
 #define kvm_vmi_access_flags					\
 	{ KVM_VMI_ACCESS_R,		"R" },			\
