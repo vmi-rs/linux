@@ -141,6 +141,13 @@ static inline bool cpu_has_tertiary_exec_ctrls(void)
 		CPU_BASED_ACTIVATE_TERTIARY_CONTROLS;
 }
 
+static inline bool cpu_has_vmx_ept_paging_write(void)
+{
+	return cpu_has_tertiary_exec_ctrls() &&
+		(vmcs_config.cpu_based_3rd_exec_ctrl &
+		 TERTIARY_EXEC_EPT_PAGING_WRITE);
+}
+
 static inline bool cpu_has_vmx_virtualize_apic_accesses(void)
 {
 	return vmcs_config.cpu_based_2nd_exec_ctrl &
