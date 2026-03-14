@@ -24,6 +24,10 @@
 #define KVM_VMI_TEARDOWN_RING     _IOW(KVMIO,  0xeb, __u32)
 #define KVM_VMI_ACK_EVENT         _IOW(KVMIO,  0xec, struct kvm_vmi_vcpu)
 #define KVM_VMI_CONTROL_EVENT     _IOW(KVMIO,  0xed, struct kvm_vmi_control_event)
+#define KVM_VMI_PAUSE_VM          _IO(KVMIO,   0xee)
+#define KVM_VMI_UNPAUSE_VM        _IO(KVMIO,   0xef)
+#define KVM_VMI_PAUSE_VCPU        _IOW(KVMIO,  0xf0, struct kvm_vmi_vcpu)
+#define KVM_VMI_UNPAUSE_VCPU      _IOW(KVMIO,  0xf1, struct kvm_vmi_vcpu)
 #define KVM_VMI_GET_MEM_INFO      _IOR(KVMIO,  0xf6, struct kvm_vmi_mem_info)
 
 /* Ring event response flags (bitmask, combinable) */
