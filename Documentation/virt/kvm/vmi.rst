@@ -394,6 +394,11 @@ depends on the event (and the architecture) - see the per-event sections.
      - 1 << 4
      - Deliver the intercepted exception to the guest instead of consuming it:
        ``#BP`` for breakpoints, ``#DB`` (with the original DR6) for debug.
+   * - ``KVM_VMI_RESPONSE_SINGLESTEP``
+     - 1 << 5
+     - Single-step the next instruction (MTF). One-shot. If
+       ``KVM_VMI_EVENT_SINGLESTEP`` is enabled, a singlestep event fires after
+       the instruction.
 5.6 Register snapshot
 ---------------------
 
@@ -493,6 +498,9 @@ defined in ``<asm/kvm_vmi.h>``.
    * - 0
      - ``MEM_ACCESS``
      - generic (per-view access violation)
+   * - 1
+     - ``SINGLESTEP``
+     - generic
    * - 8
      - ``CR``
      - control register write
@@ -544,6 +552,28 @@ Responses: ``SET_REGS``, ``SWITCH_VIEW``, ``SINGLESTEP``, ``SINGLESTEP_FAST``.
 the view's permissions. A bare ``CONTINUE`` does not by itself resolve the fault
 (the access is re-attempted); the agent must widen the permission, emulate, or
 step past it (``SINGLESTEP_FAST``) to make progress.
+
+KVM_VMI_EVENT_SINGLESTEP (1)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+:Trigger: completion of a single instruction step armed by a prior
+          ``SINGLESTEP`` response
+:Data: ``struct kvm_vmi_event_singlestep``
+
+::
+
+    struct kvm_vmi_event_singlestep {
+        __u64 gpa;   /* guest-physical of the instruction */
+    };
+
+A step is armed only by ``KVM_VMI_RESPONSE_SINGLESTEP`` /
+``KVM_VMI_RESPONSE_SINGLESTEP_FAST``; there is no single-step ioctl. Delivery of
+the event additionally requires ``KVM_VMI_EVENT_SINGLESTEP`` to be enabled via
+``CONTROL_EVENT`` - if it is not, the step still occurs but no event is
+delivered and the guest resumes. A ``SINGLESTEP_FAST`` step is consumed and its
+event suppressed before this gate, so it never delivers a singlestep event.
+Single-step is one-shot; respond ``SINGLESTEP`` again to keep stepping.
+Responses: ``SET_REGS``, ``SWITCH_VIEW``, ``SINGLESTEP``.
 
 6.4 x86 architecture events
 ---------------------------

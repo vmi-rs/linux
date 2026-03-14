@@ -226,6 +226,9 @@ static int kvm_vmi_apply_ring_response(struct kvm_vcpu *vcpu,
 	/* Dispatch to arch-specific response handler */
 	kvm_vmi_handle_event_response(vcpu, event_type, resp);
 
+	if (resp & KVM_VMI_RESPONSE_SINGLESTEP)
+		kvm_arch_vmi_set_singlestep(vcpu, true);
+
 	if (resp & KVM_VMI_RESPONSE_SWITCH_VIEW) {
 		u32 view_id = READ_ONCE(event->view_id);
 
@@ -1860,6 +1863,22 @@ static int kvm_vmi_release(struct inode *inode, struct file *file)
 	 * returns, so every vCPU stays parked through the whole teardown.
 	 */
 	kvm_vmi_pause_vm(kvm);
+
+	/*
+	 * Restore any guest CPU state an in-flight single-step left masked, while
+	 * the per-session VMI state is still alive and the vCPU is parked (mutex
+	 * dropped). This must run before vcpu->vmi is NULLed below (via WRITE_ONCE after kvm_vmi_free_ring()):
+	 * otherwise the restore is left to a later apply that can no longer reach
+	 * the per-session saved value, leaving the guest with interrupts masked (a
+	 * silent hang). The arch hook is a no-op where single-step masks no state.
+	 */
+	kvm_for_each_vcpu(i, vcpu, kvm) {
+		if (!vcpu->vmi)
+			continue;
+		mutex_lock(&vcpu->mutex);
+		kvm_arch_vmi_restore_singlestep(vcpu);
+		mutex_unlock(&vcpu->mutex);
+	}
 
 	/* Clear VM-wide event monitoring state */
 	vmi->enabled_events = 0;

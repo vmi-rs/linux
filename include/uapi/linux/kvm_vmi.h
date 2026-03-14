@@ -76,10 +76,11 @@
 #define KVM_VMI_RESPONSE_SWITCH_VIEW       (1 << 2)
 #define KVM_VMI_RESPONSE_EMULATE           (1 << 3)
 #define KVM_VMI_RESPONSE_REINJECT          (1 << 4)
+#define KVM_VMI_RESPONSE_SINGLESTEP        (1 << 5)
 #define KVM_VMI_RESPONSE_MASK \
 	(KVM_VMI_RESPONSE_DENY | KVM_VMI_RESPONSE_SET_REGS | \
 	 KVM_VMI_RESPONSE_SWITCH_VIEW | KVM_VMI_RESPONSE_EMULATE | \
-	 KVM_VMI_RESPONSE_REINJECT)
+	 KVM_VMI_RESPONSE_REINJECT | KVM_VMI_RESPONSE_SINGLESTEP)
 
 /*
  * VMI ioctl structures
@@ -245,6 +246,10 @@ struct kvm_vmi_event_mem_access {
 	__u32 pad;
 };
 
+struct kvm_vmi_event_singlestep {
+	__u64 gpa;
+};
+
 /**
  * struct kvm_vmi_ring_header - Ring page header
  * @req_prod: Producer index (kernel increments after writing event)
@@ -265,7 +270,7 @@ struct kvm_vmi_ring_header {
  * Written by kernel (header + event data + regs), response area
  * written by agent before signaling ack_fd.
  *
- * Generic events (mem_access) are direct union members.
+ * Generic events (mem_access, singlestep) are direct union members.
  * Arch-specific events are grouped under the 'arch' union member.
  */
 struct kvm_vmi_ring_event {
@@ -281,6 +286,7 @@ struct kvm_vmi_ring_event {
 	/* Event-specific data: written by kernel */
 	union {
 		struct kvm_vmi_event_mem_access mem_access;
+		struct kvm_vmi_event_singlestep singlestep;
 		union kvm_vmi_arch_event_data arch;
 	};
 
