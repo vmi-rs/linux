@@ -8,6 +8,7 @@ KVM
    :maxdepth: 2
 
    api
+   vmi
    devices/index
 
    arm/index

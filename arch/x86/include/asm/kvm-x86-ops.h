@@ -149,6 +149,11 @@ KVM_X86_OP_OPTIONAL_RET0(gmem_prepare)
 KVM_X86_OP_OPTIONAL_RET0(gmem_max_mapping_level)
 KVM_X86_OP_OPTIONAL(gmem_invalidate)
 
+#ifdef CONFIG_KVM_VMI
+KVM_X86_OP_OPTIONAL_RET0(vmi_has_cap)
+KVM_X86_OP_OPTIONAL(vmi_apply_state)
+#endif
+
 #undef KVM_X86_OP
 #undef KVM_X86_OP_OPTIONAL
 #undef KVM_X86_OP_OPTIONAL_RET0
