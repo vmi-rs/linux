@@ -44,6 +44,8 @@ int vmi_destroy_view_err(int vmi_fd, uint32_t view_id);
 void vmi_switch_view(int vmi_fd, uint32_t view_id);
 void vmi_set_mem_access(int vmi_fd, uint32_t view_id, uint64_t gfn,
 			uint8_t access);
+uint64_t vmi_alloc_gfn(int vmi_fd);
+void vmi_free_gfn(int vmi_fd, uint64_t gfn);
 void vmi_pause_vm(int vmi_fd);
 void vmi_unpause_vm(int vmi_fd);
 void vmi_pause_vcpu(int vmi_fd, uint32_t vcpu_id);

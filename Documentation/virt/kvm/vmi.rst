@@ -143,6 +143,9 @@ with ``-EOPNOTSUPP`` (see the per-ioctl descriptions).
    * - ``KVM_CAP_VMI_INJECT``
      - 504
      - Event injection (exception/interrupt/NMI).
+   * - ``KVM_CAP_VMI_ALLOC_GFN``
+     - 505
+     - Shadow-frame allocation for guest-frame remapping workflows.
 
 Configuration: ``CONFIG_KVM_VMI`` depends on ``KVM_INTEL && X86_64`` (no SVM/AMD
 support).
@@ -673,6 +676,43 @@ each frame reports its override if set, else the view's ``default_access``.
 Errors: ``-EINVAL`` (no session), ``-ENOENT`` (unknown non-zero view),
 ``-EFAULT`` (NULL batch pointers or copy failure), ``-ENOMEM`` (batch
 allocation failure).
+
+7.3 Guest-frame remapping
+-------------------------
+
+**KVM_VMI_ALLOC_GFN** (``_IOWR(KVMIO, 0xf9, struct kvm_vmi_alloc_gfn)``)
+
+:Type: vmi_fd ioctl
+:Parameters: ``struct kvm_vmi_alloc_gfn`` (``gfn`` OUT)
+:Returns: 0 on success, < 0 on error
+
+::
+
+    struct kvm_vmi_alloc_gfn {
+        __u64 gfn;   /* OUT: allocated shadow GFN */
+    };
+
+Allocates a zeroed kernel page and assigns it a shadow GFN from a counter
+starting at ``KVM_VMI_SHADOW_GFN_BASE`` (``0xFFFFFE000000``), well above any
+realistic guest physical address. The shadow page is accessible via ``vmi_fd``
+mmap at offset ``gfn << PAGE_SHIFT``. Errors: ``-EINVAL`` (no session),
+``-ENOMEM``.
+
+**KVM_VMI_FREE_GFN** (``_IOW(KVMIO, 0xfa, struct kvm_vmi_free_gfn)``)
+
+:Type: vmi_fd ioctl
+:Parameters: ``struct kvm_vmi_free_gfn`` (``gfn`` IN)
+:Returns: 0 on success, < 0 on error
+
+::
+
+    struct kvm_vmi_free_gfn {
+        __u64 gfn;   /* IN: shadow GFN to free */
+    };
+
+Frees a shadow page (and force-unmaps it from any agent mapping). Errors:
+``-EINVAL`` (no session, or ``gfn < KVM_VMI_SHADOW_GFN_BASE``), ``-ENOENT``
+(not allocated), ``-EBUSY`` (still referenced by a ``CHANGE_GFN`` remap).
 
 8. Guest memory access
 ======================

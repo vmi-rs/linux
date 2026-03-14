@@ -37,6 +37,13 @@
 					 KVM_VMI_ACCESS_X)
 #define KVM_VMI_ACCESS_DEFAULT		0xff  /* Use view's default access */
 
+/*
+ * Base GFN for VMI-allocated shadow pages. Shadow GFNs live in a
+ * reserved range above guest physical memory and are backed by
+ * kernel-allocated pages rather than guest memslots.
+ */
+#define KVM_VMI_SHADOW_GFN_BASE		(0xFFFFFE000000ULL)
+
 /* Ioctls on vmi_fd (returned by KVM_CREATE_VMI) */
 #define KVM_VMI_SETUP_RING        _IOWR(KVMIO, 0xea, struct kvm_vmi_setup_ring)
 #define KVM_VMI_TEARDOWN_RING     _IOW(KVMIO,  0xeb, __u32)
@@ -53,6 +60,8 @@
 #define KVM_VMI_SWITCH_VIEW       _IOW(KVMIO,  0xf6, struct kvm_vmi_switch_view)
 #define KVM_VMI_GET_MEM_ACCESS    _IOWR(KVMIO, 0xf7, struct kvm_vmi_mem_access)
 #define KVM_VMI_SET_MEM_ACCESS    _IOW(KVMIO,  0xf8, struct kvm_vmi_mem_access)
+#define KVM_VMI_ALLOC_GFN         _IOWR(KVMIO, 0xf9, struct kvm_vmi_alloc_gfn)
+#define KVM_VMI_FREE_GFN          _IOW(KVMIO,  0xfa, struct kvm_vmi_free_gfn)
 
 /* Ring event response flags (bitmask, combinable) */
 #define KVM_VMI_RESPONSE_CONTINUE          (0)  /* Default: proceed with normal handling */
@@ -188,6 +197,14 @@ struct kvm_vmi_mem_access {
 			__u64 accesses_uaddr;
 		};
 	};
+};
+
+struct kvm_vmi_alloc_gfn {
+	__u64 gfn;	/* out: allocated shadow GFN */
+};
+
+struct kvm_vmi_free_gfn {
+	__u64 gfn;	/* in: shadow GFN to free */
 };
 
 /*
