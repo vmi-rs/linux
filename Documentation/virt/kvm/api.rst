@@ -6551,6 +6551,35 @@ KVM_S390_KEYOP_SSKE
   Sets the storage key for the guest address ``guest_addr`` to the key
   specified in ``key``, returning the previous value in ``key``.
 
+4.145 KVM_CREATE_VMI
+--------------------
+
+:Capability: KVM_CAP_VMI
+:Architectures: x86
+:Type: vm ioctl
+:Parameters: none
+:Returns: a vmi_fd file descriptor on success, <0 on error
+
+Creates a VMI (Virtual Machine Introspection) session for the VM. The
+returned ``vmi_fd`` is the single control channel for all VMI operations,
+including event monitoring, alternate memory views, guest-frame remapping,
+guest memory mapping, vCPU pause, and event injection. Only one VMI session
+may be active per VM; a second call returns ``-EBUSY`` (``-ENOMEM`` on
+allocation failure).
+
+Unlike other VM-fd ioctls, ``KVM_CREATE_VMI`` may be issued from a process
+other than the one that created the VM (the ``kvm->mm == current->mm`` check
+is bypassed for it), so an external introspection agent can attach to a VM
+owned by the VMM. While a session is active, the agent may also issue vCPU-fd
+ioctls (``KVM_GET_REGS`` etc.) from its own process on duplicated vCPU fds.
+
+Closing the ``vmi_fd`` (including on agent crash) performs full cleanup: all
+vCPUs are paused and switched back to view 0, event monitoring is disabled,
+alternate views are destroyed, per-vCPU rings are torn down, and shadow
+frames are freed. This ensures no VMI state leaks.
+
+See ``Documentation/virt/kvm/vmi.rst`` for the full VMI API reference.
+
 .. _kvm_run:
 
 5. The kvm_run structure
@@ -9435,6 +9464,23 @@ available.
 KVM exits with the register state of either the L1 or L2 guest
 depending on which executed at the time of an exit. Userspace must
 take care to differentiate between these cases.
+
+8.47 KVM_CAP_VMI
+-----------------
+
+:Architectures: x86
+
+The presence of this capability indicates that the ``KVM_CREATE_VMI`` ioctl
+is available on the VM fd. VMI requires ``CONFIG_KVM_VMI=y`` and EPT
+(Intel VT-x).
+
+Additional VMI sub-capabilities advertise specific VMI features:
+``KVM_CAP_VMI_RING``, ``KVM_CAP_VMI_GUEST_MMAP``, ``KVM_CAP_VMI_PAUSE``,
+``KVM_CAP_VMI_INJECT``, ``KVM_CAP_VMI_ALLOC_GFN`` and ``KVM_CAP_VMI_EPT_PW``
+(EPT paging-write monitoring).
+These capabilities are advertise-only and are not re-checked at ioctl
+dispatch. See ``Documentation/virt/kvm/vmi.rst`` for the full VMI API
+reference including all capabilities.
 
 9. Known KVM API problems
 =========================

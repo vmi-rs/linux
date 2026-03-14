@@ -990,6 +990,7 @@ struct kvm_enable_cap {
 #define KVM_CAP_ARM_SEA_TO_USER 245
 #define KVM_CAP_S390_USER_OPEREXEC 246
 #define KVM_CAP_S390_KEYOP 247
+#define KVM_CAP_VMI 500
 
 struct kvm_irq_routing_irqchip {
 	__u32 irqchip;
@@ -1658,5 +1659,11 @@ struct kvm_pre_fault_memory {
 	__u64 flags;
 	__u64 padding[5];
 };
+
+/* KVM VMI (Virtual Machine Introspection) ioctls */
+#include <linux/kvm_vmi.h>
+
+/* VM-level VMI ioctl */
+#define KVM_CREATE_VMI            _IO(KVMIO, 0xe9)
 
 #endif /* __LINUX_KVM_H */

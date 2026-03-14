@@ -385,6 +385,9 @@ struct kvm_vcpu {
 	bool preempted;
 	bool ready;
 	bool scheduled_out;
+#ifdef CONFIG_KVM_VMI
+	struct kvm_vcpu_vmi *vmi;
+#endif
 	struct kvm_vcpu_arch arch;
 	struct kvm_vcpu_stat stat;
 	char stats_id[KVM_STATS_NAME_SIZE];
@@ -875,6 +878,9 @@ struct kvm {
 	/* Protected by slots_lock (for writes) and RCU (for reads) */
 	struct xarray mem_attr_array;
 #endif
+#ifdef CONFIG_KVM_VMI
+	struct kvm_vmi __rcu *vmi;
+#endif
 	char stats_id[KVM_STATS_NAME_SIZE];
 };
 
@@ -1095,6 +1101,15 @@ static inline struct kvm_memslots *kvm_vcpu_memslots(struct kvm_vcpu *vcpu)
 
 	return __kvm_memslots(vcpu->kvm, as_id);
 }
+
+#ifdef CONFIG_KVM_VMI
+static inline struct kvm_vmi *kvm_vmi_get(struct kvm *kvm)
+{
+	return srcu_dereference_check(kvm->vmi, &kvm->srcu,
+			lockdep_is_held(&kvm->lock) ||
+			!refcount_read(&kvm->users_count));
+}
+#endif
 
 static inline bool kvm_memslots_empty(struct kvm_memslots *slots)
 {

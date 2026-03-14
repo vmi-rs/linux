@@ -213,6 +213,21 @@ config KVM_XEN
 
 	  If in doubt, say "N".
 
+config KVM_VMI
+	bool "Virtual Machine Introspection (VMI) support"
+	depends on KVM_INTEL && X86_64
+	help
+	  Provides support for KVM Virtual Machine Introspection (VMI),
+	  allowing external agents to monitor and control guest VM execution
+	  through alternate memory views, event interception, and memory
+	  access control.
+
+	  VMI enables security tools to inspect guest state, intercept
+	  control register and MSR writes, set per-page memory permissions,
+	  and create alternate memory views with GFN remapping.
+
+	  If unsure, say N.
+
 config KVM_PROVE_MMU
 	bool "Prove KVM MMU correctness"
 	depends on DEBUG_KERNEL

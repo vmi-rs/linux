@@ -34,6 +34,8 @@
 #include "xen.h"
 #include "smm.h"
 
+#include <linux/kvm_vmi.h>
+
 #include <linux/clocksource.h>
 #include <linux/interrupt.h>
 #include <linux/kvm.h>
@@ -4870,6 +4872,11 @@ int kvm_vm_ioctl_check_extension(struct kvm *kvm, long ext)
 	case KVM_CAP_ONE_REG:
 		r = 1;
 		break;
+#ifdef CONFIG_KVM_VMI
+	case KVM_CAP_VMI:
+		r = kvm_vmi_has_cap();
+		break;
+#endif
 	case KVM_CAP_PRE_FAULT_MEMORY:
 		r = tdp_enabled;
 		break;
@@ -7626,6 +7633,11 @@ set_pit2_out:
 		r = kvm_vm_ioctl_set_msr_filter(kvm, &filter);
 		break;
 	}
+#ifdef CONFIG_KVM_VMI
+	case KVM_CREATE_VMI:
+		r = kvm_create_vmi(kvm);
+		break;
+#endif
 	default:
 		r = -ENOTTY;
 	}
@@ -11273,6 +11285,9 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
 		}
 	}
 
+	if (kvm_check_request(KVM_REQ_VMI_UPDATE, vcpu))
+		kvm_x86_call(vmi_apply_state)(vcpu);
+
 	if (kvm_check_request(KVM_REQ_EVENT, vcpu) || req_int_win ||
 	    kvm_xen_has_interrupt(vcpu)) {
 		++vcpu->stat.req_event;
@@ -12842,6 +12857,12 @@ int kvm_arch_vcpu_create(struct kvm_vcpu *vcpu)
 	kvm_vcpu_reset(vcpu, false);
 	kvm_init_mmu(vcpu);
 	vcpu_put(vcpu);
+
+#ifdef CONFIG_KVM_VMI
+	r = kvm_vmi_vcpu_init(vcpu);
+	if (r)
+		goto free_guest_fpu;
+#endif
 	return 0;
 
 free_guest_fpu:
@@ -12896,6 +12917,9 @@ void kvm_arch_vcpu_destroy(struct kvm_vcpu *vcpu)
 	kvm_xen_destroy_vcpu(vcpu);
 	kvm_hv_vcpu_uninit(vcpu);
 	kvm_pmu_destroy(vcpu);
+#ifdef CONFIG_KVM_VMI
+	kvm_vmi_vcpu_destroy(vcpu);
+#endif
 	kfree(vcpu->arch.mce_banks);
 	kfree(vcpu->arch.mci_ctl2_banks);
 	kvm_free_lapic(vcpu);
@@ -13441,6 +13465,9 @@ void kvm_arch_destroy_vm(struct kvm *kvm)
 	kvm_page_track_cleanup(kvm);
 	kvm_xen_destroy_vm(kvm);
 	kvm_hv_destroy_vm(kvm);
+#ifdef CONFIG_KVM_VMI
+	kvm_vmi_destroy(kvm);
+#endif
 	kvm_x86_call(vm_destroy)(kvm);
 }
 

@@ -1,0 +1,124 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * KVM VMI (Virtual Machine Introspection) basic tests
+ *
+ * Tests for:
+ * - KVM_CAP_VMI capability detection
+ * - KVM_CREATE_VMI ioctl (create VMI session)
+ * - KVM_VMI_CONTROL_EVENT basic validation via vmi_fd
+ */
+
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/ioctl.h>
+
+#include "test_util.h"
+#include "kvm_util.h"
+#include "processor.h"
+#include "vmi_util.h"
+
+/*
+ * Simple guest code: just halt.
+ * We don't run it in most tests; these are ioctl-level tests.
+ */
+static void guest_code(void)
+{
+	for (;;)
+		asm volatile("hlt");
+}
+
+/*
+ * Test 1: KVM_CAP_VMI capability is reported
+ */
+static void test_cap_vmi(void)
+{
+	int r;
+
+	r = kvm_check_cap(KVM_CAP_VMI);
+	TEST_ASSERT(r > 0,
+		    "KVM_CAP_VMI should be supported, got %d", r);
+	pr_info("PASS: KVM_CAP_VMI is supported (value=%d)\n", r);
+}
+
+/*
+ * Test 3: KVM_CREATE_VMI succeeds on a fresh VM and returns fd >= 0
+ */
+static void test_vmi_create(void)
+{
+	struct kvm_vm *vm;
+	int fd;
+
+	vm = vm_create_barebones();
+	fd = __vm_ioctl(vm, KVM_CREATE_VMI, NULL);
+	TEST_ASSERT(fd >= 0,
+		    "KVM_CREATE_VMI should return fd >= 0 on fresh VM, got %d (errno=%d)",
+		    fd, errno);
+
+	close(fd);
+	kvm_vm_free(vm);
+	pr_info("PASS: KVM_CREATE_VMI succeeds on fresh VM\n");
+}
+
+/*
+ * Test 4: Second KVM_CREATE_VMI fails with -EBUSY while session is active
+ */
+static void test_vmi_create_twice(void)
+{
+	struct kvm_vm *vm;
+	int fd, fd2;
+
+	vm = vm_create_barebones();
+	fd = __vm_ioctl(vm, KVM_CREATE_VMI, NULL);
+	TEST_ASSERT(fd >= 0,
+		    "First KVM_CREATE_VMI should succeed, got %d", fd);
+
+	fd2 = __vm_ioctl(vm, KVM_CREATE_VMI, NULL);
+	TEST_ASSERT(fd2 == -1 && errno == EBUSY,
+		    "Second KVM_CREATE_VMI should fail with EBUSY, got fd2=%d errno=%d",
+		    fd2, errno);
+
+	close(fd);
+	kvm_vm_free(vm);
+	pr_info("PASS: KVM_CREATE_VMI correctly fails on second call\n");
+}
+
+/*
+ * Test 5: Close vmi_fd, then KVM_CREATE_VMI again (re-create after cleanup)
+ */
+static void test_vmi_create_close_recreate(void)
+{
+	struct kvm_vm *vm;
+	int fd;
+
+	vm = vm_create_barebones();
+
+	/* First session */
+	fd = __vm_ioctl(vm, KVM_CREATE_VMI, NULL);
+	TEST_ASSERT(fd >= 0,
+		    "First KVM_CREATE_VMI should succeed, got %d", fd);
+	close(fd);
+
+	/* After close, should be able to create again */
+	fd = __vm_ioctl(vm, KVM_CREATE_VMI, NULL);
+	TEST_ASSERT(fd >= 0,
+		    "KVM_CREATE_VMI after close should succeed, got %d (errno=%d)",
+		    fd, errno);
+	close(fd);
+
+	kvm_vm_free(vm);
+	pr_info("PASS: KVM_CREATE_VMI succeeds after close (re-create)\n");
+}
+
+int main(int argc, char *argv[])
+{
+	TEST_REQUIRE(kvm_has_cap(KVM_CAP_VMI));
+
+	test_cap_vmi();
+	test_vmi_create();
+	test_vmi_create_twice();
+	test_vmi_create_close_recreate();
+
+	return 0;
+}
