@@ -383,6 +383,10 @@ depends on the event (and the architecture) - see the per-event sections.
    * - ``KVM_VMI_RESPONSE_SWITCH_VIEW``
      - 1 << 2
      - Switch this vCPU to ``slot->view_id`` on resume.
+   * - ``KVM_VMI_RESPONSE_EMULATE``
+     - 1 << 3
+     - Emulate the faulting instruction in software (applicable to
+       ``MEM_ACCESS``, ``CPUID`` and ``DESC_ACCESS``).
 5.6 Register snapshot
 ---------------------
 
@@ -465,6 +469,54 @@ implicitly enabled and fires whenever a vCPU on an alternate view touches a
 frame whose per-view permissions deny the access (section 7). Configure it with
 ``KVM_VMI_SET_MEM_ACCESS``.
 
+6.2 Event IDs
+-------------
+
+Generic event IDs (0-2) are defined in ``<linux/kvm_vmi_events.h>``.
+Architecture-specific event IDs start at ``KVM_VMI_EVENT_ARCH_BASE`` (8) and are
+defined in ``<asm/kvm_vmi.h>``.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 12 28 60
+
+   * - ID
+     - Event
+     - Notes
+   * - 0
+     - ``MEM_ACCESS``
+     - generic (per-view access violation)
+
+6.3 Generic events
+------------------
+
+KVM_VMI_EVENT_MEM_ACCESS (0)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+:Trigger: a vCPU on an alternate view accesses a frame whose per-view
+          permissions deny the access type (EPT violation)
+:Data: ``struct kvm_vmi_event_mem_access``
+:Enabled by: implicit (no ``CONTROL_EVENT``); fires whenever a ring exists and
+             the vCPU is on an alternate view
+
+::
+
+    struct kvm_vmi_event_mem_access {
+        __u64 gpa;     /* faulting guest physical address */
+        __u32 access;  /* denied access bits: KVM_VMI_ACCESS_R/W/X */
+        __u32 pad;
+    };
+
+``access`` is a bitmask of the attempted-but-denied access types; x86 may set
+several bits at once (the EPT-violation read/write/instruction bits are OR-ed
+together), so an agent should test bits rather than compare for equality.
+
+Responses: ``SET_REGS``, ``SWITCH_VIEW``, ``SINGLESTEP``, ``SINGLESTEP_FAST``.
+``EMULATE`` emulates the faulting instruction so it completes without relaxing
+the view's permissions. A bare ``CONTINUE`` does not by itself resolve the fault
+(the access is re-attempted); the agent must widen the permission, emulate, or
+step past it (``SINGLESTEP_FAST``) to make progress.
+
 7. Alternate memory views
 =========================
 
@@ -536,6 +588,91 @@ on the view).
 Switches **all** vCPUs to ``view_id`` (0 = host view). For per-vCPU switching,
 use ``KVM_VMI_RESPONSE_SWITCH_VIEW`` in a ring response instead. Errors:
 ``-EINVAL`` (no session), ``-ENOENT`` (unknown non-zero view).
+
+7.2 Memory access control
+-------------------------
+
+**KVM_VMI_SET_MEM_ACCESS** (``_IOW(KVMIO, 0xf8, struct kvm_vmi_mem_access)``)
+
+:Type: vmi_fd ioctl
+:Parameters: ``struct kvm_vmi_mem_access``
+:Returns: 0 on success, < 0 on error
+
+::
+
+    struct kvm_vmi_mem_access {
+        __u32 view_id;
+        __u32 nr;
+        union {
+            /* single-GFN mode (nr <= 1) */
+            struct {
+                __u64 gfn;
+                __u8  access;
+                __u8  pad;
+                __u16 autostep_mask;   /* must be 0 on x86 */
+                __u8  pad2[4];
+            };
+            /* batch mode (nr > 1) */
+            struct {
+                __u64 gfns_uaddr;      /* __u64[nr] of GFNs */
+                __u64 accesses_uaddr;  /* __u8[nr] of access bytes */
+            };
+        };
+    };
+
+Sets per-frame access permissions in an alternate view. Cannot modify view 0
+(``-EINVAL``). Single-GFN mode (``nr`` <= 1) uses the inline ``gfn``/``access``;
+batch mode (``nr`` > 1) reads ``nr`` entries from the two user arrays. A clear
+permission bit makes the corresponding access fault, delivering a
+``KVM_VMI_EVENT_MEM_ACCESS`` event.
+
+Access flags:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 8 62
+
+   * - Flag
+     - Value
+     - Description
+   * - ``KVM_VMI_ACCESS_R``
+     - 1 << 0
+     - Allow read
+   * - ``KVM_VMI_ACCESS_W``
+     - 1 << 1
+     - Allow write (requires R)
+   * - ``KVM_VMI_ACCESS_X``
+     - 1 << 2
+     - Allow execute
+
+Convenience combinations ``KVM_VMI_ACCESS_RW/RX/WX/RWX`` are also defined.
+
+.. note::
+   ``KVM_VMI_ACCESS_DEFAULT`` (0xff) is defined in the uAPI but is **not**
+   interpreted specially by the current implementation: it is stored verbatim
+   as the access value (and, containing the ``PW`` bit, is rejected with
+   ``-EOPNOTSUPP`` unless EPT paging-write hardware is present). There is no
+   per-frame "revert to the view default" operation.
+
+``autostep_mask`` (single-GFN mode) must be 0 on x86; a non-zero value returns
+``-EOPNOTSUPP`` (x86 has no auto-step support). Batch mode never sets a mask.
+
+Errors: ``-EINVAL`` (no session, view 0, or W-without-R), ``-ENOENT`` (unknown
+view), ``-EOPNOTSUPP`` (PW without hardware, or non-zero ``autostep_mask``),
+``-EFAULT`` (NULL batch pointers or copy failure), ``-ENOMEM``.
+
+**KVM_VMI_GET_MEM_ACCESS** (``_IOWR(KVMIO, 0xf7, struct kvm_vmi_mem_access)``)
+
+:Type: vmi_fd ioctl
+:Parameters: ``struct kvm_vmi_mem_access``
+:Returns: 0 on success, < 0 on error
+
+Queries permissions, in single-GFN or batch mode. Unlike SET, view 0 is
+accepted and reports ``KVM_VMI_ACCESS_RWX`` for every frame. For a non-zero view
+each frame reports its override if set, else the view's ``default_access``.
+Errors: ``-EINVAL`` (no session), ``-ENOENT`` (unknown non-zero view),
+``-EFAULT`` (NULL batch pointers or copy failure), ``-ENOMEM`` (batch
+allocation failure).
 
 8. Guest memory access
 ======================

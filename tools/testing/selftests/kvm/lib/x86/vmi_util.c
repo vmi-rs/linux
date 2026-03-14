@@ -177,6 +177,20 @@ void vmi_switch_view(int vmi_fd, uint32_t view_id)
 		    view_id, ret, errno);
 }
 
+void vmi_set_mem_access(int vmi_fd, uint32_t view_id, uint64_t gfn,
+			uint8_t access)
+{
+	struct kvm_vmi_mem_access ma = {};
+	int ret;
+
+	ma.view_id = view_id;
+	ma.access = access;
+	ma.gfn = gfn;
+
+	ret = ioctl(vmi_fd, KVM_VMI_SET_MEM_ACCESS, &ma);
+	TEST_ASSERT(ret == 0, "KVM_VMI_SET_MEM_ACCESS failed: %d", ret);
+}
+
 void vmi_pause_vm(int vmi_fd)
 {
 	int ret;

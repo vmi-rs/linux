@@ -34,8 +34,20 @@ struct kvm_arch_vmi {
 
 /**
  * struct kvm_arch_vcpu_vmi - x86-specific per-vCPU VMI state
+ * @emul_gpa: Faulting GPA saved for ACTION_EMULATE.
  */
 struct kvm_arch_vcpu_vmi {
+	gpa_t emul_gpa;
 };
+
+#ifdef CONFIG_KVM_VMI
+
+/* Memory access (TDP MMU integration) */
+int kvm_vmi_check_mem_access(struct kvm_vcpu *vcpu, gpa_t gpa,
+			     unsigned long exit_qual);
+void kvm_vmi_setup_page_fault(struct kvm_vcpu *vcpu,
+			      struct kvm_page_fault *fault);
+
+#endif /* CONFIG_KVM_VMI */
 
 #endif /* _ASM_X86_KVM_VMI_H */
