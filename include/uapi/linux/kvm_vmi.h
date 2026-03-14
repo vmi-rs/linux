@@ -49,15 +49,18 @@
 #define KVM_VMI_CREATE_VIEW       _IOWR(KVMIO, 0xf3, struct kvm_vmi_view)
 #define KVM_VMI_DESTROY_VIEW      _IOW(KVMIO,  0xf4, struct kvm_vmi_view)
 #define KVM_VMI_SWITCH_VIEW       _IOW(KVMIO,  0xf5, struct kvm_vmi_switch_view)
+#define KVM_VMI_GET_MEM_ACCESS    _IOWR(KVMIO, 0xf6, struct kvm_vmi_mem_access)
+#define KVM_VMI_SET_MEM_ACCESS    _IOW(KVMIO,  0xf7, struct kvm_vmi_mem_access)
 
 /* Ring event response flags (bitmask, combinable) */
 #define KVM_VMI_RESPONSE_CONTINUE          (0)  /* Default: proceed with normal handling */
 #define KVM_VMI_RESPONSE_DENY              (1 << 0)
 #define KVM_VMI_RESPONSE_SET_REGS          (1 << 1)
 #define KVM_VMI_RESPONSE_SWITCH_VIEW       (1 << 2)
+#define KVM_VMI_RESPONSE_EMULATE           (1 << 3)
 #define KVM_VMI_RESPONSE_MASK \
 	(KVM_VMI_RESPONSE_DENY | KVM_VMI_RESPONSE_SET_REGS | \
-	 KVM_VMI_RESPONSE_SWITCH_VIEW)
+	 KVM_VMI_RESPONSE_SWITCH_VIEW | KVM_VMI_RESPONSE_EMULATE)
 
 /*
  * VMI ioctl structures
@@ -125,6 +128,35 @@ struct kvm_vmi_view {
 struct kvm_vmi_switch_view {
 	__u32 view_id;
 	__u32 pad;
+};
+
+/**
+ * struct kvm_vmi_mem_access - Memory access permissions for a view
+ * @view_id: Target view.
+ * @nr: Number of GFNs (0 or 1 for single-GFN, >1 for batch).
+ *
+ * Single-GFN mode (nr <= 1):
+ *   @gfn: The guest frame number.
+ *   @access: Combination of KVM_VMI_ACCESS_R/W/X flags.
+ *
+ * Batch mode (nr > 1):
+ *   @gfns_uaddr: Userspace pointer to __u64 array of GFNs.
+ *   @accesses_uaddr: Userspace pointer to __u8 array of access flags.
+ */
+struct kvm_vmi_mem_access {
+	__u32 view_id;
+	__u32 nr;
+	union {
+		struct {
+			__u64 gfn;
+			__u8  access;
+			__u8  pad[7];
+		};
+		struct {
+			__u64 gfns_uaddr;
+			__u64 accesses_uaddr;
+		};
+	};
 };
 
 /*

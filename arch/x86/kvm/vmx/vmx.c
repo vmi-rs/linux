@@ -6014,6 +6014,21 @@ static int handle_ept_violation(struct kvm_vcpu *vcpu)
 	gpa = vmcs_read64(GUEST_PHYSICAL_ADDRESS);
 	trace_kvm_page_fault(vcpu, gpa, exit_qualification);
 
+#ifdef CONFIG_KVM_VMI
+	/*
+	 * For alternate VMI views, check if the access violates the view's
+	 * permissions. If so, deliver a mem_access event and skip SPTE
+	 * installation. Otherwise, fall through to the normal TDP fault
+	 * path which populates the view's EPT via tdp_mmu_get_root_for_fault().
+	 */
+	if (vcpu->vmi && vcpu->vmi->current_view_id != 0) {
+		int ret = kvm_vmi_check_mem_access(vcpu, gpa,
+						   exit_qualification);
+		if (ret)
+			return ret;
+	}
+#endif
+
 	/*
 	 * Check that the GPA doesn't exceed physical memory limits, as that is
 	 * a guest page fault.  We have to emulate the instruction here, because

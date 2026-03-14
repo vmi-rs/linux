@@ -23,6 +23,7 @@ struct eventfd_ctx;
  * @vcpu_count: Number of vCPUs currently executing in this view.
  * @default_access: Default R/W/X permissions for lazily-populated entries.
  * @visible: VMFUNC visibility (for future EPTP list, currently unused).
+ * @access_overrides: Xarray mapping GFN -> u8 access permissions.
  * @arch: Architecture-specific view data.
  */
 struct kvm_vmi_view_data {
@@ -30,6 +31,7 @@ struct kvm_vmi_view_data {
 	atomic_t vcpu_count;
 	u8 default_access;
 	bool visible;
+	struct xarray access_overrides;
 	struct kvm_arch_vmi_view arch;
 };
 
