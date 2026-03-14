@@ -513,10 +513,12 @@ static int kvm_vmi_create_view(struct kvm *kvm, struct kvm_vmi_view *uview)
 	atomic_set(&view->vcpu_count, 0);
 	view->default_access = uview->default_access;
 	view->visible = true;
+	xa_init(&view->access_overrides);
 
 	/* Allocate arch-specific EPT root */
 	ret = kvm_arch_vmi_create_view(kvm, view);
 	if (ret) {
+		xa_destroy(&view->access_overrides);
 		kfree(view);
 		return ret;
 	}
@@ -529,6 +531,7 @@ static int kvm_vmi_create_view(struct kvm *kvm, struct kvm_vmi_view *uview)
 
 	if (ret) {
 		kvm_arch_vmi_destroy_view(kvm, view);
+		xa_destroy(&view->access_overrides);
 		kfree(view);
 		return ret;
 	}
@@ -581,9 +584,179 @@ static int kvm_vmi_destroy_view(struct kvm *kvm, struct kvm_vmi_view *uview)
 	kvm_arch_vmi_destroy_view(kvm, view);
 
 	/* Free override xarrays */
+	xa_destroy(&view->access_overrides);
 
 	kfree(view);
 	return 0;
+}
+
+static int kvm_vmi_validate_access(u8 access)
+{
+	/* Reject W without R - EPT cannot encode this combination */
+	if ((access & KVM_VMI_ACCESS_W) && !(access & KVM_VMI_ACCESS_R))
+		return -EINVAL;
+
+	return 0;
+}
+
+static void kvm_vmi_set_gfn_access(struct kvm *kvm,
+				    struct kvm_vmi_view_data *view,
+				    u32 view_id, u64 gfn, u8 access)
+{
+	trace_kvm_vmi_set_mem_access(view_id, gfn, access);
+
+	xa_store(&view->access_overrides, gfn,
+		 xa_mk_value(access), GFP_KERNEL);
+
+	if (kvm_arch_vmi_view_has_root(view))
+		kvm_arch_vmi_invalidate_gfn(kvm, view, gfn);
+}
+
+static int kvm_vmi_set_mem_access_batch(struct kvm *kvm,
+					struct kvm_vmi_view_data *view,
+					struct kvm_vmi_mem_access *ma)
+{
+	u64 *gfns;
+	u8 *accesses;
+	u32 i;
+	int ret;
+
+	if (!ma->gfns_uaddr || !ma->accesses_uaddr)
+		return -EFAULT;
+
+	gfns = vmemdup_array_user((u64 __user *)ma->gfns_uaddr,
+				  ma->nr, sizeof(*gfns));
+	if (IS_ERR(gfns))
+		return PTR_ERR(gfns);
+
+	accesses = vmemdup_array_user((u8 __user *)ma->accesses_uaddr,
+				      ma->nr, sizeof(*accesses));
+	if (IS_ERR(accesses)) {
+		kvfree(gfns);
+		return PTR_ERR(accesses);
+	}
+
+	for (i = 0; i < ma->nr; i++) {
+		ret = kvm_vmi_validate_access(accesses[i]);
+		if (ret)
+			goto out;
+
+		kvm_vmi_set_gfn_access(kvm, view, ma->view_id,
+				       gfns[i], accesses[i]);
+	}
+
+	ret = 0;
+out:
+	kvfree(accesses);
+	kvfree(gfns);
+	return ret;
+}
+
+static int kvm_vmi_set_mem_access(struct kvm *kvm, struct kvm_vmi_mem_access *ma)
+{
+	struct kvm_vmi *vmi = kvm->vmi;
+	struct kvm_vmi_view_data *view;
+	int ret;
+
+	if (!vmi)
+		return -EINVAL;
+
+	if (ma->view_id == 0)
+		return -EINVAL; /* Cannot modify host view permissions */
+
+	view = xa_load(&vmi->views, ma->view_id);
+	if (!view)
+		return -ENOENT;
+
+	if (ma->nr <= 1) {
+		ret = kvm_vmi_validate_access(ma->access);
+		if (ret)
+			return ret;
+
+		kvm_vmi_set_gfn_access(kvm, view, ma->view_id,
+				       ma->gfn, ma->access);
+	} else {
+		ret = kvm_vmi_set_mem_access_batch(kvm, view, ma);
+		if (ret)
+			return ret;
+	}
+
+	kvm_flush_remote_tlbs(kvm);
+
+	return 0;
+}
+
+static u8 kvm_vmi_get_gfn_access(struct kvm_vmi_view_data *view, u64 gfn)
+{
+	void *entry;
+
+	if (!view)
+		return KVM_VMI_ACCESS_RWX;
+
+	entry = xa_load(&view->access_overrides, gfn);
+	if (entry)
+		return (u8)xa_to_value(entry);
+	return view->default_access;
+}
+
+static int kvm_vmi_get_mem_access_batch(struct kvm *kvm,
+					struct kvm_vmi_view_data *view,
+					struct kvm_vmi_mem_access *ma)
+{
+	u8 __user *accesses_out = (u8 __user *)ma->accesses_uaddr;
+	u64 *gfns;
+	u8 *accesses;
+	u32 i;
+	int ret;
+
+	if (!ma->gfns_uaddr || !accesses_out)
+		return -EFAULT;
+
+	gfns = vmemdup_array_user((u64 __user *)ma->gfns_uaddr,
+				  ma->nr, sizeof(*gfns));
+	if (IS_ERR(gfns))
+		return PTR_ERR(gfns);
+
+	accesses = kvmalloc_array(ma->nr, sizeof(*accesses), GFP_KERNEL);
+	if (!accesses) {
+		ret = -ENOMEM;
+		goto out_gfns;
+	}
+
+	for (i = 0; i < ma->nr; i++)
+		accesses[i] = kvm_vmi_get_gfn_access(view, gfns[i]);
+
+	if (copy_to_user(accesses_out, accesses, ma->nr * sizeof(*accesses)))
+		ret = -EFAULT;
+	else
+		ret = 0;
+
+	kvfree(accesses);
+out_gfns:
+	kvfree(gfns);
+	return ret;
+}
+
+static int kvm_vmi_get_mem_access(struct kvm *kvm, struct kvm_vmi_mem_access *ma)
+{
+	struct kvm_vmi *vmi = kvm->vmi;
+	struct kvm_vmi_view_data *view = NULL;
+
+	if (!vmi)
+		return -EINVAL;
+
+	if (ma->view_id != 0) {
+		view = xa_load(&vmi->views, ma->view_id);
+		if (!view)
+			return -ENOENT;
+	}
+
+	if (ma->nr <= 1) {
+		ma->access = kvm_vmi_get_gfn_access(view, ma->gfn);
+		return 0;
+	}
+
+	return kvm_vmi_get_mem_access_batch(kvm, view, ma);
 }
 
 /*
@@ -1163,6 +1336,7 @@ static int kvm_vmi_release(struct inode *inode, struct file *file)
 			continue;
 		xa_erase(&vmi->views, index);
 		kvm_arch_vmi_destroy_view(kvm, view);
+		xa_destroy(&view->access_overrides);
 		kfree(view);
 	}
 
@@ -1270,6 +1444,26 @@ static long kvm_vmi_ioctl(struct file *file, unsigned int ioctl,
 		if (copy_from_user(&sv, argp, sizeof(sv)))
 			return -EFAULT;
 		return kvm_vmi_switch_view(kvm, &sv);
+	}
+	case KVM_VMI_GET_MEM_ACCESS: {
+		struct kvm_vmi_mem_access ma;
+		int r;
+
+		if (copy_from_user(&ma, argp, sizeof(ma)))
+			return -EFAULT;
+		r = kvm_vmi_get_mem_access(kvm, &ma);
+		if (r)
+			return r;
+		if (copy_to_user(argp, &ma, sizeof(ma)))
+			return -EFAULT;
+		return 0;
+	}
+	case KVM_VMI_SET_MEM_ACCESS: {
+		struct kvm_vmi_mem_access ma;
+
+		if (copy_from_user(&ma, argp, sizeof(ma)))
+			return -EFAULT;
+		return kvm_vmi_set_mem_access(kvm, &ma);
 	}
 	case KVM_VMI_PAUSE_VM:
 		return kvm_vmi_pause_vm(kvm);

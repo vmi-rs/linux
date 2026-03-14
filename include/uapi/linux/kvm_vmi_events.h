@@ -9,6 +9,14 @@
 #define _UAPI_LINUX_KVM_VMI_EVENTS_H
 
 /*
+ * Generic VMI Event Types (arch-independent)
+ *
+ * Arch-specific events (CR, MSR, CPUID, etc.) are defined in
+ * <asm/kvm_vmi.h> starting at KVM_VMI_EVENT_ARCH_BASE.
+ */
+#define KVM_VMI_EVENT_MEM_ACCESS	0  /* EPT/stage-2 violation with VMI permissions */
+
+/*
  * Base for arch-specific event IDs. Arch headers use KVM_VMI_ARCH_EVENT(nr)
  * to define event IDs relative to this base.
  */

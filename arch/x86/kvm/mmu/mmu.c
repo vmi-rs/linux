@@ -5505,10 +5505,19 @@ static void reset_tdp_shadow_zero_bits_mask(struct kvm_mmu *context)
 					context->root_role.level, true,
 					boot_cpu_has(X86_FEATURE_GBPAGES),
 					false, true);
-	else
+	else {
+		/*
+		 * Allow execute-only SPTEs if the hardware supports them.
+		 * VMI alternate views use restricted EPT permissions
+		 * (including execute-only for code-hiding) that require
+		 * this to avoid false reserved-bit warnings.
+		 */
+		bool execonly = !(shadow_present_mask & shadow_user_mask);
+
 		__reset_rsvds_bits_mask_ept(shadow_zero_check,
-					    reserved_hpa_bits(), false,
+					    reserved_hpa_bits(), execonly,
 					    max_huge_page_level);
+	}
 
 	if (!shadow_me_mask)
 		return;
