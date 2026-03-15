@@ -6518,6 +6518,28 @@ the capability to be present.
 `flags` must currently be zero.
 
 
+4.145 KVM_CREATE_VMI
+--------------------
+
+:Capability: KVM_CAP_VMI
+:Architectures: x86
+:Type: vm ioctl
+:Parameters: none
+:Returns: a vmi_fd file descriptor on success, <0 on error
+
+Creates a VMI (Virtual Machine Introspection) session for the VM. The
+returned ``vmi_fd`` is the single control channel for all VMI operations,
+including event monitoring, alternate memory views, GFN remapping, guest
+memory mapping, vCPU pause, and event injection. Only one VMI session may
+be active per VM; a second call returns ``-EBUSY``.
+
+Closing the ``vmi_fd`` performs full cleanup: events are disabled, all vCPUs
+are switched to view 0, alternate views are destroyed, rings are torn down,
+and shadow GFNs are freed. This ensures no VMI state leaks if the agent
+crashes.
+
+See ``Documentation/virt/kvm/vmi.rst`` for the full VMI API reference.
+
 .. _kvm_run:
 
 5. The kvm_run structure
@@ -9322,6 +9344,21 @@ vCPU was executing nested guest code when it exited.
 KVM exits with the register state of either the L1 or L2 guest
 depending on which executed at the time of an exit. Userspace must
 take care to differentiate between these cases.
+
+8.47 KVM_CAP_VMI
+-----------------
+
+:Architectures: x86
+
+The presence of this capability indicates that the ``KVM_CREATE_VMI`` ioctl
+is available on the VM fd. VMI requires ``CONFIG_KVM_VMI=y`` in the kernel
+configuration and hardware EPT support (Intel VT-x).
+
+Additional VMI sub-capabilities (``KVM_CAP_VMI_RING``,
+``KVM_CAP_VMI_GUEST_MMAP``, ``KVM_CAP_VMI_PAUSE``, ``KVM_CAP_VMI_INJECT``,
+``KVM_CAP_VMI_ALLOC_GFN``, ``KVM_CAP_VMI_EPT_PW``) gate specific VMI
+features. See ``Documentation/virt/kvm/vmi.rst`` for the full VMI API
+reference including all capabilities.
 
 9. Known KVM API problems
 =========================
