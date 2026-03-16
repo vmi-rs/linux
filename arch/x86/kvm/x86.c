@@ -10525,6 +10525,11 @@ int kvm_emulate_hypercall(struct kvm_vcpu *vcpu)
 	if (kvm_hv_hypercall_enabled(vcpu))
 		return kvm_hv_hypercall(vcpu);
 
+#ifdef CONFIG_KVM_VMI
+	if (vcpu->vmi && kvm_vmi_hypercall(vcpu))
+		return 1;
+#endif
+
 	return __kvm_emulate_hypercall(vcpu, kvm_x86_call(get_cpl)(vcpu),
 				       complete_hypercall_exit);
 }
