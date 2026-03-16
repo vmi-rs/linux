@@ -16,6 +16,7 @@
  */
 #define KVM_VMI_EVENT_MEM_ACCESS	0  /* EPT/stage-2 violation with VMI permissions */
 #define KVM_VMI_EVENT_SINGLESTEP	1  /* Single-step completed */
+#define KVM_VMI_EVENT_HYPERCALL		2  /* Guest hypercall (VMCALL/VMMCALL/HVC) */
 
 /*
  * Base for arch-specific event IDs. Arch headers use KVM_VMI_ARCH_EVENT(nr)

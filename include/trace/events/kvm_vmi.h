@@ -23,7 +23,8 @@
 
 #define kvm_vmi_event_types				\
 	{ KVM_VMI_EVENT_MEM_ACCESS,	"mem_access" },	\
-	{ KVM_VMI_EVENT_SINGLESTEP,	"singlestep" }	\
+	{ KVM_VMI_EVENT_SINGLESTEP,	"singlestep" },	\
+	{ KVM_VMI_EVENT_HYPERCALL,	"hypercall" }	\
 	kvm_vmi_event_types_arch
 
 #define kvm_vmi_response_flags				\
