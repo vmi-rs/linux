@@ -351,6 +351,24 @@ static void handle_emulate(struct kvm_vcpu *vcpu)
 }
 
 /**
+ * handle_hypercall_response - Handle hypercall event response
+ * @vcpu: The vCPU re-entering after a hypercall event.
+ * @resp: KVM_VMI_RESPONSE_* bitmask from userspace.
+ *
+ * Deferred pattern: CONTINUE/EMULATE let the normal hypercall handler run
+ * (handled by kvm_vmi_hypercall returning 0). DENY advances RIP past the
+ * VMCALL/VMMCALL instruction. SET_REGS means the agent controls everything.
+ */
+static void handle_hypercall_response(struct kvm_vcpu *vcpu, u32 resp)
+{
+	if (resp & KVM_VMI_RESPONSE_SET_REGS)
+		return;
+
+	if (resp & KVM_VMI_RESPONSE_DENY)
+		kvm_skip_emulated_instruction(vcpu);
+}
+
+/**
  * kvm_vmi_handle_event_response - Dispatch event response to the right handler
  * @vcpu: The vCPU that delivered the event.
  * @event_type: The KVM_VMI_EVENT_* type of the original event.
@@ -370,6 +388,9 @@ void kvm_vmi_handle_event_response(struct kvm_vcpu *vcpu, u32 event_type,
 		break;
 	case KVM_VMI_EVENT_SINGLESTEP:
 		/* No special response handling for singlestep */
+		break;
+	case KVM_VMI_EVENT_HYPERCALL:
+		handle_hypercall_response(vcpu, resp);
 		break;
 	case KVM_VMI_EVENT_CR:
 		handle_cr_response(vcpu, resp);
@@ -834,6 +855,36 @@ int kvm_vmi_singlestep(struct kvm_vcpu *vcpu)
 	return 1;
 }
 EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_vmi_singlestep);
+
+/**
+ * kvm_vmi_hypercall - Check if a hypercall should generate a VMI event
+ * @vcpu: The vCPU executing the hypercall (VMCALL/VMMCALL).
+ *
+ * Called from kvm_emulate_hypercall() after Xen/HV dispatch.
+ * Uses the deferred pattern: returns 0 to let the caller proceed
+ * with normal hypercall handling, or 1 if the event was handled
+ * (DENY/SET_REGS).
+ *
+ * Return: 0 (caller proceeds with normal hypercall handling),
+ *         1 (handled - caller returns immediately).
+ */
+int kvm_vmi_hypercall(struct kvm_vcpu *vcpu)
+{
+	struct kvm_vmi_ring_event ring_event = {};
+	int ret;
+
+	if (!kvm_vmi_event_enabled(vcpu, KVM_VMI_EVENT_HYPERCALL))
+		return 0;
+
+	ring_event.type = KVM_VMI_EVENT_HYPERCALL;
+	ring_event.vcpu_id = vcpu->vcpu_id;
+	ring_event.insn_len = kvm_x86_call(vmi_get_instruction_len)(vcpu);
+	trace_kvm_vmi_event_deliver(vcpu->vcpu_id, KVM_VMI_EVENT_HYPERCALL, 0);
+	ret = kvm_vmi_deliver_via_ring(vcpu, &ring_event);
+	/* Deferred: return 0 (caller proceeds) unless DENY or SET_REGS */
+	return (ret > 0 && (ret & (KVM_VMI_RESPONSE_DENY |
+				   KVM_VMI_RESPONSE_SET_REGS))) ? 1 : 0;
+}
 
 /**
  * kvm_vmi_cr_write - Check if a CR write should generate a VMI event
