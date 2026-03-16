@@ -251,6 +251,20 @@ struct kvm_vmi_event_singlestep {
 	__u64 gpa;
 };
 
+/*
+ * KVM_VMI_EVENT_HYPERCALL event data.
+ *
+ * @imm: the trapped hypercall instruction's immediate (HVC #imm on arm64).
+ *
+ * Hypercall arguments are not duplicated here: they ride along in the
+ * captured GP registers (x0..x7 on arm64; rax/rbx/... on x86).
+ * Zero on architectures whose hypercall instruction carries no immediate.
+ */
+struct kvm_vmi_event_hypercall {
+	__u32 imm;
+	__u32 pad;
+};
+
 /**
  * struct kvm_vmi_ring_header - Ring page header
  * @req_prod: Producer index (kernel increments after writing event)
@@ -288,6 +302,7 @@ struct kvm_vmi_ring_event {
 	union {
 		struct kvm_vmi_event_mem_access mem_access;
 		struct kvm_vmi_event_singlestep singlestep;
+		struct kvm_vmi_event_hypercall hypercall;
 		union kvm_vmi_arch_event_data arch;
 	};
 
