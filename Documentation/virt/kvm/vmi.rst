@@ -512,6 +512,9 @@ defined in ``<asm/kvm_vmi.h>``.
    * - 1
      - ``SINGLESTEP``
      - generic
+   * - 2
+     - ``HYPERCALL``
+     - generic (``VMCALL``/``VMMCALL``)
    * - 8
      - ``CR``
      - control register write
@@ -585,6 +588,25 @@ delivered and the guest resumes. A ``SINGLESTEP_FAST`` step is consumed and its
 event suppressed before this gate, so it never delivers a singlestep event.
 Single-step is one-shot; respond ``SINGLESTEP`` again to keep stepping.
 Responses: ``SET_REGS``, ``SWITCH_VIEW``, ``SINGLESTEP``.
+
+KVM_VMI_EVENT_HYPERCALL (2)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+:Trigger: guest hypercall - ``VMCALL`` / ``VMMCALL``
+:Data: ``struct kvm_vmi_event_hypercall``
+
+::
+
+    struct kvm_vmi_event_hypercall {
+        __u32 imm;   /* reserved; always 0 on x86 */
+        __u32 pad;
+    };
+
+The instruction carries no immediate and ``imm`` is 0. Hypercall number and
+arguments are not duplicated here; read them from the register snapshot
+(``regs.rax``/``rbx``/``rcx``/...). Responses: ``CONTINUE`` runs normal
+hypercall dispatch; ``DENY`` or ``SET_REGS`` makes the kernel skip dispatch.
+``SET_REGS`` is honoured.
 
 6.4 x86 architecture events
 ---------------------------
