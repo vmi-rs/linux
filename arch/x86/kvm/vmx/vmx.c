@@ -3603,9 +3603,22 @@ void vmx_load_mmu_pgd(struct kvm_vcpu *vcpu, hpa_t root_hpa, int root_level)
 	unsigned long guest_cr3;
 
 	if (enable_ept) {
-		KVM_MMU_WARN_ON(root_to_sp(root_hpa) &&
-				root_level != root_to_sp(root_hpa)->role.level);
-		vmcs_write64(EPT_POINTER, construct_eptp(root_hpa));
+		u64 eptp;
+
+#ifdef CONFIG_KVM_VMI
+		if (vcpu->vmi &&
+		    vcpu->vmi->current_view_id != 0) {
+			struct kvm_vmi_view_data *view = vcpu->vmi->current_view;
+
+			eptp = view ? view->arch.eptp : construct_eptp(root_hpa);
+		} else
+#endif
+		{
+			KVM_MMU_WARN_ON(root_to_sp(root_hpa) &&
+					root_level != root_to_sp(root_hpa)->role.level);
+			eptp = construct_eptp(root_hpa);
+		}
+		vmcs_write64(EPT_POINTER, eptp);
 
 		hv_track_root_tdp(vcpu, root_hpa);
 
@@ -5383,6 +5396,113 @@ bool vmx_vmi_has_cap(void)
 
 void vmx_vmi_apply_vmcs_state(struct kvm_vcpu *vcpu)
 {
+	struct kvm_vcpu_vmi *vcpu_vmi = vcpu->vmi;
+
+	if (!vcpu_vmi)
+		return;
+
+	/* Exception bitmap: picks up BP/DB intercept state */
+	vmx_update_exception_bitmap(vcpu);
+
+	/*
+	 * EPTP for current view. Only write EPTP when the vCPU is on an
+	 * alternate view. When on view 0 (host), KVM's normal MMU handling
+	 * manages the EPTP - don't touch it here (the MMU root may not
+	 * even be initialized on the first vcpu_enter_guest() call).
+	 */
+	if (vcpu_vmi->current_view_id != 0) {
+		struct kvm_vmi_view_data *view = vcpu_vmi->current_view;
+
+		if (view)
+			vmcs_write64(EPT_POINTER, view->arch.eptp);
+		kvm_make_request(KVM_REQ_TLB_FLUSH_GUEST, vcpu);
+	}
+}
+
+/**
+ * vmx_vmi_create_view - Allocate TDP MMU root for an alternate view
+ * @kvm: The VM.
+ * @view: The view to initialize.
+ *
+ * Allocates a TDP MMU root page via kvm_tdp_mmu_alloc_vmi_root() and
+ * constructs the EPTP for this view. The view starts with an empty EPT;
+ * entries are lazily populated by the TDP MMU on first access.
+ */
+int vmx_vmi_create_view(struct kvm *kvm, struct kvm_vmi_view_data *view)
+{
+	struct kvm_mmu_page *root;
+	hpa_t root_pa;
+
+	root = kvm_tdp_mmu_alloc_vmi_root(!enable_ept_ad_bits, &root_pa);
+	if (IS_ERR(root))
+		return PTR_ERR(root);
+
+	view->arch.tdp_root = root;
+	view->arch.eptp = construct_eptp(root_pa);
+
+	return 0;
+}
+
+/**
+ * vmx_vmi_destroy_view - Free all EPT pages for an alternate view
+ * @kvm: The VM.
+ * @view: The view to tear down.
+ *
+ * Uses kvm_tdp_mmu_free_vmi_root() to zap all SPTEs bottom-up and free
+ * the root page and its header.
+ */
+void vmx_vmi_destroy_view(struct kvm *kvm, struct kvm_vmi_view_data *view)
+{
+	struct kvm_mmu_page *root = view->arch.tdp_root;
+
+	if (!root)
+		return;
+
+	/*
+	 * Drain users of this view's hardware root -- a different invariant
+	 * from the VM-wide vCPU pause in kvm_vmi_pause_vm(): here we only need
+	 * that no vCPU executes on this view's EPTP and no in-flight fault
+	 * walker still holds it.
+	 * x86 reloads EPTP eagerly on switch, so unlike arm64 no
+	 * KVM_REQ_OUTSIDE_GUEST_MODE is needed here -- the mmu_lock write cycle
+	 * alone drains any in-flight fault reader before we free the root.
+	 */
+	write_lock(&kvm->mmu_lock);
+	/*
+	 * NULL tdp_root inside the write lock so that any concurrent
+	 * page fault reader (holding mmu_lock for read) that accesses
+	 * this view will see tdp_root=NULL and fall through to the
+	 * primary root, rather than getting a dangling pointer after
+	 * we free the root.
+	 */
+	WRITE_ONCE(view->arch.tdp_root, NULL);
+	view->arch.eptp = 0;
+	kvm_tdp_mmu_free_vmi_root(kvm, root);
+	write_unlock(&kvm->mmu_lock);
+}
+
+/**
+ * vmx_vmi_switch_view - Switch a vCPU's EPTP to an alternate view
+ * @vcpu: The vCPU to switch.
+ * @view: The target view, or NULL for host view (view 0).
+ */
+void vmx_vmi_switch_view(struct kvm_vcpu *vcpu,
+			      struct kvm_vmi_view_data *view)
+{
+	if (view) {
+		vmcs_write64(EPT_POINTER, view->arch.eptp);
+	} else {
+		/*
+		 * Switch back to host view: reload the EPTP from the
+		 * primary MMU's root. Use construct_eptp() which handles
+		 * page walk length and AD bits correctly.
+		 */
+		vmcs_write64(EPT_POINTER,
+			     construct_eptp(vcpu->arch.mmu->root.hpa));
+	}
+
+	/* Flush TLB to pick up the new EPTP */
+	kvm_make_request(KVM_REQ_TLB_FLUSH_GUEST, vcpu);
 }
 #endif
 

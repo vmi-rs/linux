@@ -11,8 +11,20 @@ struct kvm;
 struct kvm_vcpu;
 struct kvm_mmu_page;
 struct kvm_page_fault;
+struct kvm_vmi_view_data;
 struct kvm_vmi_control_event;
 struct kvm_vmi_inject_event;
+
+/**
+ * struct kvm_arch_vmi_view - x86-specific alternate view data
+ * @tdp_root: TDP MMU root page (kvm_mmu_page) for this view's EPT.
+ * @eptp: Full 64-bit EPTP value (memory type + page walk len + AD + root_hpa).
+ *        Stored complete for VMFUNC-readiness.
+ */
+struct kvm_arch_vmi_view {
+	struct kvm_mmu_page *tdp_root;
+	u64 eptp;
+};
 
 /**
  * struct kvm_arch_vmi - x86-specific VM-level VMI monitoring config
