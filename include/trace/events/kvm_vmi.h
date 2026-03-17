@@ -10,7 +10,13 @@
 
 #define kvm_vmi_response_flags				\
 	{ KVM_VMI_RESPONSE_DENY,		"DENY" },	\
-	{ KVM_VMI_RESPONSE_SET_REGS,		"SET_REGS" }
+	{ KVM_VMI_RESPONSE_SET_REGS,		"SET_REGS" },	\
+	{ KVM_VMI_RESPONSE_SWITCH_VIEW,		"SWITCH_VIEW" }
+
+#define kvm_vmi_access_flags					\
+	{ KVM_VMI_ACCESS_R,		"R" },			\
+	{ KVM_VMI_ACCESS_W,		"W" },			\
+	{ KVM_VMI_ACCESS_X,		"X" }
 
 /*
  * Trace VMI session create/release.
@@ -103,6 +109,70 @@ TRACE_EVENT(kvm_vmi_pause,
 		  __entry->is_pause ? "pause" : "unpause",
 		  __entry->vcpu_id == -1 ? "vm" : "vcpu ",
 		  __entry->vcpu_id == -1 ? 0 : __entry->vcpu_id)
+);
+
+/*
+ * Trace view creation.
+ */
+TRACE_EVENT(kvm_vmi_view_create,
+	TP_PROTO(__u32 view_id, __u8 default_access),
+	TP_ARGS(view_id, default_access),
+
+	TP_STRUCT__entry(
+		__field(__u32,	view_id)
+		__field(__u8,	default_access)
+	),
+
+	TP_fast_assign(
+		__entry->view_id = view_id;
+		__entry->default_access = default_access;
+	),
+
+	TP_printk("view %u access %s",
+		  __entry->view_id,
+		  __print_flags(__entry->default_access, "|",
+				kvm_vmi_access_flags))
+);
+
+/*
+ * Trace view destruction.
+ */
+TRACE_EVENT(kvm_vmi_view_destroy,
+	TP_PROTO(__u32 view_id),
+	TP_ARGS(view_id),
+
+	TP_STRUCT__entry(
+		__field(__u32,	view_id)
+	),
+
+	TP_fast_assign(
+		__entry->view_id = view_id;
+	),
+
+	TP_printk("view %u", __entry->view_id)
+);
+
+/*
+ * Trace vCPU view switch.
+ */
+TRACE_EVENT(kvm_vmi_view_switch,
+	TP_PROTO(unsigned int vcpu_id, __u32 old_view, __u32 new_view),
+	TP_ARGS(vcpu_id, old_view, new_view),
+
+	TP_STRUCT__entry(
+		__field(unsigned int,	vcpu_id)
+		__field(__u32,		old_view)
+		__field(__u32,		new_view)
+	),
+
+	TP_fast_assign(
+		__entry->vcpu_id = vcpu_id;
+		__entry->old_view = old_view;
+		__entry->new_view = new_view;
+	),
+
+	TP_printk("vcpu %u view %u -> %u",
+		  __entry->vcpu_id, __entry->old_view, __entry->new_view)
 );
 
 #endif /* _TRACE_KVM_VMI_H */

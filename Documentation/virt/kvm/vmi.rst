@@ -380,6 +380,9 @@ depends on the event (and the architecture) - see the per-event sections.
        ``KVM_SET_REGS``/``KVM_SET_SREGS``/``KVM_SET_ONE_REG`` for those). On a
        CR/MSR event, SET_REGS alone does *not* suppress the write - combine with
        DENY to both modify registers and suppress.
+   * - ``KVM_VMI_RESPONSE_SWITCH_VIEW``
+     - 1 << 2
+     - Switch this vCPU to ``slot->view_id`` on resume.
 5.6 Register snapshot
 ---------------------
 
@@ -461,6 +464,78 @@ up. The ``arch`` union carries event-specific parameters (x86 CR/MSR). ``-EINVAL
 implicitly enabled and fires whenever a vCPU on an alternate view touches a
 frame whose per-view permissions deny the access (section 7). Configure it with
 ``KVM_VMI_SET_MEM_ACCESS``.
+
+7. Alternate memory views
+=========================
+
+An alternate view is an independent guest-physical address space with its own
+per-frame access permissions and frame remapping. A view is a separate EPT root
+(with an EPTP value). A view starts empty and is populated lazily from the host
+mapping on first access.
+
+View 0 is the default host view and always exists. It cannot be created,
+destroyed, switched-from permanently, or have its permissions or frame mappings
+modified.
+
+7.1 View management
+-------------------
+
+**KVM_VMI_CREATE_VIEW** (``_IOWR(KVMIO, 0xf4, struct kvm_vmi_view)``)
+
+:Type: vmi_fd ioctl
+:Parameters: ``struct kvm_vmi_view`` (``view_id`` is OUT)
+:Returns: 0 on success, < 0 on error
+
+::
+
+    struct kvm_vmi_view {
+        __u32 view_id;         /* OUT on create, IN on destroy */
+        __u32 flags;           /* reserved, set to 0 */
+        __u8  default_access;  /* default R/W/X for lazily-populated entries */
+        __u8  pad[7];
+    };
+
+``default_access`` is a combination of ``KVM_VMI_ACCESS_R/W/X`` (and, on x86
+with hardware support, ``KVM_VMI_ACCESS_PW``). The kernel assigns a
+monotonically increasing ``view_id`` starting at 1; ids are never reused within
+a session. Views are allocated dynamically with no fixed limit.
+
+Errors: ``-EINVAL`` (no session, or ``W`` without ``R`` - that combination
+cannot be encoded), ``-EOPNOTSUPP`` (``PW`` requested without hardware support),
+``-ENOMEM``.
+
+.. note::
+   View ids are stable u32 values intended to also serve as EPTP-list indices
+   for a future VMFUNC fast-switch path when ``<= 511``. This is a forward
+   convention only; nothing in the current code enforces a 511 limit or uses an
+   EPTP list.
+
+**KVM_VMI_DESTROY_VIEW** (``_IOW(KVMIO, 0xf5, struct kvm_vmi_view)``)
+
+:Type: vmi_fd ioctl
+:Parameters: ``struct kvm_vmi_view`` (``view_id`` IN)
+:Returns: 0 on success, < 0 on error
+
+Destroys a view and frees its EPT root. Errors: ``-EINVAL`` (no session,
+or ``view_id`` 0), ``-ENOENT`` (unknown view), ``-EBUSY`` (a vCPU is currently
+on the view).
+
+**KVM_VMI_SWITCH_VIEW** (``_IOW(KVMIO, 0xf6, struct kvm_vmi_switch_view)``)
+
+:Type: vmi_fd ioctl
+:Parameters: ``struct kvm_vmi_switch_view``
+:Returns: 0 on success, < 0 on error
+
+::
+
+    struct kvm_vmi_switch_view {
+        __u32 view_id;
+        __u32 pad;
+    };
+
+Switches **all** vCPUs to ``view_id`` (0 = host view). For per-vCPU switching,
+use ``KVM_VMI_RESPONSE_SWITCH_VIEW`` in a ring response instead. Errors:
+``-EINVAL`` (no session), ``-ENOENT`` (unknown non-zero view).
 
 8. Guest memory access
 ======================

@@ -135,6 +135,48 @@ int vmi_control_event_err(int vmi_fd, uint32_t event, int enable)
 	return ioctl(vmi_fd, KVM_VMI_CONTROL_EVENT, &ctl);
 }
 
+uint32_t vmi_create_view(int vmi_fd, uint8_t default_access)
+{
+	struct kvm_vmi_view view = {};
+	int ret;
+
+	view.default_access = default_access;
+	ret = ioctl(vmi_fd, KVM_VMI_CREATE_VIEW, &view);
+	TEST_ASSERT(ret == 0, "KVM_VMI_CREATE_VIEW failed: %d (errno=%d)",
+		    ret, errno);
+	TEST_ASSERT(view.view_id > 0, "Expected view_id > 0, got %u",
+		    view.view_id);
+	return view.view_id;
+}
+
+void vmi_destroy_view(int vmi_fd, uint32_t view_id)
+{
+	struct kvm_vmi_view view = { .view_id = view_id };
+	int ret;
+
+	ret = ioctl(vmi_fd, KVM_VMI_DESTROY_VIEW, &view);
+	TEST_ASSERT(ret == 0, "KVM_VMI_DESTROY_VIEW failed: %d", ret);
+}
+
+int vmi_destroy_view_err(int vmi_fd, uint32_t view_id)
+{
+	struct kvm_vmi_view view = { .view_id = view_id };
+
+	return ioctl(vmi_fd, KVM_VMI_DESTROY_VIEW, &view);
+}
+
+void vmi_switch_view(int vmi_fd, uint32_t view_id)
+{
+	struct kvm_vmi_switch_view sv = {
+		.view_id = view_id,
+	};
+	int ret;
+
+	ret = ioctl(vmi_fd, KVM_VMI_SWITCH_VIEW, &sv);
+	TEST_ASSERT(ret == 0, "KVM_VMI_SWITCH_VIEW(view_id=%u) failed: %d errno=%d",
+		    view_id, ret, errno);
+}
+
 void vmi_pause_vm(int vmi_fd)
 {
 	int ret;

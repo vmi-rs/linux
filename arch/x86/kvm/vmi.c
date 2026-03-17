@@ -369,3 +369,44 @@ void kvm_arch_vmi_block_end(struct kvm_vcpu *vcpu)
 {
 	kvm_vcpu_srcu_read_lock(vcpu);
 }
+
+int kvm_arch_vmi_create_view(struct kvm *kvm, struct kvm_vmi_view_data *view)
+{
+	return kvm_x86_call(vmi_create_view)(kvm, view);
+}
+
+void kvm_arch_vmi_destroy_view(struct kvm *kvm, struct kvm_vmi_view_data *view)
+{
+	kvm_x86_call(vmi_destroy_view)(kvm, view);
+}
+
+void kvm_arch_vmi_switch_view(struct kvm_vcpu *vcpu,
+			      struct kvm_vmi_view_data *view)
+{
+	kvm_x86_call(vmi_switch_view)(vcpu, view);
+}
+
+void kvm_arch_vmi_reset_view(struct kvm_vcpu *vcpu)
+{
+	kvm_make_request(KVM_REQ_LOAD_MMU_PGD, vcpu);
+}
+
+bool kvm_arch_vmi_view_has_root(struct kvm_vmi_view_data *view)
+{
+	return view->arch.tdp_root != NULL;
+}
+
+void kvm_arch_vmi_invalidate_gfn(struct kvm *kvm,
+				 struct kvm_vmi_view_data *view, gfn_t gfn)
+{
+	write_lock(&kvm->mmu_lock);
+	kvm_tdp_mmu_zap_vmi_leaf(kvm, view->arch.tdp_root, gfn);
+	write_unlock(&kvm->mmu_lock);
+}
+
+void kvm_arch_vmi_invalidate_gfn_locked(struct kvm *kvm,
+					 struct kvm_vmi_view_data *view,
+					 gfn_t gfn)
+{
+	kvm_tdp_mmu_zap_vmi_leaf(kvm, view->arch.tdp_root, gfn);
+}
