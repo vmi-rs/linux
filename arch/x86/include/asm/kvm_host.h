@@ -1968,6 +1968,10 @@ struct kvm_x86_ops {
 #ifdef CONFIG_KVM_VMI
 	bool (*vmi_has_cap)(void);
 	void (*vmi_apply_state)(struct kvm_vcpu *vcpu);
+	int (*vmi_create_view)(struct kvm *kvm, struct kvm_vmi_view_data *view);
+	void (*vmi_destroy_view)(struct kvm *kvm, struct kvm_vmi_view_data *view);
+	void (*vmi_switch_view)(struct kvm_vcpu *vcpu,
+				struct kvm_vmi_view_data *view);
 #endif
 };
 

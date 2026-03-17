@@ -3665,6 +3665,17 @@ static int fast_page_fault(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault)
 	u64 *sptep;
 	uint retry_count = 0;
 
+#ifdef CONFIG_KVM_VMI
+	/*
+	 * Skip fast path for VMI alternate views. fast_page_fault() uses
+	 * kvm_tdp_mmu_fast_pf_get_last_sptep() which walks the host root
+	 * (not the view root), and can atomically upgrade SPTE access bits
+	 * which would bypass intentional view access restrictions.
+	 */
+	if (vcpu->vmi && vcpu->vmi->current_view_id != 0)
+		return RET_PF_INVALID;
+#endif
+
 	if (!page_fault_can_be_fast(vcpu->kvm, fault))
 		return ret;
 
@@ -7331,6 +7342,9 @@ void kvm_mmu_slot_leaf_clear_dirty(struct kvm *kvm,
 	if (tdp_mmu_enabled) {
 		read_lock(&kvm->mmu_lock);
 		kvm_tdp_mmu_clear_dirty_slot(kvm, memslot);
+#ifdef CONFIG_KVM_VMI
+		kvm_tdp_mmu_clear_dirty_vmi_views(kvm, memslot);
+#endif
 		read_unlock(&kvm->mmu_lock);
 	}
 
