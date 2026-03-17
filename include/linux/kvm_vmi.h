@@ -18,13 +18,33 @@ struct kvm_vcpu;
 struct eventfd_ctx;
 
 /**
+ * struct kvm_vmi_view_data - An alternate memory view (alternate EPT root)
+ * @id: Unique stable view ID (usable as EPTP list index if <= 511).
+ * @vcpu_count: Number of vCPUs currently executing in this view.
+ * @default_access: Default R/W/X permissions for lazily-populated entries.
+ * @visible: VMFUNC visibility (for future EPTP list, currently unused).
+ * @arch: Architecture-specific view data.
+ */
+struct kvm_vmi_view_data {
+	u32 id;
+	atomic_t vcpu_count;
+	u8 default_access;
+	bool visible;
+	struct kvm_arch_vmi_view arch;
+};
+
+/**
  * struct kvm_vmi - VM-level VMI state
  * @lock: Protects VMI state modifications.
+ * @views: Xarray of alternate memory views (struct kvm_vmi_view_data).
+ * @next_view_id: Next view ID to allocate (starts at 1; 0 is the host view).
  * @enabled_events: Bitmask of enabled event types (BIT_ULL(KVM_VMI_EVENT_*)).
  * @arch: Architecture-specific VMI monitoring config (CR/MSR).
  */
 struct kvm_vmi {
 	struct mutex lock;
+	struct xarray views;
+	u32 next_view_id;
 
 	/* Event monitoring config (VM-wide) */
 	u64 enabled_events;
@@ -33,9 +53,14 @@ struct kvm_vmi {
 
 /**
  * struct kvm_vcpu_vmi - Per-vCPU VMI state
+ * @current_view_id: ID of the memory view this vCPU is currently on.
+ * @current_view: Pointer to current alternate view (NULL when on view 0).
  * @arch: Architecture-specific per-vCPU VMI state.
  */
 struct kvm_vcpu_vmi {
+	u32 current_view_id;
+	struct kvm_vmi_view_data *current_view; /* NULL when on view 0 */
+
 	/* Ring state */
 	struct page *ring_page;
 	struct kvm_vmi_ring_header *ring;
@@ -74,6 +99,9 @@ void kvm_vmi_vcpu_destroy(struct kvm_vcpu *vcpu);
 int kvm_vmi_deliver_via_ring(struct kvm_vcpu *vcpu,
 			     struct kvm_vmi_ring_event *event);
 
+/* View management */
+int kvm_vmi_vcpu_switch_view(struct kvm_vcpu *vcpu, u32 view_id);
+
 /* Pause support (called from vcpu_run) */
 bool kvm_vmi_vcpu_paused(struct kvm_vcpu *vcpu);
 void kvm_vmi_vcpu_pause_wait(struct kvm_vcpu *vcpu);
@@ -97,6 +125,19 @@ void kvm_arch_vmi_reset_vcpu_state(struct kvm_vcpu *vcpu);
 int kvm_arch_vmi_control_event(struct kvm *kvm,
 			       struct kvm_vmi_control_event *ctrl);
 void kvm_arch_vmi_update(struct kvm *kvm);
+
+int kvm_arch_vmi_create_view(struct kvm *kvm, struct kvm_vmi_view_data *view);
+void kvm_arch_vmi_destroy_view(struct kvm *kvm, struct kvm_vmi_view_data *view);
+void kvm_arch_vmi_switch_view(struct kvm_vcpu *vcpu,
+			      struct kvm_vmi_view_data *view);
+void kvm_arch_vmi_reset_view(struct kvm_vcpu *vcpu);
+bool kvm_arch_vmi_view_has_root(struct kvm_vmi_view_data *view);
+
+void kvm_arch_vmi_invalidate_gfn(struct kvm *kvm,
+				 struct kvm_vmi_view_data *view, gfn_t gfn);
+void kvm_arch_vmi_invalidate_gfn_locked(struct kvm *kvm,
+					 struct kvm_vmi_view_data *view,
+					 gfn_t gfn);
 
 #else /* !CONFIG_KVM_VMI */
 
