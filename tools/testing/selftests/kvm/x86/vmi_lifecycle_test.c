@@ -86,6 +86,7 @@ static void test_destroy_without_release(void)
 int main(int argc, char *argv[])
 {
 	TEST_REQUIRE(kvm_has_cap(KVM_CAP_VMI));
+	TEST_REQUIRE(kvm_has_cap(KVM_CAP_VMI_RING));
 
 	test_destroy_without_release();
 

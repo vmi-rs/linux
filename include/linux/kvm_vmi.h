@@ -70,6 +70,16 @@ void kvm_vmi_destroy(struct kvm *kvm);
 int kvm_vmi_vcpu_init(struct kvm_vcpu *vcpu);
 void kvm_vmi_vcpu_destroy(struct kvm_vcpu *vcpu);
 
+/* Event delivery */
+int kvm_vmi_deliver_via_ring(struct kvm_vcpu *vcpu,
+			     struct kvm_vmi_ring_event *event);
+
+/* Per-arch functions (implemented per-arch, not a generic->arch contract) */
+void kvm_vmi_capture_regs(struct kvm_vcpu *vcpu, struct kvm_vmi_regs *regs);
+void kvm_vmi_restore_regs(struct kvm_vcpu *vcpu, struct kvm_vmi_regs *regs);
+void kvm_vmi_handle_event_response(struct kvm_vcpu *vcpu,
+				   u32 event_type, u32 resp);
+
 /* Arch callbacks (generic -> arch contract) */
 bool kvm_arch_vmi_supported(void);
 
@@ -81,6 +91,11 @@ void kvm_arch_vmi_reset_vcpu_state(struct kvm_vcpu *vcpu);
 int kvm_arch_vmi_control_event(struct kvm *kvm,
 			       struct kvm_vmi_control_event *ctrl);
 void kvm_arch_vmi_update(struct kvm *kvm);
+
+/* Shed/re-take per-vCPU read locks the arch holds, around a VMI op that
+ * blocks the vCPU thread. */
+void kvm_arch_vmi_block_begin(struct kvm_vcpu *vcpu);
+void kvm_arch_vmi_block_end(struct kvm_vcpu *vcpu);
 
 #else /* !CONFIG_KVM_VMI */
 

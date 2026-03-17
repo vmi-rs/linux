@@ -70,12 +70,83 @@ static void test_session_only_one(void)
 	pr_info("PASS: test_session_only_one\n");
 }
 
+/*
+ * Test 3: Setup ring for a vCPU. Verify ring_fd, mmap, and header.
+ */
+static void test_ring_setup(void)
+{
+	struct kvm_vm *vm;
+	struct kvm_vcpu *vcpu;
+	struct vmi_test_ring ring;
+	int vmi_fd;
+
+	vm = vm_create_with_one_vcpu(&vcpu, guest_halt);
+	vmi_fd = vmi_create(vm);
+
+	vmi_setup_ring(vmi_fd, 0, &ring);
+
+	TEST_ASSERT(ring.ring_fd >= 0,
+		    "ring_fd should be >= 0, got %d", ring.ring_fd);
+	TEST_ASSERT(ring.ring != NULL && ring.ring != MAP_FAILED,
+		    "Ring mmap should succeed");
+	TEST_ASSERT(ring.ring->num_slots > 0,
+		    "Ring header num_slots should be > 0, got %u",
+		    ring.ring->num_slots);
+
+	vmi_teardown_ring(&ring);
+	close(vmi_fd);
+	kvm_vm_free(vm);
+	pr_info("PASS: test_ring_setup\n");
+}
+
+/*
+ * Test 6: Setup ring, then teardown via KVM_VMI_TEARDOWN_RING ioctl.
+ */
+static void test_ring_teardown(void)
+{
+	struct kvm_vm *vm;
+	struct kvm_vcpu *vcpu;
+	struct vmi_test_ring ring;
+	int vmi_fd, ret;
+	__u32 vcpu_id = 0;
+
+	vm = vm_create_with_one_vcpu(&vcpu, guest_halt);
+	vmi_fd = vmi_create(vm);
+	vmi_setup_ring(vmi_fd, 0, &ring);
+
+	/* Unmap the ring before teardown ioctl */
+	if (ring.ring && ring.ring != MAP_FAILED)
+		munmap(ring.ring, getpagesize());
+	ring.ring = NULL;
+
+	/* Teardown via ioctl */
+	ret = ioctl(vmi_fd, KVM_VMI_TEARDOWN_RING, &vcpu_id);
+	TEST_ASSERT(ret == 0,
+		    "KVM_VMI_TEARDOWN_RING should succeed, got %d (errno=%d)",
+		    ret, errno);
+
+	/* Clean up remaining fds (ring_fd was invalidated by teardown) */
+	if (ring.ring_fd >= 0)
+		close(ring.ring_fd);
+	if (ring.event_fd >= 0)
+		close(ring.event_fd);
+	if (ring.ack_fd >= 0)
+		close(ring.ack_fd);
+
+	close(vmi_fd);
+	kvm_vm_free(vm);
+	pr_info("PASS: test_ring_teardown\n");
+}
+
 int main(int argc, char *argv[])
 {
 	TEST_REQUIRE(kvm_has_cap(KVM_CAP_VMI));
+	TEST_REQUIRE(kvm_has_cap(KVM_CAP_VMI_RING));
 
 	test_session_create();
 	test_session_only_one();
+	test_ring_setup();
+	test_ring_teardown();
 
 	return 0;
 }
