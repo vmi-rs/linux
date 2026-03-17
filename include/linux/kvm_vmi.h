@@ -70,6 +70,16 @@ void kvm_vmi_destroy(struct kvm *kvm);
 int kvm_vmi_vcpu_init(struct kvm_vcpu *vcpu);
 void kvm_vmi_vcpu_destroy(struct kvm_vcpu *vcpu);
 
+/* Event delivery */
+int kvm_vmi_deliver_via_ring(struct kvm_vcpu *vcpu,
+			     struct kvm_vmi_ring_event *event);
+
+/* Per-arch functions (implemented per-arch, not a generic->arch contract) */
+void kvm_vmi_capture_regs(struct kvm_vcpu *vcpu, struct kvm_vmi_regs *regs);
+void kvm_vmi_restore_regs(struct kvm_vcpu *vcpu, struct kvm_vmi_regs *regs);
+void kvm_vmi_handle_event_response(struct kvm_vcpu *vcpu,
+				   u32 event_type, u32 resp);
+
 /* Arch callbacks (generic -> arch contract) */
 bool kvm_arch_vmi_supported(void);
 
