@@ -19,6 +19,23 @@
 #include <linux/kvm_vmi_events.h>
 #include <asm/kvm_vmi.h>
 
+/*
+ * Memory Access Flags
+ *
+ * Used in kvm_vmi_mem_access.access to specify which access types
+ * are permitted for a GFN in a given view.  A cleared bit means
+ * that access type will cause a KVM_VMI_EVENT_MEM_ACCESS exit.
+ */
+#define KVM_VMI_ACCESS_R		(1 << 0)
+#define KVM_VMI_ACCESS_W		(1 << 1)
+#define KVM_VMI_ACCESS_X		(1 << 2)
+#define KVM_VMI_ACCESS_RW		(KVM_VMI_ACCESS_R | KVM_VMI_ACCESS_W)
+#define KVM_VMI_ACCESS_RX		(KVM_VMI_ACCESS_R | KVM_VMI_ACCESS_X)
+#define KVM_VMI_ACCESS_WX		(KVM_VMI_ACCESS_W | KVM_VMI_ACCESS_X)
+#define KVM_VMI_ACCESS_RWX		(KVM_VMI_ACCESS_R | KVM_VMI_ACCESS_W | \
+					 KVM_VMI_ACCESS_X)
+#define KVM_VMI_ACCESS_DEFAULT		0xff  /* Use view's default access */
+
 /* Ioctls on vmi_fd (returned by KVM_CREATE_VMI) */
 #define KVM_VMI_SETUP_RING        _IOWR(KVMIO, 0xea, struct kvm_vmi_setup_ring)
 #define KVM_VMI_TEARDOWN_RING     _IOW(KVMIO,  0xeb, __u32)
@@ -30,13 +47,18 @@
 #define KVM_VMI_PAUSE_VCPU        _IOW(KVMIO,  0xf1, struct kvm_vmi_vcpu)
 #define KVM_VMI_UNPAUSE_VCPU      _IOW(KVMIO,  0xf2, struct kvm_vmi_vcpu)
 #define KVM_VMI_INJECT_EVENT      _IOW(KVMIO,  0xf3, struct kvm_vmi_inject_event)
+#define KVM_VMI_CREATE_VIEW       _IOWR(KVMIO, 0xf4, struct kvm_vmi_view)
+#define KVM_VMI_DESTROY_VIEW      _IOW(KVMIO,  0xf5, struct kvm_vmi_view)
+#define KVM_VMI_SWITCH_VIEW       _IOW(KVMIO,  0xf6, struct kvm_vmi_switch_view)
 
 /* Ring event response flags (bitmask, combinable) */
 #define KVM_VMI_RESPONSE_CONTINUE          (0)  /* Default: proceed with normal handling */
 #define KVM_VMI_RESPONSE_DENY              (1 << 0)
 #define KVM_VMI_RESPONSE_SET_REGS          (1 << 1)
+#define KVM_VMI_RESPONSE_SWITCH_VIEW       (1 << 2)
 #define KVM_VMI_RESPONSE_MASK \
-	(KVM_VMI_RESPONSE_DENY | KVM_VMI_RESPONSE_SET_REGS)
+	(KVM_VMI_RESPONSE_DENY | KVM_VMI_RESPONSE_SET_REGS | \
+	 KVM_VMI_RESPONSE_SWITCH_VIEW)
 
 /*
  * VMI ioctl structures
@@ -76,6 +98,34 @@ struct kvm_vmi_vcpu {
 struct kvm_vmi_control_event {
 	__u32 event;
 	__u32 enable;
+};
+
+/**
+ * struct kvm_vmi_view - Alternate memory view descriptor
+ * @view_id: View identifier. OUT on create (assigned by kernel), IN on destroy.
+ *           View 0 is always the default (host) view and cannot be created/destroyed.
+ * @flags: Reserved, must be zero.
+ * @default_access: Default R/W/X permissions for lazily-populated entries.
+ *                  Combination of KVM_VMI_ACCESS_R/W/X flags.
+ * @pad: Reserved padding, must be zero.
+ */
+struct kvm_vmi_view {
+	__u32 view_id;
+	__u32 flags;
+	__u8  default_access;
+	__u8  pad[7];
+};
+
+/**
+ * struct kvm_vmi_switch_view - Switch all vCPUs to a view via vmi_fd
+ *
+ * Switches every vCPU in the VM to the specified view atomically.
+ * For per-vCPU view switching, use the KVM_VMI_RESPONSE_SWITCH_VIEW
+ * flag in the ring event response.
+ */
+struct kvm_vmi_switch_view {
+	__u32 view_id;
+	__u32 pad;
 };
 
 /**

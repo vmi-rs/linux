@@ -1765,6 +1765,10 @@ void kvm_tdp_mmu_clear_dirty_pt_masked(struct kvm *kvm,
 
 	for_each_valid_tdp_mmu_root(kvm, root, slot->as_id)
 		clear_dirty_pt_masked(kvm, root, gfn, mask, wrprot);
+
+#ifdef CONFIG_KVM_VMI
+	kvm_tdp_mmu_clear_dirty_pt_masked_vmi_views(kvm, gfn, mask, wrprot);
+#endif
 }
 
 static int tdp_mmu_make_huge_spte(struct kvm *kvm,
@@ -1939,10 +1943,32 @@ bool kvm_tdp_mmu_write_protect_gfn(struct kvm *kvm,
 int kvm_tdp_mmu_get_walk(struct kvm_vcpu *vcpu, u64 addr, u64 *sptes,
 			 int *root_level)
 {
-	struct kvm_mmu_page *root = root_to_sp(vcpu->arch.mmu->root.hpa);
+	struct kvm_mmu_page *root = NULL;
 	struct tdp_iter iter;
 	gfn_t gfn = addr >> PAGE_SHIFT;
 	int leaf = -1;
+
+#ifdef CONFIG_KVM_VMI
+	/*
+	 * When a vCPU is running in a VMI alternate view, walk the
+	 * view's EPT root instead of the primary root.  This is
+	 * critical for handle_mmio_page_fault() which calls here via
+	 * get_sptes_lockless() to find MMIO SPTEs - walking the wrong
+	 * root causes MMIO emulation to never trigger, resulting in
+	 * an infinite EPT_MISCONFIG retry loop.
+	 *
+	 * Use READ_ONCE for both current_view and tdp_root because
+	 * kvm_vmi_release() can NULL them concurrently during teardown.
+	 */
+	if (vcpu->vmi && vcpu->vmi->current_view_id != 0) {
+		struct kvm_vmi_view_data *view = READ_ONCE(vcpu->vmi->current_view);
+
+		if (view)
+			root = READ_ONCE(view->arch.tdp_root);
+	}
+	if (!root)
+#endif
+		root = root_to_sp(vcpu->arch.mmu->root.hpa);
 
 	*root_level = vcpu->arch.mmu->root_role.level;
 
@@ -1990,3 +2016,226 @@ u64 *kvm_tdp_mmu_fast_pf_get_last_sptep(struct kvm_vcpu *vcpu, gfn_t gfn,
 	 */
 	return rcu_dereference(sptep);
 }
+
+#ifdef CONFIG_KVM_VMI
+/*
+ * Allocate a TDP MMU root for a VMI alternate view.
+ *
+ * Returns a kvm_mmu_page with a zeroed page table page. The root has
+ * set_page_private() so root_to_sp() and sptep_to_sp() work correctly
+ * during TDP MMU walks. The view starts with an empty EPT; entries are
+ * lazily populated by the TDP MMU on first access (EPT violation).
+ *
+ * @ad_disabled: true if A/D bits are not available (affects role and EPTP).
+ * @root_pa: output - physical address of the root page table page.
+ */
+struct kvm_mmu_page *kvm_tdp_mmu_alloc_vmi_root(bool ad_disabled, hpa_t *root_pa)
+{
+	struct kvm_mmu_page *root;
+	struct page *spt_page;
+	union kvm_mmu_page_role role = {0};
+
+	root = kzalloc(sizeof(*root), GFP_KERNEL);
+	if (!root)
+		return ERR_PTR(-ENOMEM);
+
+	spt_page = alloc_page(GFP_KERNEL_ACCOUNT | __GFP_ZERO);
+	if (!spt_page) {
+		kfree(root);
+		return ERR_PTR(-ENOMEM);
+	}
+
+	root->spt = page_address(spt_page);
+	set_page_private(spt_page, (unsigned long)root);
+
+	/*
+	 * Initialize role to match host TDP root. The exact role bits
+	 * don't matter much since this root is not in tdp_mmu_roots,
+	 * but level and direct must be correct for TDP MMU iteration,
+	 * and ad_disabled must match for EPTP construction.
+	 */
+	role.level = PT64_ROOT_4LEVEL;
+	role.direct = true;
+	role.ad_disabled = ad_disabled;
+	root->role = role;
+	root->gfn = 0;
+	root->tdp_mmu_page = true;
+	INIT_LIST_HEAD(&root->possible_nx_huge_page_link);
+	INIT_LIST_HEAD(&root->link);
+	refcount_set(&root->tdp_mmu_root_count, 1);
+
+	*root_pa = __pa(root->spt);
+	return root;
+}
+EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_tdp_mmu_alloc_vmi_root);
+
+/*
+ * Free an entire VMI view EPT rooted at @root. Zaps all SPTEs bottom-up
+ * (leaves first, then intermediate levels) to avoid use-after-free:
+ * setting a non-leaf SPTE to 0 triggers handle_removed_pt() which
+ * recursively frees the subtree via RCU - the iterator must not then
+ * try to descend into it.
+ *
+ * Caller must hold kvm->mmu_lock for write.
+ */
+void kvm_tdp_mmu_free_vmi_root(struct kvm *kvm, struct kvm_mmu_page *root)
+{
+	struct tdp_iter iter;
+	int zap_level;
+
+	lockdep_assert_held_write(&kvm->mmu_lock);
+
+	rcu_read_lock();
+
+	/*
+	 * Zap bottom-up: leaves first (PG_LEVEL_4K), then 2MB non-leaves,
+	 * then 1G, then root-level entries. This ensures we never descend
+	 * into an already-freed subtree.
+	 *
+	 * tdp_mmu_iter_set_spte -> handle_changed_spte -> handle_removed_pt
+	 * properly unaccounts and RCU-frees intermediate kvm_mmu_page structs.
+	 */
+	for (zap_level = PG_LEVEL_4K; zap_level <= root->role.level;
+	     zap_level++) {
+		for_each_tdp_pte(iter, kvm, root, 0, -1ull) {
+			if (iter.level != zap_level)
+				continue;
+			if (!is_shadow_present_pte(iter.old_spte))
+				continue;
+			tdp_mmu_iter_set_spte(kvm, &iter,
+					      SHADOW_NONPRESENT_VALUE);
+		}
+	}
+
+	rcu_read_unlock();
+
+	/* Root page and header allocated by kvm_tdp_mmu_alloc_vmi_root() */
+	free_page((unsigned long)root->spt);
+	kfree(root);
+}
+EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_tdp_mmu_free_vmi_root);
+
+/*
+ * Clear dirty bits in all VMI alternate view roots for a memslot range.
+ * Called when dirty logging is initially enabled on a memslot so that PML
+ * captures writes in alt views (PML only fires on clean->dirty transition).
+ * Caller must hold kvm->mmu_lock for read.
+ */
+void kvm_tdp_mmu_clear_dirty_vmi_views(struct kvm *kvm,
+					const struct kvm_memory_slot *slot)
+{
+	struct kvm_vmi *vmi;
+	struct kvm_vmi_view_data *view;
+	unsigned long idx;
+
+	lockdep_assert_held_read(&kvm->mmu_lock);
+
+	rcu_read_lock();
+	vmi = rcu_dereference(kvm->vmi);
+	if (!vmi) {
+		rcu_read_unlock();
+		return;
+	}
+
+	xa_for_each(&vmi->views, idx, view) {
+		if (view->arch.tdp_root)
+			clear_dirty_gfn_range(kvm, view->arch.tdp_root,
+					      slot->base_gfn,
+					      slot->base_gfn + slot->npages);
+	}
+	rcu_read_unlock();
+}
+
+/*
+ * Clear dirty status (D-bit or W-bit) for the given GFN mask in all VMI
+ * alternate view EPT roots. Called from kvm_tdp_mmu_clear_dirty_pt_masked()
+ * on every KVM_CLEAR_DIRTY_LOG so that PML continues to capture writes in
+ * alt views (PML only fires on clean->dirty transition).
+ */
+void kvm_tdp_mmu_clear_dirty_pt_masked_vmi_views(struct kvm *kvm,
+							 gfn_t gfn,
+							 unsigned long mask,
+							 bool wrprot)
+{
+	struct kvm_vmi *vmi;
+	struct kvm_vmi_view_data *view;
+	unsigned long idx;
+
+	rcu_read_lock();
+	vmi = rcu_dereference(kvm->vmi);
+	if (!vmi) {
+		rcu_read_unlock();
+		return;
+	}
+
+	xa_for_each(&vmi->views, idx, view) {
+		if (view->arch.tdp_root)
+			clear_dirty_pt_masked(kvm, view->arch.tdp_root,
+					      gfn, mask, wrprot);
+	}
+	rcu_read_unlock();
+}
+
+/*
+ * Zap a single leaf SPTE from a VMI view root.
+ * Used by set_mem_access and change_gfn to invalidate a mapping so the
+ * next fault re-installs it with updated permissions/PFN.
+ * Caller must hold kvm->mmu_lock for write.
+ */
+void kvm_tdp_mmu_zap_vmi_leaf(struct kvm *kvm, struct kvm_mmu_page *root,
+			      gfn_t gfn)
+{
+	struct tdp_iter iter;
+
+	lockdep_assert_held_write(&kvm->mmu_lock);
+
+	rcu_read_lock();
+
+	for_each_tdp_pte(iter, kvm, root, gfn, gfn + 1) {
+		if (!is_shadow_present_pte(iter.old_spte))
+			continue;
+		if (is_last_spte(iter.old_spte, iter.level)) {
+			tdp_mmu_iter_set_spte(kvm, &iter,
+					      SHADOW_NONPRESENT_VALUE);
+			break;
+		}
+	}
+
+	rcu_read_unlock();
+}
+
+/*
+ * Zap the non-leaf SPTE at PG_LEVEL_2M covering @gfn in a VMI view root.
+ * This removes the entire 4K page table for the 2MB block, allowing
+ * subsequent faults to install a 2MB huge page SPTE if possible.
+ *
+ * Used when the last GFN remap in a 2MB block is removed, so the block
+ * no longer needs to be forced to 4K granularity.
+ *
+ * Caller must hold kvm->mmu_lock for write.
+ */
+void kvm_tdp_mmu_zap_vmi_2m_block(struct kvm *kvm, struct kvm_mmu_page *root,
+				   gfn_t gfn)
+{
+	gfn_t block_gfn = gfn & ~(KVM_PAGES_PER_HPAGE(PG_LEVEL_2M) - 1);
+	struct tdp_iter iter;
+
+	lockdep_assert_held_write(&kvm->mmu_lock);
+
+	rcu_read_lock();
+
+	for_each_tdp_pte_min_level(iter, kvm, root, PG_LEVEL_2M,
+				   block_gfn, block_gfn + 1) {
+		if (!is_shadow_present_pte(iter.old_spte))
+			continue;
+		if (iter.level == PG_LEVEL_2M &&
+		    !is_last_spte(iter.old_spte, iter.level)) {
+			tdp_mmu_iter_set_spte(kvm, &iter,
+					      SHADOW_NONPRESENT_VALUE);
+			break;
+		}
+	}
+
+	rcu_read_unlock();
+}
+#endif /* CONFIG_KVM_VMI */

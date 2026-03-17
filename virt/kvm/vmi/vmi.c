@@ -71,7 +71,9 @@ int kvm_create_vmi(struct kvm *kvm)
 	}
 
 	mutex_init(&vmi->lock);
+	xa_init(&vmi->views);
 	kvm_arch_vmi_session_init(vmi);
+	vmi->next_view_id = 1; /* View 0 is the default/host view */
 
 	rcu_assign_pointer(kvm->vmi, vmi);
 
@@ -110,6 +112,7 @@ err_rollback:
 	mutex_unlock(&kvm->lock);
 	mutex_destroy(&vmi->lock);
 	kvm_arch_vmi_session_cleanup(vmi);
+	xa_destroy(&vmi->views);
 	kfree(vmi);
 	return r;
 }
@@ -142,6 +145,7 @@ void kvm_vmi_destroy(struct kvm *kvm)
 
 	rcu_assign_pointer(kvm->vmi, NULL);
 	kvm_arch_vmi_session_cleanup(vmi);
+	xa_destroy(&vmi->views);
 	mutex_destroy(&vmi->lock);
 	kfree(vmi);
 }
@@ -165,10 +169,13 @@ int kvm_vmi_vcpu_init(struct kvm_vcpu *vcpu)
 	if (!vcpu_vmi)
 		return -ENOMEM;
 
+	spin_lock_init(&vcpu_vmi->view_lock);
+	vcpu_vmi->current_view_id = 0; /* Default to host view */
 	init_waitqueue_head(&vcpu_vmi->wq);
-	init_waitqueue_head(&vcpu_vmi->pause_wq);
-	atomic_set(&vcpu_vmi->pause_count, 0);
 	vcpu_vmi->teardown = false;
+	vcpu_vmi->session_teardown = false;
+	atomic_set(&vcpu_vmi->pause_count, 0);
+	init_waitqueue_head(&vcpu_vmi->pause_wq);
 
 	vcpu->vmi = vcpu_vmi;
 
@@ -215,6 +222,12 @@ static int kvm_vmi_apply_ring_response(struct kvm_vcpu *vcpu,
 
 	/* Dispatch to arch-specific response handler */
 	kvm_vmi_handle_event_response(vcpu, event_type, resp);
+
+	if (resp & KVM_VMI_RESPONSE_SWITCH_VIEW) {
+		u32 view_id = READ_ONCE(event->view_id);
+
+		kvm_vmi_vcpu_switch_view(vcpu, view_id);
+	}
 
 	return resp;
 }
@@ -268,8 +281,12 @@ int kvm_vmi_deliver_via_ring(struct kvm_vcpu *vcpu,
 	/* Snapshot registers into the ring slot */
 	kvm_vmi_capture_regs(vcpu, &slot->regs);
 
+	/* Initialize response area: view_id defaults to current view
+	 * so the agent can read it to know which view the event fired in.
+	 * The agent can overwrite it for SWITCH_VIEW responses.
+	 */
 	slot->response = 0;
-	slot->view_id = 0;
+	slot->view_id = vcpu_vmi->current_view_id;
 
 	/* Publish event: ensure all writes are visible before prod update */
 	smp_wmb();
@@ -322,6 +339,103 @@ int kvm_vmi_deliver_via_ring(struct kvm_vcpu *vcpu,
 
 	/* Apply response and return the masked response flags */
 	return kvm_vmi_apply_ring_response(vcpu, slot);
+}
+
+/*
+ * __kvm_vmi_vcpu_switch_view_locked - Core per-vCPU view switch.
+ *
+ * Does the refcount bookkeeping, the arch-specific stage-2/EPTP switch, and
+ * updates current_view. The caller must hold @vcpu->vmi->view_lock so this
+ * cannot interleave with a concurrent VM-wide KVM_VMI_SWITCH_VIEW; that
+ * serialization is what keeps the view refcounts consistent (see
+ * struct kvm_vcpu_vmi::view_lock).
+ *
+ * Return: 0 on success, negative errno on failure.
+ */
+static int __kvm_vmi_vcpu_switch_view_locked(struct kvm_vcpu *vcpu, u32 view_id)
+{
+	struct kvm_vmi *vmi = vcpu->kvm->vmi;
+	struct kvm_vcpu_vmi *vcpu_vmi = vcpu->vmi;
+	struct kvm_vmi_view_data *new_view, *old_view;
+	u32 old_view_id;
+	int idx;
+
+	lockdep_assert_held(&vcpu_vmi->view_lock);
+
+	old_view_id = vcpu_vmi->current_view_id;
+
+	/* Switching to same view is a no-op */
+	if (view_id == old_view_id)
+		return 0;
+
+	/*
+	 * Dereference views under kvm->srcu: destroy_view frees them via
+	 * call_srcu(&kvm->srcu). Lookup + the refcount handshake all run inside
+	 * this section.
+	 */
+	idx = srcu_read_lock(&vcpu->kvm->srcu);
+
+	if (view_id == 0) {
+		new_view = NULL;
+	} else {
+		new_view = xa_load(&vmi->views, view_id);
+		if (!new_view) {
+			srcu_read_unlock(&vcpu->kvm->srcu, idx);
+			return -ENOENT;
+		}
+	}
+
+	/* Update refcounts */
+	if (old_view_id != 0) {
+		old_view = xa_load(&vmi->views, old_view_id);
+		if (old_view)
+			atomic_dec(&old_view->vcpu_count);
+	}
+	if (new_view) {
+		atomic_inc(&new_view->vcpu_count);
+		/*
+		 * Pair with destroy_view's WRITE_ONCE(dying)+smp_mb()+read count.
+		 * If destroy committed to free new_view, observe ->dying here and
+		 * back off so current_view never ends up pointing at a freed view.
+		 */
+		smp_mb__after_atomic();
+		if (READ_ONCE(new_view->dying)) {
+			atomic_dec(&new_view->vcpu_count);
+			srcu_read_unlock(&vcpu->kvm->srcu, idx);
+			return -ENOENT;
+		}
+	}
+
+	srcu_read_unlock(&vcpu->kvm->srcu, idx);
+
+	/* Perform the arch-specific EPTP switch */
+	kvm_arch_vmi_switch_view(vcpu, new_view);
+
+	trace_kvm_vmi_view_switch(vcpu->vcpu_id, old_view_id, view_id);
+	vcpu_vmi->current_view_id = view_id;
+	rcu_assign_pointer(vcpu_vmi->current_view, new_view);
+	return 0;
+}
+
+/**
+ * kvm_vmi_vcpu_switch_view - Switch a vCPU to an alternate memory view
+ * @vcpu: The target vCPU.
+ * @view_id: The view ID to switch to (0 = host view).
+ *
+ * Return: 0 on success, negative errno on failure.
+ */
+int kvm_vmi_vcpu_switch_view(struct kvm_vcpu *vcpu, u32 view_id)
+{
+	struct kvm_vcpu_vmi *vcpu_vmi = vcpu->vmi;
+	int ret;
+
+	if (!vcpu->kvm->vmi || !vcpu_vmi)
+		return -EINVAL;
+
+	spin_lock(&vcpu_vmi->view_lock);
+	ret = __kvm_vmi_vcpu_switch_view_locked(vcpu, view_id);
+	spin_unlock(&vcpu_vmi->view_lock);
+	return ret;
 }
 
 /**
@@ -912,6 +1026,255 @@ static int kvm_vmi_inject_event_ioctl(struct kvm *kvm,
 	return r;
 }
 
+/**
+ * kvm_vmi_create_view - Create an alternate memory view
+ * @kvm: The target VM.
+ * @uview: View descriptor from userspace (view_id is output).
+ *
+ * Allocates a new alternate view with its own EPT root. The view starts
+ * empty; entries are lazily populated from the host EPT on first access.
+ *
+ * Return: 0 on success, negative errno on failure.
+ */
+static int kvm_vmi_create_view(struct kvm *kvm, struct kvm_vmi_view *uview)
+{
+	struct kvm_vmi *vmi = kvm->vmi;
+	struct kvm_vmi_view_data *view;
+	int ret;
+
+	if (!vmi)
+		return -EINVAL;
+
+	/* Reject W without R - EPT cannot encode this combination */
+	if ((uview->default_access & KVM_VMI_ACCESS_W) &&
+	    !(uview->default_access & KVM_VMI_ACCESS_R))
+		return -EINVAL;
+
+	view = kzalloc(sizeof(*view), GFP_KERNEL);
+	if (!view)
+		return -ENOMEM;
+
+	atomic_set(&view->vcpu_count, 0);
+	view->default_access = uview->default_access;
+	view->visible = true;
+
+	/* Allocate arch-specific EPT root */
+	ret = kvm_arch_vmi_create_view(kvm, view);
+	if (ret) {
+		kfree(view);
+		return ret;
+	}
+
+	/* Assign view ID and store in xarray */
+	mutex_lock(&vmi->lock);
+	view->id = vmi->next_view_id++;
+	ret = xa_insert(&vmi->views, view->id, view, GFP_KERNEL);
+	mutex_unlock(&vmi->lock);
+
+	if (ret) {
+		kvm_arch_vmi_destroy_view(kvm, view);
+		kfree(view);
+		return ret;
+	}
+
+	uview->view_id = view->id;
+	trace_kvm_vmi_view_create(view->id, view->default_access);
+	return 0;
+}
+
+/*
+ * Deferred free of a destroyed view, queued via call_srcu(&kvm->srcu) once the
+ * arch stage-2 root has been torn down synchronously. The embedded xarrays are
+ * walked by the lock-free fault-path readers under kvm->srcu (kvm_vmi_view_*),
+ * so their teardown must outlive any in-flight reader - hence it runs here,
+ * after the SRCU grace period, not at destroy_view time. Mirrors __free_bus()
+ * (virt/kvm/kvm_main.c) and free_vcpu_vmi() above.
+ */
+static void free_view(struct rcu_head *rcu)
+{
+	struct kvm_vmi_view_data *view =
+		container_of(rcu, struct kvm_vmi_view_data, rcu_head);
+
+	kfree(view);
+}
+
+/**
+ * kvm_vmi_destroy_view - Destroy an alternate memory view
+ * @kvm: The target VM.
+ * @uview: View descriptor from userspace (view_id identifies the view).
+ *
+ * Frees a view and all its resources. Fails if any vCPU is currently
+ * executing in the view.
+ *
+ * Return: 0 on success, negative errno on failure.
+ */
+static int kvm_vmi_destroy_view(struct kvm *kvm, struct kvm_vmi_view *uview)
+{
+	struct kvm_vmi *vmi = kvm->vmi;
+	struct kvm_vmi_view_data *view;
+
+	if (!vmi)
+		return -EINVAL;
+
+	if (uview->view_id == 0)
+		return -EINVAL; /* Cannot destroy host view */
+
+	mutex_lock(&vmi->lock);
+	view = xa_load(&vmi->views, uview->view_id);
+	if (!view) {
+		mutex_unlock(&vmi->lock);
+		return -ENOENT;
+	}
+
+	/* Check no vCPUs are currently on this view */
+	if (atomic_read(&view->vcpu_count) > 0) {
+		mutex_unlock(&vmi->lock);
+		return -EBUSY;
+	}
+
+	/*
+	 * Publish ->dying, then re-read vcpu_count. The vCPU-thread switch
+	 * (__kvm_vmi_vcpu_switch_view_locked) cannot take vmi->lock, so it
+	 * serializes against us with a symmetric store-load barrier:
+	 *   switch:  atomic_inc(count); smp_mb__after_atomic(); read ->dying
+	 *   destroy: WRITE_ONCE(->dying,1); smp_mb(); read count
+	 * The two full barriers forbid the "both miss" outcome, so at most one
+	 * side proceeds: if a switch's inc is visible here we back off (-EBUSY,
+	 * clearing ->dying); otherwise the switch observes ->dying and backs off
+	 * its inc. A freed view is therefore never left referenced by a vCPU's
+	 * current_view.
+	 */
+	WRITE_ONCE(view->dying, true);
+	smp_mb();
+	if (atomic_read(&view->vcpu_count) > 0) {
+		WRITE_ONCE(view->dying, false);
+		mutex_unlock(&vmi->lock);
+		return -EBUSY;
+	}
+
+	xa_erase(&vmi->views, uview->view_id);
+	mutex_unlock(&vmi->lock);
+
+	trace_kvm_vmi_view_destroy(uview->view_id);
+
+	/*
+	 * Free arch-specific resources (EPT/stage-2 root) synchronously. Safe:
+	 * vcpu_count==0 and the arch drain forces vCPUs OUTSIDE_GUEST_MODE, and
+	 * no SRCU reader dereferences view->arch.{mmu,tdp_root}.
+	 */
+	kvm_arch_vmi_destroy_view(kvm, view);
+
+	/* Defer the struct + embedded-xarray free past in-flight SRCU readers. */
+	call_srcu(&kvm->srcu, &view->rcu_head, free_view);
+	return 0;
+}
+
+/**
+ * kvm_vmi_switch_view - Switch all vCPUs to a view (ioctl wrapper)
+ * @kvm: The target VM.
+ * @sv: Switch view descriptor from userspace.
+ *
+ * Return: 0 on success, negative errno on failure.
+ */
+static int kvm_vmi_switch_view(struct kvm *kvm,
+			       struct kvm_vmi_switch_view *sv)
+{
+	struct kvm_vmi *vmi = kvm->vmi;
+	struct kvm_vmi_view_data *new_view, *old_view;
+	struct kvm_vcpu *vcpu;
+	unsigned long i;
+
+	if (!vmi)
+		return -EINVAL;
+
+	/*
+	 * Hold vmi->lock across the view lookup and the per-vCPU refcount
+	 * updates below. kvm_vmi_destroy_view() erases the view under vmi->lock
+	 * and frees it (and its arch stage-2 root) right after, once
+	 * vcpu_count == 0 -- which is exactly the xa_load()->atomic_inc() window
+	 * here. Without the lock this otherwise lock-free lookup + refcount bump
+	 * races destroy_view and increments a freed view. The per-vCPU view_lock
+	 * taken inside the loop only serializes a vCPU's own view switches, not
+	 * KVM_VMI_DESTROY_VIEW. Lock order is vmi->lock (mutex) -> view_lock
+	 * (spinlock), consistent with the rest of the file; no view_lock holder
+	 * takes vmi->lock, so no inversion is introduced. See change_gfn
+	 * (7bc2164c) for the sibling fix.
+	 */
+	mutex_lock(&vmi->lock);
+
+	if (sv->view_id == 0) {
+		new_view = NULL;
+	} else {
+		new_view = xa_load(&vmi->views, sv->view_id);
+		if (!new_view) {
+			mutex_unlock(&vmi->lock);
+			return -ENOENT;
+		}
+	}
+
+	/*
+	 * Switch every vCPU to the target view. Update in-memory state
+	 * first, then kick all vCPUs via kvm_arch_vmi_update() so they
+	 * pick up the new EPTP in apply_vmcs_state().
+	 */
+	kvm_for_each_vcpu(i, vcpu, kvm) {
+		struct kvm_vcpu_vmi *vcpu_vmi = vcpu->vmi;
+		u32 old_view_id;
+
+		if (!vcpu_vmi)
+			continue;
+
+		/*
+		 * Serialize this VM-wide mutation against the vCPU's own view
+		 * switches (fast-singlestep completion and ring-response
+		 * switches run on the vCPU thread). Without it the refcount
+		 * update and the restore-target redirect below race those
+		 * paths, and a fast-singlestep completing in the window can
+		 * resurrect a refcount on the view we are switching away from.
+		 */
+		spin_lock(&vcpu_vmi->view_lock);
+
+		old_view_id = vcpu_vmi->current_view_id;
+		if (sv->view_id == old_view_id) {
+			spin_unlock(&vcpu_vmi->view_lock);
+			continue;
+		}
+
+		/* Update refcounts */
+		if (old_view_id != 0) {
+			old_view = xa_load(&vmi->views, old_view_id);
+			if (old_view)
+				atomic_dec(&old_view->vcpu_count);
+		}
+		if (new_view)
+			atomic_inc(&new_view->vcpu_count);
+
+		vcpu_vmi->current_view_id = sv->view_id;
+		rcu_assign_pointer(vcpu_vmi->current_view, new_view);
+
+		/*
+		 * When switching back to view 0, ask the arch layer
+		 * to reload the host page table root on next entry.
+		 */
+		if (sv->view_id == 0 && old_view_id != 0)
+			kvm_arch_vmi_reset_view(vcpu);
+
+		spin_unlock(&vcpu_vmi->view_lock);
+	}
+
+	/*
+	 * The refcounts are now committed: any vCPU that switched onto new_view
+	 * has bumped its vcpu_count, so destroy_view() can no longer free it.
+	 * Drop vmi->lock before the kick (kvm_arch_vmi_update touches no view).
+	 */
+	mutex_unlock(&vmi->lock);
+
+	/* Schedule VMCS sync + kick on all vCPUs */
+	kvm_arch_vmi_update(kvm);
+
+	return 0;
+}
+
 /*
  * KVM_VMI_GET_MEM_INFO: report the guest RAM extent.
  *
@@ -960,9 +1323,10 @@ static void free_vcpu_vmi(struct rcu_head *head)
 static int kvm_vmi_release(struct inode *inode, struct file *file)
 {
 	struct kvm *kvm = file->private_data;
-	struct kvm_vmi *vmi;
 	struct kvm_vcpu *vcpu;
-	unsigned long i;
+	struct kvm_vmi_view_data *view;
+	struct kvm_vmi *vmi;
+	unsigned long i, index;
 	int srcu_idx;
 
 	trace_kvm_vmi_session(false);
@@ -995,6 +1359,66 @@ static int kvm_vmi_release(struct inode *inode, struct file *file)
 	/* Clear VM-wide event monitoring state */
 	vmi->enabled_events = 0;
 	kvm_arch_vmi_session_reset(vmi);
+
+	/*
+	 * Disable events and switch to view 0 on each vCPU.
+	 * Only update in-memory state here - we cannot write VMCS
+	 * fields from this thread. The vCPU threads will pick up
+	 * the changes via kvm_arch_vmi_update() at the end.
+	 */
+	kvm_for_each_vcpu(i, vcpu, kvm) {
+		struct kvm_vmi_view_data *old_view;
+		struct kvm_vcpu_vmi *vcpu_vmi = vcpu->vmi;
+
+		if (!vcpu_vmi)
+			continue;
+		kvm_arch_vmi_reset_vcpu_state(vcpu);
+
+		if (vcpu_vmi->current_view_id != 0) {
+			old_view = xa_load(&vmi->views,
+					   vcpu_vmi->current_view_id);
+			if (old_view)
+				atomic_dec(&old_view->vcpu_count);
+			vcpu_vmi->current_view_id = 0;
+			rcu_assign_pointer(vcpu_vmi->current_view, NULL);
+			/*
+			 * The vCPU was on an alternate view. Ask the
+			 * arch layer to reload the host page table
+			 * root on next entry.
+			 */
+			kvm_arch_vmi_reset_view(vcpu);
+		}
+	}
+
+	/* Schedule VMCS sync on all vCPUs */
+	kvm_arch_vmi_update(kvm);
+
+	/*
+	 * Drain in-flight stage-2 fault handlers that are walking the page
+	 * table *root* under mmu_lock (read), so a fault cannot install a leaf
+	 * into a view root the arch destroy below tears down. (The view *struct*
+	 * + the current_view deref are not covered by this cycle - the first
+	 * fault reader runs before mmu_lock - they are covered by kvm->srcu +
+	 * call_srcu(free_view); current_view=NULL was published above, so new
+	 * faults fall through to the primary root.)
+	 */
+	write_lock(&kvm->mmu_lock);
+	write_unlock(&kvm->mmu_lock);
+
+	/*
+	 * Destroy all non-zero views. release runs with all vCPUs paused, so
+	 * there are no in-flight view readers and ->dying is not needed (no
+	 * concurrent switch); the arch stage-2 root drain stays synchronous and
+	 * the struct/xarray free is deferred past any SRCU grace period via
+	 * call_srcu(free_view), mirroring kvm_vmi_destroy_view().
+	 */
+	xa_for_each(&vmi->views, index, view) {
+		if (index == 0)
+			continue;
+		xa_erase(&vmi->views, index);
+		kvm_arch_vmi_destroy_view(kvm, view);
+		call_srcu(&kvm->srcu, &view->rcu_head, free_view);
+	}
 
 	/*
 	 * Free per-vCPU ring state, then detach and schedule deferred
@@ -1034,6 +1458,7 @@ static int kvm_vmi_release(struct inode *inode, struct file *file)
 	synchronize_srcu(&kvm->srcu);
 
 	kvm_arch_vmi_session_cleanup(vmi);
+	xa_destroy(&vmi->views);
 	mutex_destroy(&vmi->lock);
 	kfree(vmi);
 
@@ -1107,6 +1532,33 @@ static long kvm_vmi_ioctl(struct file *file, unsigned int ioctl,
 		if (copy_from_user(&inject, argp, sizeof(inject)))
 			return -EFAULT;
 		return kvm_vmi_inject_event_ioctl(kvm, &inject);
+	}
+	case KVM_VMI_CREATE_VIEW: {
+		struct kvm_vmi_view view;
+		int r;
+
+		if (copy_from_user(&view, argp, sizeof(view)))
+			return -EFAULT;
+		r = kvm_vmi_create_view(kvm, &view);
+		if (r)
+			return r;
+		if (copy_to_user(argp, &view, sizeof(view)))
+			return -EFAULT;
+		return 0;
+	}
+	case KVM_VMI_DESTROY_VIEW: {
+		struct kvm_vmi_view view;
+
+		if (copy_from_user(&view, argp, sizeof(view)))
+			return -EFAULT;
+		return kvm_vmi_destroy_view(kvm, &view);
+	}
+	case KVM_VMI_SWITCH_VIEW: {
+		struct kvm_vmi_switch_view sv;
+
+		if (copy_from_user(&sv, argp, sizeof(sv)))
+			return -EFAULT;
+		return kvm_vmi_switch_view(kvm, &sv);
 	}
 	case KVM_VMI_GET_MEM_INFO: {
 		struct kvm_vmi_mem_info info = {};

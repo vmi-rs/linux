@@ -743,6 +743,10 @@ void vmx_exit(void);
 #ifdef CONFIG_KVM_VMI
 bool vmx_vmi_has_cap(void);
 void vmx_vmi_apply_vmcs_state(struct kvm_vcpu *vcpu);
+int vmx_vmi_create_view(struct kvm *kvm, struct kvm_vmi_view_data *view);
+void vmx_vmi_destroy_view(struct kvm *kvm, struct kvm_vmi_view_data *view);
+void vmx_vmi_switch_view(struct kvm_vcpu *vcpu,
+			 struct kvm_vmi_view_data *view);
 #endif
 
 #endif /* __KVM_X86_VMX_H */

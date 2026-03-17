@@ -1021,6 +1021,9 @@ struct kvm_x86_ops vt_x86_ops __initdata = {
 #ifdef CONFIG_KVM_VMI
 	.vmi_has_cap = vmx_vmi_has_cap,
 	.vmi_apply_state = vmx_vmi_apply_vmcs_state,
+	.vmi_create_view = vmx_vmi_create_view,
+	.vmi_destroy_view = vmx_vmi_destroy_view,
+	.vmi_switch_view = vmx_vmi_switch_view,
 #endif
 };
 

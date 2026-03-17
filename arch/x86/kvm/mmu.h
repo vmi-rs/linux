@@ -322,4 +322,14 @@ static inline bool kvm_is_gfn_alias(struct kvm *kvm, gfn_t gfn)
 {
 	return gfn & kvm_gfn_direct_bits(kvm);
 }
+
+#ifdef CONFIG_KVM_VMI
+struct kvm_mmu_page *kvm_tdp_mmu_alloc_vmi_root(bool ad_disabled, hpa_t *root_pa);
+void kvm_tdp_mmu_free_vmi_root(struct kvm *kvm, struct kvm_mmu_page *root);
+void kvm_tdp_mmu_zap_vmi_leaf(struct kvm *kvm, struct kvm_mmu_page *root,
+			      gfn_t gfn);
+void kvm_tdp_mmu_zap_vmi_2m_block(struct kvm *kvm, struct kvm_mmu_page *root,
+				   gfn_t gfn);
+#endif
+
 #endif
