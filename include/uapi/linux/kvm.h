@@ -980,6 +980,7 @@ struct kvm_enable_cap {
 #define KVM_CAP_ARM_SEA_TO_USER 245
 #define KVM_CAP_S390_USER_OPEREXEC 246
 #define KVM_CAP_VMI 500
+#define KVM_CAP_VMI_RING         501
 
 struct kvm_irq_routing_irqchip {
 	__u32 irqchip;

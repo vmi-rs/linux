@@ -111,6 +111,29 @@ static void test_vmi_create_close_recreate(void)
 	pr_info("PASS: KVM_CREATE_VMI succeeds after close (re-create)\n");
 }
 
+/*
+ * Test 6: KVM_VMI_CONTROL_EVENT validates event type
+ */
+static void test_control_event_invalid(void)
+{
+	struct kvm_vm *vm;
+	struct kvm_vcpu *vcpu;
+	int vmi_fd, r;
+
+	vm = vm_create_with_one_vcpu(&vcpu, guest_code);
+	vmi_fd = vmi_create(vm);
+
+	/* Invalid event type should fail */
+	r = vmi_control_event_err(vmi_fd, KVM_VMI_NUM_EVENTS, 1);
+	TEST_ASSERT(r == -1 && errno == EINVAL,
+		    "Invalid event type should fail with EINVAL, got r=%d errno=%d",
+		    r, errno);
+
+	close(vmi_fd);
+	kvm_vm_free(vm);
+	pr_info("PASS: Invalid event type correctly rejected\n");
+}
+
 int main(int argc, char *argv[])
 {
 	TEST_REQUIRE(kvm_has_cap(KVM_CAP_VMI));
@@ -119,6 +142,7 @@ int main(int argc, char *argv[])
 	test_vmi_create();
 	test_vmi_create_twice();
 	test_vmi_create_close_recreate();
+	test_control_event_invalid();
 
 	return 0;
 }

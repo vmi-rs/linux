@@ -19,6 +19,41 @@
 #include <linux/kvm_vmi_events.h>
 #include <asm/kvm_vmi.h>
 
+/* Ioctls on vmi_fd (returned by KVM_CREATE_VMI) */
+#define KVM_VMI_SETUP_RING        _IOWR(KVMIO, 0xea, struct kvm_vmi_setup_ring)
+#define KVM_VMI_TEARDOWN_RING     _IOW(KVMIO,  0xeb, __u32)
+#define KVM_VMI_ACK_EVENT         _IOW(KVMIO,  0xec, struct kvm_vmi_vcpu)
+#define KVM_VMI_CONTROL_EVENT     _IOW(KVMIO,  0xed, struct kvm_vmi_control_event)
+
+/* Ring event response flags (bitmask, combinable) */
+#define KVM_VMI_RESPONSE_CONTINUE          (0)  /* Default: proceed with normal handling */
+#define KVM_VMI_RESPONSE_DENY              (1 << 0)
+#define KVM_VMI_RESPONSE_SET_REGS          (1 << 1)
+#define KVM_VMI_RESPONSE_MASK \
+	(KVM_VMI_RESPONSE_DENY | KVM_VMI_RESPONSE_SET_REGS)
+
+/*
+ * VMI ioctl structures
+ */
+
+/**
+ * struct kvm_vmi_setup_ring - Ring setup parameters
+ * @vcpu_id: Target vCPU
+ * @flags: Reserved, must be 0
+ * @event_fd: IN: eventfd for kernel -> agent event notification
+ * @ack_fd: IN: eventfd for agent -> kernel response notification
+ * @ring_fd: OUT: fd to mmap for the ring page (created by kernel)
+ * @pad: Reserved padding
+ */
+struct kvm_vmi_setup_ring {
+	__u32 vcpu_id;
+	__u32 flags;
+	__s32 event_fd;
+	__s32 ack_fd;
+	__s32 ring_fd;
+	__s32 pad;
+};
+
 /**
  * struct kvm_vmi_vcpu - Generic vCPU identifier for vmi_fd ioctls
  */
@@ -36,5 +71,64 @@ struct kvm_vmi_control_event {
 	__u32 event;
 	__u32 enable;
 };
+
+/*
+ * Ring-based event delivery
+ */
+
+/*
+ * Generic event data structs (arch-independent)
+ */
+struct kvm_vmi_event_mem_access {
+	__u64 gpa;
+	__u32 access;
+	__u32 pad;
+};
+
+/**
+ * struct kvm_vmi_ring_header - Ring page header
+ * @req_prod: Producer index (kernel increments after writing event)
+ * @req_cons: Consumer index (agent increments after reading event)
+ * @num_slots: Number of event slots in this ring
+ * @pad: Reserved padding
+ */
+struct kvm_vmi_ring_header {
+	__u32 req_prod;
+	__u32 req_cons;
+	__u32 num_slots;
+	__u32 pad;
+};
+
+/**
+ * struct kvm_vmi_ring_event - Ring event slot
+ *
+ * Written by kernel (header + event data + regs), response area
+ * written by agent before signaling ack_fd.
+ *
+ * Generic events (mem_access) are direct union members.
+ * Arch-specific events are grouped under the 'arch' union member.
+ */
+struct kvm_vmi_ring_event {
+	/* Header: written by kernel */
+	__u32 type;          /* KVM_VMI_EVENT_* */
+	__u32 flags;
+	__u32 vcpu_id;
+	__u32 view_id;
+	__u8  insn_len;      /* VM-exit instruction length (0 = not applicable) */
+	__u8  _pad[3];
+	__u32 response;      /* KVM_VMI_RESPONSE_* flags (written by agent) */
+
+	/* Event-specific data: written by kernel */
+	union {
+		struct kvm_vmi_event_mem_access mem_access;
+		union kvm_vmi_arch_event_data arch;
+	};
+
+	/* Registers: written by kernel, optionally modified by agent */
+	struct kvm_vmi_regs regs;
+};
+
+_Static_assert(sizeof(struct kvm_vmi_ring_event) <= 4096,
+	       "ring event must fit in a page");
 
 #endif /* _UAPI_LINUX_KVM_VMI_H */
