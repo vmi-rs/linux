@@ -51,6 +51,23 @@ static inline struct kvm_mmu_page *tdp_mmu_get_root_for_fault(struct kvm_vcpu *v
 	if (unlikely(!kvm_is_addr_direct(vcpu->kvm, fault->addr)))
 		return root_to_sp(vcpu->arch.mmu->mirror_root_hpa);
 
+#ifdef CONFIG_KVM_VMI
+	if (vcpu->vmi && vcpu->vmi->current_view_id != 0) {
+		struct kvm_vmi_view_data *view = READ_ONCE(vcpu->vmi->current_view);
+
+		if (view) {
+			struct kvm_mmu_page *vmi_root = READ_ONCE(view->arch.tdp_root);
+
+			if (vmi_root)
+				return vmi_root;
+		}
+		/*
+		 * View or tdp_root is NULL - view is being torn down.
+		 * Fall through to primary root.
+		 */
+	}
+#endif
+
 	return root_to_sp(vcpu->arch.mmu->root.hpa);
 }
 
@@ -112,6 +129,14 @@ int kvm_tdp_mmu_get_walk(struct kvm_vcpu *vcpu, u64 addr, u64 *sptes,
 			 int *root_level);
 u64 *kvm_tdp_mmu_fast_pf_get_last_sptep(struct kvm_vcpu *vcpu, gfn_t gfn,
 					u64 *spte);
+
+#ifdef CONFIG_KVM_VMI
+void kvm_tdp_mmu_clear_dirty_vmi_views(struct kvm *kvm,
+					const struct kvm_memory_slot *slot);
+void kvm_tdp_mmu_clear_dirty_pt_masked_vmi_views(struct kvm *kvm, gfn_t gfn,
+						  unsigned long mask,
+						  bool wrprot);
+#endif
 
 #ifdef CONFIG_X86_64
 static inline bool is_tdp_mmu_page(struct kvm_mmu_page *sp) { return sp->tdp_mmu_page; }
