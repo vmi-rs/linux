@@ -2171,6 +2171,16 @@ static int __kvm_emulate_wrmsr(struct kvm_vcpu *vcpu, u32 msr, u64 data)
 {
 	int r;
 
+#ifdef CONFIG_KVM_VMI
+	if (vcpu->vmi) {
+		u64 old_val = 0;
+
+		kvm_msr_read(vcpu, msr, &old_val);
+		if (kvm_vmi_msr_write(vcpu, msr, old_val, data))
+			return 1;
+	}
+#endif
+
 	r = kvm_emulate_msr_write(vcpu, msr, data);
 	if (!r) {
 		trace_kvm_msr_write(msr, data);
