@@ -157,6 +157,25 @@ void kvm_vmi_restore_regs(struct kvm_vcpu *vcpu, struct kvm_vmi_regs *regs)
 }
 
 /**
+ * handle_cr_response - Handle CR event response
+ * @vcpu: The vCPU re-entering after a CR event.
+ * @resp: KVM_VMI_RESPONSE_* flags from the agent.
+ *
+ * CR uses Xen's deferred-write pattern:
+ * CONTINUE (0): Write proceeds (caller applies it). Default.
+ * DENY: Advance RIP without applying the write.
+ * SET_REGS: Agent controls everything.
+ */
+static void handle_cr_response(struct kvm_vcpu *vcpu, u32 resp)
+{
+	if (resp & KVM_VMI_RESPONSE_SET_REGS)
+		return;
+
+	if (resp & KVM_VMI_RESPONSE_DENY)
+		kvm_skip_emulated_instruction(vcpu);
+}
+
+/**
  * handle_emulate - Emulate faulting instruction for ACTION_EMULATE
  * @vcpu: The vCPU that received ACTION_EMULATE response.
  *
@@ -202,6 +221,9 @@ void kvm_vmi_handle_event_response(struct kvm_vcpu *vcpu, u32 event_type,
 	case KVM_VMI_EVENT_MEM_ACCESS:
 		if (resp & KVM_VMI_RESPONSE_EMULATE)
 			handle_emulate(vcpu);
+		break;
+	case KVM_VMI_EVENT_CR:
+		handle_cr_response(vcpu, resp);
 		break;
 	default:
 		break;
@@ -333,6 +355,21 @@ void kvm_arch_vmi_session_cleanup(struct kvm_vmi *vmi)
  */
 void kvm_arch_vmi_session_reset(struct kvm_vmi *vmi)
 {
+	memset(vmi->arch.cr_monitor, 0, sizeof(vmi->arch.cr_monitor));
+}
+
+/*
+ * Check whether any CR index is still monitored.
+ */
+static bool vmi_any_cr_enabled(struct kvm_vmi *vmi)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(vmi->arch.cr_monitor); i++) {
+		if (vmi->arch.cr_monitor[i].enabled)
+			return true;
+	}
+	return false;
 }
 
 /**
@@ -350,10 +387,32 @@ void kvm_arch_vmi_session_reset(struct kvm_vmi *vmi)
 int kvm_arch_vmi_control_event(struct kvm *kvm,
 			       struct kvm_vmi_control_event *ctrl)
 {
+	struct kvm_vmi *vmi = kvm->vmi;
+	int idx;
+
 	switch (ctrl->event) {
+	case KVM_VMI_EVENT_CR:
+		idx = vmi_cr_index(ctrl->arch.cr.index);
+		if (idx < 0)
+			return -EINVAL;
+		if (ctrl->enable) {
+			vmi->arch.cr_monitor[idx].enabled = true;
+			vmi->arch.cr_monitor[idx].onchangeonly =
+				ctrl->arch.cr.onchangeonly;
+			vmi->arch.cr_monitor[idx].bitmask = ctrl->arch.cr.bitmask;
+			vmi->enabled_events |= BIT_ULL(ctrl->event);
+		} else {
+			vmi->arch.cr_monitor[idx].enabled = false;
+			if (!vmi_any_cr_enabled(vmi))
+				vmi->enabled_events &= ~BIT_ULL(ctrl->event);
+		}
+		break;
 	default:
-		return -EOPNOTSUPP;
+		return -EOPNOTSUPP; /* Not handled by arch; fall through to generic */
 	}
+
+	kvm_arch_vmi_update(kvm);
+	return 0;
 }
 
 /**
@@ -474,6 +533,78 @@ static inline bool kvm_vmi_event_enabled(struct kvm_vcpu *vcpu, u32 event_type)
 	return vmi && (vmi->enabled_events & BIT_ULL(event_type))
 		&& vcpu->vmi && vcpu->vmi->ring;
 }
+
+/* VMCS intercept queries */
+
+bool kvm_vmi_cr3_intercept(struct kvm *kvm)
+{
+	struct kvm_vmi *vmi = kvm_vmi_get(kvm);
+
+	return vmi && vmi->arch.cr_monitor[KVM_VMI_CR_IDX_CR3].enabled;
+}
+EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_vmi_cr3_intercept);
+
+/* Event handlers */
+
+/**
+ * kvm_vmi_cr_write - Check if a CR write should generate a VMI event
+ * @vcpu: The vCPU performing the CR write.
+ * @cr_num: The CR number being written (0, 3, or 4).
+ * @old_val: The current CR value before the write.
+ * @new_val: The value being written to the CR.
+ *
+ * Called from the VMX CR access exit handler BEFORE the CR write is applied.
+ * If an event should be generated, delivers it via the per-vCPU ring.
+ *
+ * Return: 0 (CONTINUE - let caller apply the CR write),
+ *         1 (DENY - caller skips the CR write),
+ *         negative errno on error.
+ */
+int kvm_vmi_cr_write(struct kvm_vcpu *vcpu, int cr_num, u64 old_val,
+		     u64 new_val)
+{
+	struct kvm_vmi *vmi = kvm_vmi_get(vcpu->kvm);
+	struct kvm_vcpu_vmi *vcpu_vmi = vcpu->vmi;
+	struct kvm_vmi_ring_event ring_event = {};
+	int cr_index, ret;
+
+	if (!kvm_vmi_event_enabled(vcpu, KVM_VMI_EVENT_CR))
+		return 0;
+
+	cr_index = vmi_cr_index(cr_num);
+	if (cr_index < 0)
+		return 0;
+
+	if (!vmi->arch.cr_monitor[cr_index].enabled)
+		return 0;
+
+	/* onchangeonly filter */
+	if (vmi->arch.cr_monitor[cr_index].onchangeonly && old_val == new_val)
+		return 0;
+
+	/* bitmask filter: only trigger if changed bits overlap with mask */
+	if (vmi->arch.cr_monitor[cr_index].onchangeonly &&
+	    vmi->arch.cr_monitor[cr_index].bitmask &&
+	    !((old_val ^ new_val) & vmi->arch.cr_monitor[cr_index].bitmask))
+		return 0;
+
+	/* Save state for DENY/CONTINUE response handling (per-vCPU) */
+	vcpu_vmi->arch.cr_event_cr_num = cr_num;
+	vcpu_vmi->arch.cr_event_old_val = old_val;
+	vcpu_vmi->arch.cr_event_new_val = new_val;
+
+	ring_event.type = KVM_VMI_EVENT_CR;
+	ring_event.vcpu_id = vcpu->vcpu_id;
+	ring_event.insn_len = kvm_x86_call(vmi_get_instruction_len)(vcpu);
+	ring_event.arch.cr.index = cr_num;
+	ring_event.arch.cr.old_value = old_val;
+	ring_event.arch.cr.new_value = new_val;
+	trace_kvm_vmi_event_deliver(vcpu->vcpu_id, KVM_VMI_EVENT_CR, new_val);
+	ret = kvm_vmi_deliver_via_ring(vcpu, &ring_event);
+	/* Deferred-write: return 0 (caller applies write) unless DENY */
+	return (ret > 0 && (ret & KVM_VMI_RESPONSE_DENY)) ? 1 : 0;
+}
+EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_vmi_cr_write);
 
 /* Memory access */
 

@@ -103,10 +103,12 @@ struct kvm_vmi_setup_ring {
  * struct kvm_vmi_control_event - VM-wide event monitoring control
  * @event: Event type (KVM_VMI_EVENT_*)
  * @enable: 1 to enable, 0 to disable
+ * @arch: Architecture-specific event parameters
  */
 struct kvm_vmi_control_event {
 	__u32 event;
 	__u32 enable;
+	union kvm_vmi_arch_control_data arch;
 };
 
 /**
