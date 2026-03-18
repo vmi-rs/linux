@@ -169,6 +169,91 @@ static void test_destroy_without_release(void)
 }
 
 /*
+ * Test 4: Destroy VM without release, with rings and events active.
+ *
+ * Like test 3 but with a ring set up and events enabled, so there
+ * is more per-vCPU state to clean up.
+ */
+static void test_destroy_without_release_with_ring(void)
+{
+	struct kvm_vm *vm;
+	struct kvm_vcpu *vcpu;
+	struct vmi_test_ring ring;
+	int vmi_fd;
+
+	vmi_fd = vmi_test_setup(&vm, &vcpu, guest_counter, &ring);
+
+	/* Enable some events to populate monitoring state */
+	vmi_control_event(vmi_fd, KVM_VMI_EVENT_CPUID, 1);
+	vmi_control_cr(vmi_fd, KVM_VMI_CR3, 0, ~0ULL, 1);
+
+	/*
+	 * Destroy VM without closing vmi_fd or tearing down ring.
+	 * All cleanup goes through kvm_vmi_destroy().
+	 */
+	kvm_vm_free(vm);
+
+	/* Close everything after VM is gone */
+	vmi_teardown_ring(&ring);
+	close(vmi_fd);
+
+	pr_info("PASS: vmi_destroy_without_release_with_ring\n");
+}
+
+/*
+ * Test 5: Re-create VMI session after release.
+ *
+ * Set up a full VMI session with events and views, close it without
+ * running the vCPU, then create a second session and verify events
+ * work.  This tests that release fully cleans up VM-wide and
+ * per-vCPU state so a new session can be established.
+ */
+static void test_recreate_after_release(void)
+{
+	struct kvm_vm *vm;
+	struct kvm_vcpu *vcpu;
+	struct vmi_test_ring ring;
+	struct vmi_vcpu_thread_arg targ;
+	pthread_t thread;
+	struct kvm_vmi_ring_event *ev;
+	int vmi_fd;
+	uint32_t view_id;
+
+	/* First session - configure everything, then close */
+	vmi_fd = vmi_test_setup(&vm, &vcpu, guest_cr3_loop, &ring);
+	vmi_control_cr(vmi_fd, KVM_VMI_CR3, 0, ~0ULL, 1);
+	vmi_control_event(vmi_fd, KVM_VMI_EVENT_CPUID, 1);
+	view_id = vmi_create_view(vmi_fd, KVM_VMI_ACCESS_RWX);
+
+	vmi_teardown_ring(&ring);
+	close(vmi_fd);
+
+	/* Second session on same VM - must work */
+	vmi_fd = vmi_create(vm);
+	vmi_setup_ring(vmi_fd, 0, &ring);
+	vmi_control_cr(vmi_fd, KVM_VMI_CR3, 0, ~0ULL, 1);
+
+	targ.vcpu = vcpu;
+	targ.done = 0;
+	pthread_create(&thread, NULL, vmi_vcpu_thread_fn, &targ);
+
+	ev = vmi_wait_event_timeout(&ring, 5000);
+	TEST_ASSERT(ev != NULL, "Second session: timeout waiting for event");
+	TEST_ASSERT(ev->type == KVM_VMI_EVENT_CR,
+		    "Expected CR event, got %u", ev->type);
+	ev->response = KVM_VMI_RESPONSE_CONTINUE;
+	vmi_ack_event(&ring, 0);
+
+	/* Disable monitoring and let guest finish */
+	vmi_control_cr(vmi_fd, KVM_VMI_CR3, 0, ~0ULL, 0);
+	pthread_join(thread, NULL);
+	TEST_ASSERT(targ.done, "Guest should complete in second session");
+
+	vmi_test_teardown(vm, vmi_fd, &ring);
+	pr_info("PASS: vmi_recreate_after_release\n");
+}
+
+/*
  * Test 6: Release with active views and shadow pages.
  *
  * Creates alternate views and allocates shadow GFNs, then closes
@@ -273,6 +358,8 @@ int main(int argc, char *argv[])
 	test_release_while_blocked();
 	test_release_while_paused();
 	test_destroy_without_release();
+	test_destroy_without_release_with_ring();
+	test_recreate_after_release();
 	test_release_with_views();
 	test_release_on_alt_view();
 

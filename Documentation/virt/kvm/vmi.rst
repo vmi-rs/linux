@@ -495,6 +495,9 @@ defined in ``<asm/kvm_vmi.h>``.
    * - 9
      - ``MSR``
      - MSR write
+   * - 10
+     - ``CPUID``
+     - CPUID instruction
 
 6.3 Generic events
 ------------------
@@ -583,6 +586,30 @@ Control parameters (``arch.msr``): ``msr`` (index) and ``onchangeonly``. Only
 MSRs explicitly monitored generate events; monitoring an MSR enables its write
 intercept. DENY/SET_REGS semantics match the CR event (DENY suppresses + skips;
 SET_REGS alone still applies the write).
+
+KVM_VMI_EVENT_CPUID (10)
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+:Trigger: guest ``CPUID``
+:Data: ``struct kvm_vmi_event_cpuid``
+:Responses: EMULATE, DENY, SET_REGS (a bare CONTINUE is invalid - see note)
+
+::
+
+    struct kvm_vmi_event_cpuid {
+        __u32 leaf;      /* EAX */
+        __u32 subleaf;   /* ECX */
+    };
+
+EMULATE runs KVM's normal CPUID and advances RIP. DENY skips the instruction
+(CPUID becomes a NOP). SET_REGS lets the agent supply custom EAX/EBX/ECX/EDX via
+the register snapshot.
+
+.. note::
+   When CPUID monitoring is enabled the kernel fully bypasses its own CPUID
+   handling, so a bare ``CONTINUE`` neither advances RIP nor writes a result and
+   the instruction re-faults. The agent must respond ``EMULATE``, ``DENY`` or
+   ``SET_REGS``.
 
 7. Alternate memory views
 =========================

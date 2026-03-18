@@ -87,6 +87,7 @@ bool kvm_vmi_cr3_intercept(struct kvm *kvm);
 int kvm_vmi_cr_write(struct kvm_vcpu *vcpu, int cr_num, u64 old_val,
 		     u64 new_val);
 int kvm_vmi_msr_write(struct kvm_vcpu *vcpu, u32 msr, u64 old_val, u64 new_val);
+int kvm_vmi_cpuid(struct kvm_vcpu *vcpu, u32 leaf, u32 subleaf);
 
 /* Memory access (TDP MMU integration) */
 int kvm_vmi_check_mem_access(struct kvm_vcpu *vcpu, gpa_t gpa,
