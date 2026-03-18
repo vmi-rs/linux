@@ -3565,7 +3565,15 @@ void vmx_set_cr0(struct kvm_vcpu *vcpu, unsigned long cr0)
 		if (!(cr0 & X86_CR0_PG)) {
 			exec_controls_setbit(vmx, CR3_EXITING_BITS);
 		} else if (!is_guest_mode(vcpu)) {
-			exec_controls_clearbit(vmx, CR3_EXITING_BITS);
+			/*
+			 * Preserve CR3 load exiting if VMI CR3
+			 * monitoring is active.
+			 */
+			if (kvm_vmi_cr3_intercept(vcpu->kvm))
+				exec_controls_setbit(vmx,
+					CPU_BASED_CR3_LOAD_EXITING);
+			else
+				exec_controls_clearbit(vmx, CR3_EXITING_BITS);
 		} else {
 			tmp = exec_controls_get(vmx);
 			tmp &= ~CR3_EXITING_BITS;
@@ -5394,6 +5402,40 @@ bool vmx_vmi_has_cap(void)
 	return enable_ept;
 }
 
+u32 vmx_vmi_get_instruction_len(struct kvm_vcpu *vcpu)
+{
+	return vmcs_read32(VM_EXIT_INSTRUCTION_LEN);
+}
+
+/*
+ * vmx_vmi_update_cr3_intercept - Enable/disable CR3 load exiting for VMI
+ * @vcpu: The vCPU to update.
+ * @enable: Whether to enable CR3 load exiting.
+ *
+ * When VMI CR3 monitoring is enabled, we need CR3 writes to cause VM-exits
+ * even when EPT is active (which normally suppresses CR3 exits). When
+ * monitoring is disabled, restore the default behavior.
+ */
+void vmx_vmi_update_cr3_intercept(struct kvm_vcpu *vcpu, bool enable)
+{
+	struct vcpu_vmx *vmx = to_vmx(vcpu);
+
+	if (enable)
+		exec_controls_setbit(vmx, CPU_BASED_CR3_LOAD_EXITING);
+	else if (enable_ept)
+		exec_controls_clearbit(vmx, CPU_BASED_CR3_LOAD_EXITING);
+}
+
+/**
+ * vmx_vmi_apply_vmcs_state - Sync all VMI state into VMCS fields
+ * @vcpu: The vCPU whose VMCS needs updating.
+ *
+ * Called on the vCPU thread via KVM_REQ_VMI_UPDATE. Session ioctls
+ * only update in-memory VMI state; this function
+ * is the sole point where that state is materialized into VMCS fields.
+ *
+ * Must run on the vCPU thread where the VMCS is loaded.
+ */
 void vmx_vmi_apply_vmcs_state(struct kvm_vcpu *vcpu)
 {
 	struct kvm_vcpu_vmi *vcpu_vmi = vcpu->vmi;
@@ -5401,8 +5443,9 @@ void vmx_vmi_apply_vmcs_state(struct kvm_vcpu *vcpu)
 	if (!vcpu_vmi)
 		return;
 
-	/* Exception bitmap: picks up BP/DB intercept state */
-	vmx_update_exception_bitmap(vcpu);
+	/* CR3 load exiting: controlled by CR3 monitoring state */
+	vmx_vmi_update_cr3_intercept(vcpu,
+				     kvm_vmi_cr3_intercept(vcpu->kvm));
 
 	/*
 	 * EPTP for current view. Only write EPTP when the vCPU is on an
@@ -5886,17 +5929,33 @@ static int handle_cr(struct kvm_vcpu *vcpu)
 		val = kvm_register_read(vcpu, reg);
 		trace_kvm_cr_write(cr, val);
 		switch (cr) {
-		case 0:
+		case 0: {
+#ifdef CONFIG_KVM_VMI
+			if (kvm_vmi_cr_write(vcpu, 0, kvm_read_cr0(vcpu), val))
+				return 1;
+#endif
 			err = handle_set_cr0(vcpu, val);
 			return kvm_complete_insn_gp(vcpu, err);
-		case 3:
+		}
+		case 3: {
+#ifdef CONFIG_KVM_VMI
+			if (kvm_vmi_cr_write(vcpu, 3, kvm_read_cr3(vcpu), val))
+				return 1;
+#else
 			WARN_ON_ONCE(enable_unrestricted_guest);
+#endif
 
 			err = kvm_set_cr3(vcpu, val);
 			return kvm_complete_insn_gp(vcpu, err);
-		case 4:
+		}
+		case 4: {
+#ifdef CONFIG_KVM_VMI
+			if (kvm_vmi_cr_write(vcpu, 4, kvm_read_cr4(vcpu), val))
+				return 1;
+#endif
 			err = handle_set_cr4(vcpu, val);
 			return kvm_complete_insn_gp(vcpu, err);
+		}
 		case 8: {
 				u8 cr8_prev = kvm_get_cr8(vcpu);
 				u8 cr8 = (u8)val;
@@ -5922,6 +5981,9 @@ static int handle_cr(struct kvm_vcpu *vcpu)
 	case 1: /*mov from cr*/
 		switch (cr) {
 		case 3:
+#ifdef CONFIG_KVM_VMI
+			if (!vcpu->vmi)
+#endif
 			WARN_ON_ONCE(enable_unrestricted_guest);
 
 			val = kvm_read_cr3(vcpu);

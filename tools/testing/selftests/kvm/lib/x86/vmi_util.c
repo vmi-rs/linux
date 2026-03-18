@@ -112,6 +112,22 @@ void vmi_ack_event(struct vmi_test_ring *r, uint32_t vcpu_id)
 /*
  * Control event via vmi_fd.
  */
+void vmi_control_cr(int vmi_fd, uint8_t cr_index,
+		    uint8_t onchangeonly, uint64_t bitmask, int enable)
+{
+	struct kvm_vmi_control_event ctl = {};
+	int ret;
+
+	ctl.event = KVM_VMI_EVENT_CR;
+	ctl.enable = enable;
+	ctl.arch.cr.index = cr_index;
+	ctl.arch.cr.onchangeonly = onchangeonly;
+	ctl.arch.cr.bitmask = bitmask;
+
+	ret = ioctl(vmi_fd, KVM_VMI_CONTROL_EVENT, &ctl);
+	TEST_ASSERT(ret == 0, "KVM_VMI_CONTROL_EVENT (CR) failed: %d", ret);
+}
+
 void vmi_control_event(int vmi_fd, uint32_t event, int enable)
 {
 	struct kvm_vmi_control_event ctl = {};

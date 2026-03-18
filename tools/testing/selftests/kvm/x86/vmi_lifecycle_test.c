@@ -52,6 +52,48 @@ static void guest_counter(void)
  * waiting for the agent to ack the event.  Closing vmi_fd triggers
  * kvm_vmi_release() which must safely wake and unblock the vCPU.
  */
+static void test_release_while_blocked(void)
+{
+	struct kvm_vm *vm;
+	struct kvm_vcpu *vcpu;
+	struct vmi_test_ring ring;
+	struct vmi_vcpu_thread_arg targ;
+	pthread_t thread;
+	struct kvm_vmi_ring_event *ev;
+	int vmi_fd;
+
+	vmi_fd = vmi_test_setup(&vm, &vcpu, guest_cr3_loop, &ring);
+
+	/* Enable CR3 monitoring to generate events */
+	vmi_control_cr(vmi_fd, KVM_VMI_CR3, 0, ~0ULL, 1);
+
+	/* Start vCPU thread */
+	targ.vcpu = vcpu;
+	targ.done = 0;
+	pthread_create(&thread, NULL, vmi_vcpu_thread_fn, &targ);
+
+	/* Wait for the first event - vCPU is now blocked in ring delivery */
+	ev = vmi_wait_event_timeout(&ring, 5000);
+	TEST_ASSERT(ev != NULL, "Timeout waiting for CR event");
+	TEST_ASSERT(ev->type == KVM_VMI_EVENT_CR,
+		    "Expected CR event, got %u", ev->type);
+
+	/*
+	 * Don't ack the event - the vCPU is blocked.
+	 * Close vmi_fd to trigger release while blocked.
+	 */
+	vmi_teardown_ring(&ring);
+	close(vmi_fd);
+
+	/*
+	 * The vCPU thread should unblock and return from KVM_RUN.
+	 * It may see an error or UCALL_DONE depending on timing.
+	 */
+	pthread_join(thread, NULL);
+
+	kvm_vm_free(vm);
+	pr_info("PASS: vmi_release_while_blocked\n");
+}
 
 /*
  * Test 2: Close vmi_fd while vCPU is VMI-paused.
@@ -169,14 +211,70 @@ static void test_release_with_views(void)
 	pr_info("PASS: vmi_release_with_views\n");
 }
 
+/*
+ * Test 7: Release while vCPU is on an alternate view.
+ *
+ * Switch vCPU to a non-zero view, then close vmi_fd.  Release must
+ * switch the vCPU back to view 0 and the guest should still work.
+ */
+static void test_release_on_alt_view(void)
+{
+	struct kvm_vm *vm;
+	struct kvm_vcpu *vcpu;
+	struct vmi_test_ring ring;
+	struct vmi_vcpu_thread_arg targ;
+	pthread_t thread;
+	struct kvm_vmi_ring_event *ev;
+	int vmi_fd;
+	uint32_t view_id;
+
+	vmi_fd = vmi_test_setup(&vm, &vcpu, guest_cr3_loop, &ring);
+
+	/* Create a view and enable CR3 monitoring */
+	view_id = vmi_create_view(vmi_fd, KVM_VMI_ACCESS_RWX);
+	vmi_control_cr(vmi_fd, KVM_VMI_CR3, 0, ~0ULL, 1);
+
+	targ.vcpu = vcpu;
+	targ.done = 0;
+	pthread_create(&thread, NULL, vmi_vcpu_thread_fn, &targ);
+
+	/* Wait for first CR event */
+	ev = vmi_wait_event_timeout(&ring, 5000);
+	TEST_ASSERT(ev != NULL, "Timeout waiting for CR event");
+
+	/* Switch vCPU to alternate view in the response */
+	ev->response = KVM_VMI_RESPONSE_CONTINUE | KVM_VMI_RESPONSE_SWITCH_VIEW;
+	ev->view_id = view_id;
+	vmi_ack_event(&ring, 0);
+
+	/* Wait for next event to confirm we're on the alt view */
+	ev = vmi_wait_event_timeout(&ring, 5000);
+	TEST_ASSERT(ev != NULL, "Timeout waiting for second CR event");
+
+	/*
+	 * vCPU is now on an alternate view and blocked in ring delivery.
+	 * Close vmi_fd - release must switch back to view 0.
+	 */
+	vmi_teardown_ring(&ring);
+	close(vmi_fd);
+
+	/* vCPU should unblock, switch to view 0, and guest completes */
+	pthread_join(thread, NULL);
+
+	kvm_vm_free(vm);
+	pr_info("PASS: vmi_release_on_alt_view\n");
+}
+
 int main(int argc, char *argv[])
 {
 	TEST_REQUIRE(kvm_has_cap(KVM_CAP_VMI));
 	TEST_REQUIRE(kvm_has_cap(KVM_CAP_VMI_RING));
 
+	test_release_while_blocked();
 	test_release_while_paused();
 	test_destroy_without_release();
 	test_release_with_views();
+	test_release_on_alt_view();
 
 	return 0;
 }

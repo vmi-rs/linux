@@ -150,6 +150,58 @@ static void test_control_event_invalid(void)
 	pr_info("PASS: Invalid event type correctly rejected\n");
 }
 
+/*
+ * Test 7: KVM_VMI_CONTROL_EVENT enable/disable CR monitoring
+ */
+static void test_control_event_cr(void)
+{
+	struct kvm_vm *vm;
+	struct kvm_vcpu *vcpu;
+	int vmi_fd;
+
+	vm = vm_create_with_one_vcpu(&vcpu, guest_code);
+	vmi_fd = vmi_create(vm);
+
+	/* Enable CR3 monitoring */
+	vmi_control_cr(vmi_fd, KVM_VMI_CR3, 0, ~0ULL, 1);
+
+	/* Disable CR3 monitoring */
+	vmi_control_cr(vmi_fd, KVM_VMI_CR3, 0, ~0ULL, 0);
+
+	close(vmi_fd);
+	kvm_vm_free(vm);
+	pr_info("PASS: CR3 event enable/disable works\n");
+}
+
+/*
+ * Test 8: KVM_VMI_CONTROL_EVENT with invalid CR index
+ */
+static void test_control_event_cr_invalid_index(void)
+{
+	struct kvm_vm *vm;
+	struct kvm_vcpu *vcpu;
+	struct kvm_vmi_control_event ctl = {};
+	int vmi_fd, r;
+
+	vm = vm_create_with_one_vcpu(&vcpu, guest_code);
+	vmi_fd = vmi_create(vm);
+
+	/* Invalid CR index (e.g., CR2 is not monitorable) */
+	ctl.event = KVM_VMI_EVENT_CR;
+	ctl.enable = 1;
+	ctl.arch.cr.index = 2; /* CR2 -- not a valid VMI CR index */
+	ctl.arch.cr.bitmask = ~0ULL;
+
+	r = ioctl(vmi_fd, KVM_VMI_CONTROL_EVENT, &ctl);
+	TEST_ASSERT(r == -1 && errno == EINVAL,
+		    "Invalid CR index should fail with EINVAL, got r=%d errno=%d",
+		    r, errno);
+
+	close(vmi_fd);
+	kvm_vm_free(vm);
+	pr_info("PASS: Invalid CR index correctly rejected\n");
+}
+
 int main(int argc, char *argv[])
 {
 	TEST_REQUIRE(kvm_has_cap(KVM_CAP_VMI));
@@ -160,6 +212,8 @@ int main(int argc, char *argv[])
 	test_vmi_create_twice();
 	test_vmi_create_close_recreate();
 	test_control_event_invalid();
+	test_control_event_cr();
+	test_control_event_cr_invalid_index();
 
 	return 0;
 }
