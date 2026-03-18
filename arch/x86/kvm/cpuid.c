@@ -11,6 +11,7 @@
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include <linux/kvm_host.h>
+#include <linux/kvm_vmi.h>
 #include "linux/lockdep.h"
 #include <linux/export.h>
 #include <linux/vmalloc.h>
@@ -2104,6 +2105,12 @@ int kvm_emulate_cpuid(struct kvm_vcpu *vcpu)
 
 	eax = kvm_rax_read(vcpu);
 	ecx = kvm_rcx_read(vcpu);
+
+#ifdef CONFIG_KVM_VMI
+	if (vcpu->vmi && kvm_vmi_cpuid(vcpu, eax, ecx))
+		return 1;
+#endif
+
 	kvm_cpuid(vcpu, &eax, &ebx, &ecx, &edx, false);
 	kvm_rax_write(vcpu, eax);
 	kvm_rbx_write(vcpu, ebx);
