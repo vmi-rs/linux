@@ -87,6 +87,7 @@ static inline int vmi_cr_index(u8 cr)
 /* VMCS intercept queries (called from vmx.c to build VMCS state) */
 bool kvm_vmi_cr3_intercept(struct kvm *kvm);
 bool kvm_vmi_bp_intercept(struct kvm *kvm);
+bool kvm_vmi_desc_intercept(struct kvm *kvm);
 
 /* Event handlers - VM-exit intercepts (arch/x86/kvm/vmi.c) */
 int kvm_vmi_cr_write(struct kvm_vcpu *vcpu, int cr_num, u64 old_val,
@@ -95,6 +96,7 @@ int kvm_vmi_msr_write(struct kvm_vcpu *vcpu, u32 msr, u64 old_val, u64 new_val);
 int kvm_vmi_cpuid(struct kvm_vcpu *vcpu, u32 leaf, u32 subleaf);
 int kvm_vmi_breakpoint(struct kvm_vcpu *vcpu);
 int kvm_vmi_debug_exception(struct kvm_vcpu *vcpu, u64 dr6);
+int kvm_vmi_desc_access(struct kvm_vcpu *vcpu, u8 descriptor, u8 is_write);
 
 /* Memory access (TDP MMU integration) */
 int kvm_vmi_check_mem_access(struct kvm_vcpu *vcpu, gpa_t gpa,

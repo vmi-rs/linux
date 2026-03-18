@@ -289,6 +289,26 @@ static void handle_debug_response(struct kvm_vcpu *vcpu, u32 resp)
 }
 
 /**
+ * handle_desc_response - Handle descriptor access event response
+ * @vcpu: The vCPU re-entering after a descriptor access event.
+ * @resp: KVM_VMI_RESPONSE_* bitmask from userspace.
+ *
+ * EMULATE: Emulate descriptor instruction (apply + advance RIP).
+ * DENY: Advance RIP without emulating.
+ * SET_REGS: Agent controls everything.
+ */
+static void handle_desc_response(struct kvm_vcpu *vcpu, u32 resp)
+{
+	if (resp & KVM_VMI_RESPONSE_SET_REGS)
+		return;
+
+	if (resp & KVM_VMI_RESPONSE_EMULATE)
+		vmi_emulate_insn(vcpu);
+	else if (resp & KVM_VMI_RESPONSE_DENY)
+		kvm_skip_emulated_instruction(vcpu);
+}
+
+/**
  * handle_emulate - Emulate faulting instruction for ACTION_EMULATE
  * @vcpu: The vCPU that received ACTION_EMULATE response.
  *
@@ -349,6 +369,9 @@ void kvm_vmi_handle_event_response(struct kvm_vcpu *vcpu, u32 event_type,
 		break;
 	case KVM_VMI_EVENT_DEBUG:
 		handle_debug_response(vcpu, resp);
+		break;
+	case KVM_VMI_EVENT_DESC_ACCESS:
+		handle_desc_response(vcpu, resp);
 		break;
 	default:
 		break;
@@ -696,6 +719,14 @@ bool kvm_vmi_bp_intercept(struct kvm *kvm)
 }
 EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_vmi_bp_intercept);
 
+bool kvm_vmi_desc_intercept(struct kvm *kvm)
+{
+	struct kvm_vmi *vmi = kvm_vmi_get(kvm);
+
+	return vmi && (vmi->enabled_events & BIT_ULL(KVM_VMI_EVENT_DESC_ACCESS));
+}
+EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_vmi_desc_intercept);
+
 /* Event handlers */
 
 /**
@@ -903,6 +934,32 @@ int kvm_vmi_debug_exception(struct kvm_vcpu *vcpu, u64 dr6)
 	return kvm_vmi_deliver_via_ring(vcpu, &ring_event) >= 0;
 }
 EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_vmi_debug_exception);
+
+/**
+ * kvm_vmi_desc_access - Check if a descriptor access should generate a VMI event
+ * @vcpu: The vCPU performing the descriptor access.
+ * @descriptor: Descriptor type (KVM_VMI_DESC_GDTR/IDTR/LDTR/TR).
+ * @is_write: 1 for load (LGDT/LIDT/LLDT/LTR), 0 for store (SGDT/SIDT/SLDT/STR).
+ *
+ * Called from handle_desc() when VMI descriptor access monitoring is enabled.
+ */
+int kvm_vmi_desc_access(struct kvm_vcpu *vcpu, u8 descriptor, u8 is_write)
+{
+	struct kvm_vmi_ring_event ring_event = {};
+
+	if (!kvm_vmi_event_enabled(vcpu, KVM_VMI_EVENT_DESC_ACCESS))
+		return 0;
+
+	ring_event.type = KVM_VMI_EVENT_DESC_ACCESS;
+	ring_event.vcpu_id = vcpu->vcpu_id;
+	ring_event.insn_len = kvm_x86_call(vmi_get_instruction_len)(vcpu);
+	ring_event.arch.desc_access.descriptor = descriptor;
+	ring_event.arch.desc_access.is_write = is_write;
+	trace_kvm_vmi_event_deliver(vcpu->vcpu_id, KVM_VMI_EVENT_DESC_ACCESS,
+				    descriptor);
+	return kvm_vmi_deliver_via_ring(vcpu, &ring_event) >= 0;
+}
+EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_vmi_desc_access);
 
 /* Memory access */
 
