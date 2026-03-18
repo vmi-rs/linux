@@ -390,6 +390,10 @@ depends on the event (and the architecture) - see the per-event sections.
      - 1 << 3
      - Emulate the faulting instruction in software (applicable to
        ``MEM_ACCESS``, ``CPUID`` and ``DESC_ACCESS``).
+   * - ``KVM_VMI_RESPONSE_REINJECT``
+     - 1 << 4
+     - Deliver the intercepted exception to the guest instead of consuming it:
+       ``#BP`` for breakpoints, ``#DB`` (with the original DR6) for debug.
 5.6 Register snapshot
 ---------------------
 
@@ -498,6 +502,9 @@ defined in ``<asm/kvm_vmi.h>``.
    * - 10
      - ``CPUID``
      - CPUID instruction
+   * - 11
+     - ``BREAKPOINT`` (INT3)
+     - software breakpoint
 
 6.3 Generic events
 ------------------
@@ -610,6 +617,26 @@ the register snapshot.
    handling, so a bare ``CONTINUE`` neither advances RIP nor writes a result and
    the instruction re-faults. The agent must respond ``EMULATE``, ``DENY`` or
    ``SET_REGS``.
+
+KVM_VMI_EVENT_BREAKPOINT (11)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+:Trigger: guest ``INT3`` (software breakpoint, opcode 0xCC)
+:Data: ``struct kvm_vmi_event_breakpoint``
+:Responses: REINJECT, SET_REGS, SINGLESTEP, SINGLESTEP_FAST, SWITCH_VIEW
+
+::
+
+    struct kvm_vmi_event_breakpoint {
+        __u64 gpa;        /* guest-physical of the INT3 (~0 if unmapped) */
+    };
+
+The INT3 length is in ``slot->insn_len``. By default (CONTINUE) the breakpoint
+is consumed and the guest never sees ``#BP``; ``REINJECT`` delivers ``#BP``
+(vector 3) to the guest. Typical transparent-breakpoint flow: receive the event
+in an instrumented view, respond ``SINGLESTEP_FAST`` (+``SWITCH_VIEW`` to a
+clean view) to step the original instruction, then auto-return to the
+instrumented view.
 
 7. Alternate memory views
 =========================
