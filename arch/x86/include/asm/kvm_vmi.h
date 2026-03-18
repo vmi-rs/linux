@@ -89,6 +89,7 @@ int kvm_vmi_cpuid(struct kvm_vcpu *vcpu, u32 leaf, u32 subleaf);
 int kvm_vmi_breakpoint(struct kvm_vcpu *vcpu);
 int kvm_vmi_debug_exception(struct kvm_vcpu *vcpu, u64 dr6);
 int kvm_vmi_desc_access(struct kvm_vcpu *vcpu, u8 descriptor, u8 is_write);
+int kvm_vmi_io(struct kvm_vcpu *vcpu, u32 bytes, u16 port, u8 in, u8 string);
 
 /* Memory access (TDP MMU integration) */
 int kvm_vmi_check_mem_access(struct kvm_vcpu *vcpu, gpa_t gpa,
