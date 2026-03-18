@@ -5481,7 +5481,7 @@ void vmx_vmi_apply_vmcs_state(struct kvm_vcpu *vcpu)
 	vmx_vmi_update_cr3_intercept(vcpu,
 				     kvm_vmi_cr3_intercept(vcpu->kvm));
 
-	/* Exception bitmap: picks up BP intercept state */
+	/* Exception bitmap: picks up BP/DB intercept state */
 	vmx_update_exception_bitmap(vcpu);
 
 	/* MSR write intercepts: VM-wide config */
@@ -5780,6 +5780,14 @@ static int handle_exception_nmi(struct kvm_vcpu *vcpu)
 	switch (ex_no) {
 	case DB_VECTOR:
 		dr6 = vmx_get_exit_qual(vcpu);
+#ifdef CONFIG_KVM_VMI
+		if (vcpu->vmi &&
+		    !(vcpu->guest_debug &
+		      (KVM_GUESTDBG_SINGLESTEP | KVM_GUESTDBG_USE_HW_BP)) &&
+		    !is_icebp(intr_info) &&
+		    kvm_vmi_debug_exception(vcpu, dr6))
+			return 1;
+#endif
 		if (!(vcpu->guest_debug &
 		      (KVM_GUESTDBG_SINGLESTEP | KVM_GUESTDBG_USE_HW_BP))) {
 			/*
