@@ -151,6 +151,7 @@ KVM_X86_OP_OPTIONAL(gmem_invalidate)
 
 #ifdef CONFIG_KVM_VMI
 KVM_X86_OP_OPTIONAL_RET0(vmi_has_cap)
+KVM_X86_OP_OPTIONAL_RET0(vmi_get_instruction_len)
 KVM_X86_OP_OPTIONAL(vmi_apply_state)
 KVM_X86_OP_OPTIONAL(vmi_create_view)
 KVM_X86_OP_OPTIONAL(vmi_destroy_view)
