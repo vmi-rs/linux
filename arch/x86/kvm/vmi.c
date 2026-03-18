@@ -179,6 +179,25 @@ static void handle_cr_response(struct kvm_vcpu *vcpu, u32 resp)
 }
 
 /**
+ * handle_msr_response - Handle MSR event response
+ * @vcpu: The vCPU re-entering after an MSR event.
+ * @resp: KVM_VMI_RESPONSE_* flags from the agent.
+ *
+ * MSR uses Xen's deferred-write pattern:
+ * CONTINUE (0): Write proceeds (caller applies it). Default.
+ * DENY: Advance RIP without applying the write.
+ * SET_REGS: Agent controls everything.
+ */
+static void handle_msr_response(struct kvm_vcpu *vcpu, u32 resp)
+{
+	if (resp & KVM_VMI_RESPONSE_SET_REGS)
+		return;
+
+	if (resp & KVM_VMI_RESPONSE_DENY)
+		kvm_skip_emulated_instruction(vcpu);
+}
+
+/**
  * handle_emulate - Emulate faulting instruction for ACTION_EMULATE
  * @vcpu: The vCPU that received ACTION_EMULATE response.
  *
@@ -220,6 +239,9 @@ void kvm_vmi_handle_event_response(struct kvm_vcpu *vcpu, u32 event_type,
 		break;
 	case KVM_VMI_EVENT_CR:
 		handle_cr_response(vcpu, resp);
+		break;
+	case KVM_VMI_EVENT_MSR:
+		handle_msr_response(vcpu, resp);
 		break;
 	default:
 		break;
@@ -345,10 +367,12 @@ bool kvm_arch_vmi_has_auto_step(void)
 
 void kvm_arch_vmi_session_init(struct kvm_vmi *vmi)
 {
+	xa_init(&vmi->arch.msr_monitor);
 }
 
 void kvm_arch_vmi_session_cleanup(struct kvm_vmi *vmi)
 {
+	xa_destroy(&vmi->arch.msr_monitor);
 }
 
 /**
@@ -361,7 +385,12 @@ void kvm_arch_vmi_session_cleanup(struct kvm_vmi *vmi)
  */
 void kvm_arch_vmi_session_reset(struct kvm_vmi *vmi)
 {
+	unsigned long index;
+	void *entry;
+
 	memset(vmi->arch.cr_monitor, 0, sizeof(vmi->arch.cr_monitor));
+	xa_for_each(&vmi->arch.msr_monitor, index, entry)
+		xa_erase(&vmi->arch.msr_monitor, index);
 }
 
 /*
@@ -422,6 +451,18 @@ int kvm_arch_vmi_control_event(struct kvm *kvm,
 		} else {
 			vmi->arch.cr_monitor[idx].enabled = false;
 			if (!vmi_any_cr_enabled(vmi))
+				vmi->enabled_events &= ~BIT_ULL(ctrl->event);
+		}
+		break;
+	case KVM_VMI_EVENT_MSR:
+		if (ctrl->enable) {
+			xa_store(&vmi->arch.msr_monitor, ctrl->arch.msr.msr,
+				 xa_mk_value(ctrl->arch.msr.onchangeonly),
+				 GFP_KERNEL);
+			vmi->enabled_events |= BIT_ULL(ctrl->event);
+		} else {
+			xa_erase(&vmi->arch.msr_monitor, ctrl->arch.msr.msr);
+			if (xa_empty(&vmi->arch.msr_monitor))
 				vmi->enabled_events &= ~BIT_ULL(ctrl->event);
 		}
 		break;
@@ -616,6 +657,53 @@ int kvm_vmi_cr_write(struct kvm_vcpu *vcpu, int cr_num, u64 old_val,
 	return (ret > 0 && (ret & KVM_VMI_RESPONSE_DENY)) ? 1 : 0;
 }
 EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_vmi_cr_write);
+
+/**
+ * kvm_vmi_msr_write - Check if an MSR write should generate a VMI event
+ * @vcpu: The vCPU performing the MSR write.
+ * @msr: The MSR index being written.
+ * @old_val: The current MSR value before the write.
+ * @new_val: The value being written to the MSR.
+ *
+ * Called from __kvm_emulate_wrmsr() BEFORE the MSR write is applied.
+ *
+ * Return: 0 (CONTINUE - let caller apply the MSR write),
+ *         1 (DENY - caller skips the MSR write).
+ */
+int kvm_vmi_msr_write(struct kvm_vcpu *vcpu, u32 msr, u64 old_val,
+		       u64 new_val)
+{
+	struct kvm_vmi *vmi = kvm_vmi_get(vcpu->kvm);
+	struct kvm_vmi_ring_event ring_event = {};
+	void *entry;
+	bool onchangeonly;
+	int ret;
+
+	if (!kvm_vmi_event_enabled(vcpu, KVM_VMI_EVENT_MSR))
+		return 0;
+
+	/* Check if this MSR is monitored */
+	entry = xa_load(&vmi->arch.msr_monitor, msr);
+	if (!entry)
+		return 0;
+
+	onchangeonly = xa_to_value(entry);
+
+	/* onchangeonly filter */
+	if (onchangeonly && old_val == new_val)
+		return 0;
+
+	ring_event.type = KVM_VMI_EVENT_MSR;
+	ring_event.vcpu_id = vcpu->vcpu_id;
+	ring_event.insn_len = kvm_x86_call(vmi_get_instruction_len)(vcpu);
+	ring_event.arch.msr.index = msr;
+	ring_event.arch.msr.old_value = old_val;
+	ring_event.arch.msr.new_value = new_val;
+	trace_kvm_vmi_event_deliver(vcpu->vcpu_id, KVM_VMI_EVENT_MSR, msr);
+	ret = kvm_vmi_deliver_via_ring(vcpu, &ring_event);
+	/* Deferred-write: return 0 (caller applies write) unless DENY */
+	return (ret > 0 && (ret & KVM_VMI_RESPONSE_DENY)) ? 1 : 0;
+}
 
 /* Memory access */
 

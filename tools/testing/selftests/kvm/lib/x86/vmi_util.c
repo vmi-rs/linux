@@ -151,6 +151,24 @@ int vmi_control_event_err(int vmi_fd, uint32_t event, int enable)
 	return ioctl(vmi_fd, KVM_VMI_CONTROL_EVENT, &ctl);
 }
 
+void vmi_control_msr(int vmi_fd, uint32_t msr,
+		     uint8_t onchangeonly, int enable)
+{
+	struct kvm_vmi_control_event ctl = {};
+	int ret;
+
+	ctl.event = KVM_VMI_EVENT_MSR;
+	ctl.enable = enable;
+	ctl.arch.msr.msr = msr;
+	ctl.arch.msr.onchangeonly = onchangeonly;
+
+	ret = ioctl(vmi_fd, KVM_VMI_CONTROL_EVENT, &ctl);
+	TEST_ASSERT(ret == 0, "KVM_VMI_CONTROL_EVENT (MSR) failed: %d", ret);
+}
+
+/*
+ * View management helpers via vmi_fd.
+ */
 uint32_t vmi_create_view(int vmi_fd, uint8_t default_access)
 {
 	struct kvm_vmi_view view = {};

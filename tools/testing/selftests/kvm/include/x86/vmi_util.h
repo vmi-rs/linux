@@ -40,6 +40,8 @@ void vmi_control_cr(int vmi_fd, uint8_t cr_index,
 		    uint8_t onchangeonly, uint64_t bitmask, int enable);
 void vmi_control_event(int vmi_fd, uint32_t event, int enable);
 int vmi_control_event_err(int vmi_fd, uint32_t event, int enable);
+void vmi_control_msr(int vmi_fd, uint32_t msr,
+		     uint8_t onchangeonly, int enable);
 uint32_t vmi_create_view(int vmi_fd, uint8_t default_access);
 void vmi_destroy_view(int vmi_fd, uint32_t view_id);
 int vmi_destroy_view_err(int vmi_fd, uint32_t view_id);

@@ -36,6 +36,7 @@ struct kvm_arch_vmi_view {
 /**
  * struct kvm_arch_vmi - x86-specific VM-level VMI monitoring config
  * @cr_monitor: Per-CR monitoring configuration (VM-wide).
+ * @msr_monitor: Xarray of monitored MSR indices (VM-wide).
  */
 struct kvm_arch_vmi {
 	struct {
@@ -43,6 +44,7 @@ struct kvm_arch_vmi {
 		u8 onchangeonly;
 		u64 bitmask;
 	} cr_monitor[KVM_VMI_NR_CR_MONITORS];
+	struct xarray msr_monitor; /* key=MSR index, value=xa_mk_value(onchangeonly) */
 };
 
 /**
@@ -84,6 +86,7 @@ bool kvm_vmi_cr3_intercept(struct kvm *kvm);
 /* Event handlers - VM-exit intercepts (arch/x86/kvm/vmi.c) */
 int kvm_vmi_cr_write(struct kvm_vcpu *vcpu, int cr_num, u64 old_val,
 		     u64 new_val);
+int kvm_vmi_msr_write(struct kvm_vcpu *vcpu, u32 msr, u64 old_val, u64 new_val);
 
 /* Memory access (TDP MMU integration) */
 int kvm_vmi_check_mem_access(struct kvm_vcpu *vcpu, gpa_t gpa,

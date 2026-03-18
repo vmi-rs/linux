@@ -492,6 +492,9 @@ defined in ``<asm/kvm_vmi.h>``.
    * - 8
      - ``CR``
      - control register write
+   * - 9
+     - ``MSR``
+     - MSR write
 
 6.3 Generic events
 ------------------
@@ -559,6 +562,27 @@ Each CR is enabled/disabled independently.
 DENY suppresses the write (the old value was never overwritten) and advances
 RIP. ``SET_REGS`` *without* DENY writes back GP regs but still lets the original
 CR write proceed - combine ``SET_REGS|DENY`` to both modify and suppress.
+
+KVM_VMI_EVENT_MSR (9)
+~~~~~~~~~~~~~~~~~~~~~~
+
+:Trigger: guest ``WRMSR`` to a monitored MSR (before the write is applied)
+:Data: ``struct kvm_vmi_event_msr``
+:Responses: CONTINUE, DENY, SET_REGS
+
+::
+
+    struct kvm_vmi_event_msr {
+        __u32 index;
+        __u32 pad;
+        __u64 old_value;
+        __u64 new_value;
+    };
+
+Control parameters (``arch.msr``): ``msr`` (index) and ``onchangeonly``. Only
+MSRs explicitly monitored generate events; monitoring an MSR enables its write
+intercept. DENY/SET_REGS semantics match the CR event (DENY suppresses + skips;
+SET_REGS alone still applies the write).
 
 7. Alternate memory views
 =========================

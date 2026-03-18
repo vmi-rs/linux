@@ -158,6 +158,7 @@ TEST_GEN_PROGS_x86 += system_counter_offset_test
 TEST_GEN_PROGS_x86 += pre_fault_memory_test
 TEST_GEN_PROGS_x86 += x86/vmi_basic_test
 TEST_GEN_PROGS_x86 += x86/vmi_cr_test
+TEST_GEN_PROGS_x86 += x86/vmi_msr_test
 TEST_GEN_PROGS_x86 += x86/vmi_view_test
 TEST_GEN_PROGS_x86 += x86/vmi_view_switch_test
 TEST_GEN_PROGS_x86 += x86/vmi_mem_access_test

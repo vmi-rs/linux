@@ -4434,6 +4434,9 @@ static void vmx_recalc_msr_intercepts(struct kvm_vcpu *vcpu)
 	 * x2APIC and LBR MSR intercepts are modified on-demand and cannot be
 	 * filtered by userspace.
 	 */
+
+	/* Re-enable write intercepts for VMI-monitored MSRs */
+	vmx_vmi_apply_msr_intercepts(vcpu);
 }
 
 static void vmx_recalc_instruction_intercepts(struct kvm_vcpu *vcpu)
@@ -5427,6 +5430,35 @@ void vmx_vmi_update_cr3_intercept(struct kvm_vcpu *vcpu, bool enable)
 }
 
 /**
+ * vmx_vmi_update_msr_intercept - Enable MSR write exiting for VMI
+ * @vcpu: The vCPU to update.
+ * @msr: The MSR index.
+ * @enable: Must be true; disabling is handled implicitly by vmx_recalc_msr_intercepts().
+ *
+ * Some MSRs (e.g., SYSENTER_EIP) have write intercepts disabled by default
+ * for performance. When VMI monitoring is enabled for such an MSR, we need
+ * to re-enable the write intercept so WRMSR causes a VM-exit.
+ */
+void vmx_vmi_update_msr_intercept(struct kvm_vcpu *vcpu, u32 msr, bool enable)
+{
+	if (enable)
+		vmx_enable_intercept_for_msr(vcpu, msr, MSR_TYPE_W);
+}
+
+void vmx_vmi_apply_msr_intercepts(struct kvm_vcpu *vcpu)
+{
+	struct kvm_vmi *vmi = kvm_vmi_get(vcpu->kvm);
+	unsigned long index;
+	void *entry;
+
+	if (!vmi)
+		return;
+
+	xa_for_each(&vmi->arch.msr_monitor, index, entry)
+		vmx_vmi_update_msr_intercept(vcpu, (u32)index, true);
+}
+
+/**
  * vmx_vmi_apply_vmcs_state - Sync all VMI state into VMCS fields
  * @vcpu: The vCPU whose VMCS needs updating.
  *
@@ -5446,6 +5478,9 @@ void vmx_vmi_apply_vmcs_state(struct kvm_vcpu *vcpu)
 	/* CR3 load exiting: controlled by CR3 monitoring state */
 	vmx_vmi_update_cr3_intercept(vcpu,
 				     kvm_vmi_cr3_intercept(vcpu->kvm));
+
+	/* MSR write intercepts: VM-wide config */
+	vmx_vmi_apply_msr_intercepts(vcpu);
 
 	/*
 	 * EPTP for current view. Only write EPTP when the vCPU is on an
