@@ -11,7 +11,19 @@
 #include <linux/types.h>
 #include <linux/kvm_vmi_events.h>
 
-#define KVM_VMI_NUM_EVENTS		KVM_VMI_ARCH_EVENT(0)
+/*
+ * x86 VMI Event Types
+ */
+#define KVM_VMI_EVENT_CR		KVM_VMI_ARCH_EVENT(0)  /* Control register write */
+#define KVM_VMI_NUM_EVENTS		KVM_VMI_ARCH_EVENT(1)
+
+/*
+ * x86 CR Indices (for kvm_vmi_control_event.cr.index)
+ */
+#define KVM_VMI_CR0			0
+#define KVM_VMI_CR3			3
+#define KVM_VMI_CR4			4
+#define KVM_VMI_XCR0			64
 
 /*
  * Event injection types (match VMCS VM-entry interruption type, bits 10:8)
@@ -77,10 +89,34 @@ struct kvm_vmi_regs {
 	__u64 msr_tsc_aux;
 };
 
+/*
+ * x86 event data structs (sub-unions of kvm_vmi_arch_event_data)
+ */
+struct kvm_vmi_event_cr {
+	__u32 index;
+	__u32 pad;
+	__u64 old_value;
+	__u64 new_value;
+};
+
+/**
+ * union kvm_vmi_arch_control_data - x86-specific control_event parameters
+ * @cr: CR event parameters
+ */
+union kvm_vmi_arch_control_data {
+	struct {
+		__u8  index;
+		__u8  onchangeonly;
+		__u8  pad[6];
+		__u64 bitmask;
+	} cr;
+};
+
 /**
  * union kvm_vmi_arch_event_data - x86-specific event data in ring events
  */
 union kvm_vmi_arch_event_data {
+	struct kvm_vmi_event_cr cr;
 };
 
 #endif /* _UAPI_ASM_X86_KVM_VMI_H */
