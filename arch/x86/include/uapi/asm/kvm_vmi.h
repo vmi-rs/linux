@@ -20,7 +20,8 @@
 #define KVM_VMI_EVENT_BREAKPOINT	KVM_VMI_ARCH_EVENT(3)  /* INT3 software breakpoint */
 #define KVM_VMI_EVENT_DEBUG		KVM_VMI_ARCH_EVENT(4)  /* Debug exception (DR access) */
 #define KVM_VMI_EVENT_DESC_ACCESS	KVM_VMI_ARCH_EVENT(5)  /* Descriptor table register access */
-#define KVM_VMI_NUM_EVENTS		KVM_VMI_ARCH_EVENT(6)
+#define KVM_VMI_EVENT_IO		KVM_VMI_ARCH_EVENT(6)  /* I/O port access */
+#define KVM_VMI_NUM_EVENTS		KVM_VMI_ARCH_EVENT(7)
 
 /*
  * x86 CR Indices (for kvm_vmi_control_event.cr.index)
@@ -139,6 +140,14 @@ struct kvm_vmi_event_desc_access {
 	__u8 pad[6];
 };
 
+struct kvm_vmi_event_io {
+	__u16 port;
+	__u8  bytes;
+	__u8  in;
+	__u8  string;
+	__u8  pad[3];
+};
+
 /**
  * union kvm_vmi_arch_control_data - x86-specific control_event parameters
  * @cr: CR event parameters
@@ -168,6 +177,7 @@ union kvm_vmi_arch_event_data {
 	struct kvm_vmi_event_breakpoint breakpoint;
 	struct kvm_vmi_event_debug debug;
 	struct kvm_vmi_event_desc_access desc_access;
+	struct kvm_vmi_event_io io;
 };
 
 #endif /* _UAPI_ASM_X86_KVM_VMI_H */

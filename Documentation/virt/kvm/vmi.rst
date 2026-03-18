@@ -511,6 +511,9 @@ defined in ``<asm/kvm_vmi.h>``.
    * - 13
      - ``DESC_ACCESS``
      - descriptor-table access
+   * - 14
+     - ``IO``
+     - I/O instruction
 
 6.3 Generic events
 ------------------
@@ -684,6 +687,23 @@ EMULATE runs the instruction; DENY skips it.
    Like CPUID, when descriptor monitoring is enabled the kernel bypasses its own
    emulation, so a bare ``CONTINUE`` re-faults; respond ``EMULATE``, ``DENY`` or
    ``SET_REGS``.
+
+KVM_VMI_EVENT_IO (14)
+~~~~~~~~~~~~~~~~~~~~~~
+
+:Trigger: guest ``IN``/``OUT``/``INS``/``OUTS``
+:Data: ``struct kvm_vmi_event_io``
+:Responses: CONTINUE (allow), DENY (skip), SET_REGS
+
+::
+
+    struct kvm_vmi_event_io {
+        __u16 port;
+        __u8  bytes;    /* 1, 2 or 4 */
+        __u8  in;       /* 1 = IN/INS, 0 = OUT/OUTS */
+        __u8  string;   /* 1 = INS/OUTS */
+        __u8  pad[3];
+    };
 
 7. Alternate memory views
 =========================
