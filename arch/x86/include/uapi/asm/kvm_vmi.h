@@ -19,7 +19,8 @@
 #define KVM_VMI_EVENT_CPUID		KVM_VMI_ARCH_EVENT(2)  /* CPUID instruction */
 #define KVM_VMI_EVENT_BREAKPOINT	KVM_VMI_ARCH_EVENT(3)  /* INT3 software breakpoint */
 #define KVM_VMI_EVENT_DEBUG		KVM_VMI_ARCH_EVENT(4)  /* Debug exception (DR access) */
-#define KVM_VMI_NUM_EVENTS		KVM_VMI_ARCH_EVENT(5)
+#define KVM_VMI_EVENT_DESC_ACCESS	KVM_VMI_ARCH_EVENT(5)  /* Descriptor table register access */
+#define KVM_VMI_NUM_EVENTS		KVM_VMI_ARCH_EVENT(6)
 
 /*
  * x86 CR Indices (for kvm_vmi_control_event.cr.index)
@@ -28,6 +29,14 @@
 #define KVM_VMI_CR3			3
 #define KVM_VMI_CR4			4
 #define KVM_VMI_XCR0			64
+
+/*
+ * x86 Descriptor Types (for KVM_VMI_EVENT_DESC_ACCESS)
+ */
+#define KVM_VMI_DESC_GDTR		0
+#define KVM_VMI_DESC_IDTR		1
+#define KVM_VMI_DESC_LDTR		2
+#define KVM_VMI_DESC_TR			3
 
 /*
  * Event injection types (match VMCS VM-entry interruption type, bits 10:8)
@@ -124,6 +133,12 @@ struct kvm_vmi_event_debug {
 	__u64 gpa;
 };
 
+struct kvm_vmi_event_desc_access {
+	__u8 descriptor;
+	__u8 is_write;
+	__u8 pad[6];
+};
+
 /**
  * union kvm_vmi_arch_control_data - x86-specific control_event parameters
  * @cr: CR event parameters
@@ -152,6 +167,7 @@ union kvm_vmi_arch_event_data {
 	struct kvm_vmi_event_cpuid cpuid;
 	struct kvm_vmi_event_breakpoint breakpoint;
 	struct kvm_vmi_event_debug debug;
+	struct kvm_vmi_event_desc_access desc_access;
 };
 
 #endif /* _UAPI_ASM_X86_KVM_VMI_H */
