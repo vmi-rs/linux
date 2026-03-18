@@ -243,6 +243,25 @@ static void handle_cpuid_response(struct kvm_vcpu *vcpu, u32 resp)
 }
 
 /**
+ * handle_bp_response - Handle breakpoint event response
+ * @vcpu: The vCPU re-entering after a breakpoint event.
+ * @resp: KVM_VMI_RESPONSE_* bitmask from userspace.
+ *
+ * If REINJECT: Inject #BP into the guest so its IDT handler fires.
+ * Otherwise: Do nothing. The agent is responsible for advancing RIP
+ *   past the INT3 via SET_REGS when it wants to consume the breakpoint.
+ */
+static void handle_bp_response(struct kvm_vcpu *vcpu, u32 resp)
+{
+	struct kvm_vcpu_vmi *vcpu_vmi = vcpu->vmi;
+
+	if (resp & KVM_VMI_RESPONSE_REINJECT) {
+		vcpu->arch.event_exit_inst_len = vcpu_vmi->arch.bp_insn_length;
+		kvm_queue_exception(vcpu, BP_VECTOR);
+	}
+}
+
+/**
  * handle_emulate - Emulate faulting instruction for ACTION_EMULATE
  * @vcpu: The vCPU that received ACTION_EMULATE response.
  *
@@ -297,6 +316,9 @@ void kvm_vmi_handle_event_response(struct kvm_vcpu *vcpu, u32 event_type,
 		break;
 	case KVM_VMI_EVENT_CPUID:
 		handle_cpuid_response(vcpu, resp);
+		break;
+	case KVM_VMI_EVENT_BREAKPOINT:
+		handle_bp_response(vcpu, resp);
 		break;
 	default:
 		break;
@@ -660,6 +682,14 @@ bool kvm_vmi_cr3_intercept(struct kvm *kvm)
 }
 EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_vmi_cr3_intercept);
 
+bool kvm_vmi_bp_intercept(struct kvm *kvm)
+{
+	struct kvm_vmi *vmi = kvm_vmi_get(kvm);
+
+	return vmi && (vmi->enabled_events & BIT_ULL(KVM_VMI_EVENT_BREAKPOINT));
+}
+EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_vmi_bp_intercept);
+
 /**
  * kvm_vmi_cr_write - Check if a CR write should generate a VMI event
  * @vcpu: The vCPU performing the CR write.
@@ -796,6 +826,41 @@ int kvm_vmi_cpuid(struct kvm_vcpu *vcpu, u32 leaf, u32 subleaf)
 	kvm_vmi_deliver_via_ring(vcpu, &ring_event);
 	return 1; /* Response handler controls emulation via flags */
 }
+
+/**
+ * kvm_vmi_breakpoint - Check if an INT3 should generate a VMI event
+ * @vcpu: The vCPU that hit the INT3.
+ *
+ * Called from handle_exception_nmi() when a #BP exception is intercepted
+ * and VMI breakpoint monitoring is enabled.
+ */
+int kvm_vmi_breakpoint(struct kvm_vcpu *vcpu)
+{
+	struct kvm_vcpu_vmi *vcpu_vmi = vcpu->vmi;
+	struct kvm_vmi_ring_event ring_event = {};
+	struct x86_exception exception;
+	u32 insn_len;
+	gva_t rip;
+	gpa_t gpa;
+
+	if (!kvm_vmi_event_enabled(vcpu, KVM_VMI_EVENT_BREAKPOINT))
+		return 0;
+
+	insn_len = kvm_x86_call(vmi_get_instruction_len)(vcpu);
+	rip = kvm_get_linear_rip(vcpu);
+	gpa = kvm_mmu_gva_to_gpa_fetch(vcpu, rip, &exception);
+
+	/* Save for potential REINJECT response */
+	vcpu_vmi->arch.bp_insn_length = insn_len;
+
+	ring_event.type = KVM_VMI_EVENT_BREAKPOINT;
+	ring_event.vcpu_id = vcpu->vcpu_id;
+	ring_event.insn_len = insn_len;
+	ring_event.arch.breakpoint.gpa = gpa;
+	trace_kvm_vmi_event_deliver(vcpu->vcpu_id, KVM_VMI_EVENT_BREAKPOINT, gpa);
+	return kvm_vmi_deliver_via_ring(vcpu, &ring_event) >= 0;
+}
+EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_vmi_breakpoint);
 
 /* Memory access */
 
