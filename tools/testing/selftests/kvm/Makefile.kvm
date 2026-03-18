@@ -158,6 +158,7 @@ TEST_GEN_PROGS_x86 += x86/vmi_msr_test
 TEST_GEN_PROGS_x86 += x86/vmi_cpuid_test
 TEST_GEN_PROGS_x86 += x86/vmi_bp_test
 TEST_GEN_PROGS_x86 += x86/vmi_bp_skip_test
+TEST_GEN_PROGS_x86 += x86/vmi_debug_test
 TEST_GEN_PROGS_x86 += x86/vmi_view_test
 TEST_GEN_PROGS_x86 += x86/vmi_view_switch_test
 TEST_GEN_PROGS_x86 += x86/vmi_mem_access_test

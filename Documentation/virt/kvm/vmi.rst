@@ -505,6 +505,9 @@ defined in ``<asm/kvm_vmi.h>``.
    * - 11
      - ``BREAKPOINT`` (INT3)
      - software breakpoint
+   * - 12
+     - ``DEBUG``
+     - debug exception
 
 6.3 Generic events
 ------------------
@@ -637,6 +640,25 @@ is consumed and the guest never sees ``#BP``; ``REINJECT`` delivers ``#BP``
 in an instrumented view, respond ``SINGLESTEP_FAST`` (+``SWITCH_VIEW`` to a
 clean view) to step the original instruction, then auto-return to the
 instrumented view.
+
+KVM_VMI_EVENT_DEBUG (12)
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+:Trigger: ``#DB`` debug exception (hardware breakpoint, single-step trap)
+:Data: ``struct kvm_vmi_event_debug``
+:Responses: REINJECT, DENY, SET_REGS (+ generic SWITCH_VIEW/SINGLESTEP[_FAST])
+
+::
+
+    struct kvm_vmi_event_debug {
+        __u64 pending_dbg;   /* DR6-style pending debug bits (exit qual) */
+        __u64 gpa;           /* guest-physical of RIP, or ~0 if unmapped */
+    };
+
+By default the guest resumes with ``RFLAGS.RF`` set so the instruction does not
+immediately re-trigger ``#DB``. ``DENY`` suppresses that (no RF set, no
+reinject). ``REINJECT`` delivers ``#DB`` (vector 1) with the original DR6 so the
+guest's handler runs.
 
 7. Alternate memory views
 =========================
