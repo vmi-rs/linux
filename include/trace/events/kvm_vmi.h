@@ -8,8 +8,16 @@
 #undef TRACE_SYSTEM
 #define TRACE_SYSTEM kvm_vmi
 
+#ifdef __x86_64__
+#define kvm_vmi_event_types_arch			\
+	, { KVM_VMI_EVENT_CR,		"cr" }
+#else
+#define kvm_vmi_event_types_arch
+#endif
+
 #define kvm_vmi_event_types				\
-	{ KVM_VMI_EVENT_MEM_ACCESS,	"mem_access" }
+	{ KVM_VMI_EVENT_MEM_ACCESS,	"mem_access" }	\
+	kvm_vmi_event_types_arch
 
 #define kvm_vmi_response_flags				\
 	{ KVM_VMI_RESPONSE_DENY,		"DENY" },	\
