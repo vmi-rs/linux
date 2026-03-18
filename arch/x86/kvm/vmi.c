@@ -309,6 +309,25 @@ static void handle_desc_response(struct kvm_vcpu *vcpu, u32 resp)
 }
 
 /**
+ * handle_io_response - Handle I/O event response
+ * @vcpu: The vCPU re-entering after an I/O event.
+ * @resp: KVM_VMI_RESPONSE_* bitmask from userspace.
+ *
+ * IO uses deferred-write pattern (like CR/MSR):
+ * CONTINUE (0): IO proceeds (caller handles it). Default.
+ * DENY: Advance RIP without emulating (I/O suppressed).
+ * SET_REGS: Agent controls everything.
+ */
+static void handle_io_response(struct kvm_vcpu *vcpu, u32 resp)
+{
+	if (resp & KVM_VMI_RESPONSE_SET_REGS)
+		return;
+
+	if (resp & KVM_VMI_RESPONSE_DENY)
+		kvm_skip_emulated_instruction(vcpu);
+}
+
+/**
  * handle_emulate - Emulate faulting instruction for ACTION_EMULATE
  * @vcpu: The vCPU that received ACTION_EMULATE response.
  *
@@ -372,6 +391,9 @@ void kvm_vmi_handle_event_response(struct kvm_vcpu *vcpu, u32 event_type,
 		break;
 	case KVM_VMI_EVENT_DESC_ACCESS:
 		handle_desc_response(vcpu, resp);
+		break;
+	case KVM_VMI_EVENT_IO:
+		handle_io_response(vcpu, resp);
 		break;
 	default:
 		break;
@@ -960,6 +982,40 @@ int kvm_vmi_desc_access(struct kvm_vcpu *vcpu, u8 descriptor, u8 is_write)
 	return kvm_vmi_deliver_via_ring(vcpu, &ring_event) >= 0;
 }
 EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_vmi_desc_access);
+
+/**
+ * kvm_vmi_io - Check if an I/O instruction should generate a VMI event
+ * @vcpu: The vCPU performing the I/O.
+ * @bytes: Number of bytes (1, 2, or 4).
+ * @port: I/O port number.
+ * @in: 1 for IN, 0 for OUT.
+ * @string: 1 for string I/O (INS/OUTS), 0 for scalar.
+ *
+ * Called from handle_io() when VMI I/O monitoring is enabled.
+ *
+ * Return: 0 (caller proceeds with IO) or 1 (DENY - caller skips IO).
+ */
+int kvm_vmi_io(struct kvm_vcpu *vcpu, u32 bytes, u16 port, u8 in, u8 string)
+{
+	struct kvm_vmi_ring_event ring_event = {};
+	int ret;
+
+	if (!kvm_vmi_event_enabled(vcpu, KVM_VMI_EVENT_IO))
+		return 0;
+
+	ring_event.type = KVM_VMI_EVENT_IO;
+	ring_event.vcpu_id = vcpu->vcpu_id;
+	ring_event.insn_len = kvm_x86_call(vmi_get_instruction_len)(vcpu);
+	ring_event.arch.io.port = port;
+	ring_event.arch.io.bytes = bytes;
+	ring_event.arch.io.in = in;
+	ring_event.arch.io.string = string;
+	trace_kvm_vmi_event_deliver(vcpu->vcpu_id, KVM_VMI_EVENT_IO, port);
+	ret = kvm_vmi_deliver_via_ring(vcpu, &ring_event);
+	/* Deferred: return 0 (caller handles IO) unless DENY */
+	return (ret > 0 && (ret & KVM_VMI_RESPONSE_DENY)) ? 1 : 0;
+}
+EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_vmi_io);
 
 /* Memory access */
 
