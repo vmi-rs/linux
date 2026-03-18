@@ -5461,6 +5461,21 @@ void vmx_vmi_apply_msr_intercepts(struct kvm_vcpu *vcpu)
 }
 
 /**
+ * vmx_vmi_set_desc_exiting - Enable or disable descriptor table access exiting
+ * @vcpu: The vCPU to update.
+ * @enable: true to enable, false to disable.
+ *
+ * Only disables if CR4.UMIP is not set (UMIP emulation also needs desc exiting).
+ */
+static void vmx_vmi_set_desc_exiting(struct kvm_vcpu *vcpu, bool enable)
+{
+	if (enable)
+		secondary_exec_controls_setbit(to_vmx(vcpu), SECONDARY_EXEC_DESC);
+	else if (!kvm_is_cr4_bit_set(vcpu, X86_CR4_UMIP))
+		secondary_exec_controls_clearbit(to_vmx(vcpu), SECONDARY_EXEC_DESC);
+}
+
+/**
  * vmx_vmi_apply_vmcs_state - Sync all VMI state into VMCS fields
  * @vcpu: The vCPU whose VMCS needs updating.
  *
@@ -5480,6 +5495,9 @@ void vmx_vmi_apply_vmcs_state(struct kvm_vcpu *vcpu)
 	/* CR3 load exiting: controlled by CR3 monitoring state */
 	vmx_vmi_update_cr3_intercept(vcpu,
 				     kvm_vmi_cr3_intercept(vcpu->kvm));
+
+	/* Descriptor table exiting: VM-wide config */
+	vmx_vmi_set_desc_exiting(vcpu, kvm_vmi_desc_intercept(vcpu->kvm));
 
 	/* Exception bitmap: picks up BP/DB intercept state */
 	vmx_update_exception_bitmap(vcpu);
@@ -5948,6 +5966,28 @@ static int handle_set_cr4(struct kvm_vcpu *vcpu, unsigned long val)
 
 static int handle_desc(struct kvm_vcpu *vcpu)
 {
+#ifdef CONFIG_KVM_VMI
+	if (vcpu->vmi) {
+		u32 exit_reason = vmx_get_exit_reason(vcpu).basic;
+		u32 instr_info = vmcs_read32(VMX_INSTRUCTION_INFO);
+		u8 insn_type = (instr_info >> 28) & 3;
+		u8 is_write = (insn_type >> 1) & 1;
+		u8 descriptor;
+
+		/*
+		 * Bits 29:28 of instr_info encode the instruction type.
+		 * Bit 0 selects the register: GDTR/LDTR (0) vs IDTR/TR (1).
+		 * Bit 1 selects load vs store (is_write).
+		 */
+		if (exit_reason == EXIT_REASON_GDTR_IDTR)
+			descriptor = (insn_type & 1) ? KVM_VMI_DESC_IDTR : KVM_VMI_DESC_GDTR;
+		else
+			descriptor = (insn_type & 1) ? KVM_VMI_DESC_TR : KVM_VMI_DESC_LDTR;
+
+		if (kvm_vmi_desc_access(vcpu, descriptor, is_write))
+			return 1;
+	}
+#endif
 	/*
 	 * UMIP emulation relies on intercepting writes to CR4.UMIP, i.e. this
 	 * and other code needs to be updated if UMIP can be guest owned.
