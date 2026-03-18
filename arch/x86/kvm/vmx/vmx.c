@@ -5900,6 +5900,16 @@ static int handle_io(struct kvm_vcpu *vcpu)
 
 	++vcpu->stat.io_exits;
 
+#ifdef CONFIG_KVM_VMI
+	if (vcpu->vmi) {
+		port = exit_qualification >> 16;
+		size = (exit_qualification & 7) + 1;
+		in = (exit_qualification & 8) != 0;
+		if (kvm_vmi_io(vcpu, size, port, in, string))
+			return 1;
+	}
+#endif
+
 	if (string)
 		return kvm_emulate_instruction(vcpu, 0);
 
