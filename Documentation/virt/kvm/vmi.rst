@@ -508,6 +508,9 @@ defined in ``<asm/kvm_vmi.h>``.
    * - 12
      - ``DEBUG``
      - debug exception
+   * - 13
+     - ``DESC_ACCESS``
+     - descriptor-table access
 
 6.3 Generic events
 ------------------
@@ -659,6 +662,28 @@ By default the guest resumes with ``RFLAGS.RF`` set so the instruction does not
 immediately re-trigger ``#DB``. ``DENY`` suppresses that (no RF set, no
 reinject). ``REINJECT`` delivers ``#DB`` (vector 1) with the original DR6 so the
 guest's handler runs.
+
+KVM_VMI_EVENT_DESC_ACCESS (13)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+:Trigger: descriptor-table access (``LGDT/SGDT/LIDT/SIDT/LLDT/SLDT/LTR/STR``)
+:Data: ``struct kvm_vmi_event_desc_access``
+:Responses: EMULATE, DENY, SET_REGS (a bare CONTINUE is invalid - see note)
+
+::
+
+    struct kvm_vmi_event_desc_access {
+        __u8 descriptor;   /* KVM_VMI_DESC_GDTR/IDTR/LDTR/TR (0..3) */
+        __u8 is_write;     /* 1 = load (LGDT/LIDT/LLDT/LTR), 0 = store */
+        __u8 pad[6];
+    };
+
+EMULATE runs the instruction; DENY skips it.
+
+.. note::
+   Like CPUID, when descriptor monitoring is enabled the kernel bypasses its own
+   emulation, so a bare ``CONTINUE`` re-faults; respond ``EMULATE``, ``DENY`` or
+   ``SET_REGS``.
 
 7. Alternate memory views
 =========================
