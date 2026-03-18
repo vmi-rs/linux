@@ -11,7 +11,8 @@
 #ifdef __x86_64__
 #define kvm_vmi_event_types_arch			\
 	, { KVM_VMI_EVENT_CR,		"cr" }		\
-	, { KVM_VMI_EVENT_MSR,		"msr" }
+	, { KVM_VMI_EVENT_MSR,		"msr" }		\
+	, { KVM_VMI_EVENT_CPUID,	"cpuid" }
 #else
 #define kvm_vmi_event_types_arch
 #endif

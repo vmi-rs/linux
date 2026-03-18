@@ -156,6 +156,34 @@ void kvm_vmi_restore_regs(struct kvm_vcpu *vcpu, struct kvm_vmi_regs *regs)
 	kvm_set_rflags(vcpu, regs->rflags);
 }
 
+/*
+ * vmi_emulate_insn - Emulate the intercepted instruction, preserving
+ * any exception/interrupt injected by the agent during the ring wait.
+ *
+ * kvm_emulate_instruction() calls kvm_clear_exception_queue() as part
+ * of its setup, which would wipe any exception the agent injected via
+ * KVM_VMI_INJECT_EVENT. Save and restore the exception/interrupt state
+ * around the emulation.
+ */
+static void vmi_emulate_insn(struct kvm_vcpu *vcpu)
+{
+	struct kvm_queued_exception saved_exception = vcpu->arch.exception;
+	struct kvm_queued_interrupt saved_interrupt = vcpu->arch.interrupt;
+	bool had_exception = vcpu->arch.exception.pending;
+	bool had_interrupt = vcpu->arch.interrupt.injected;
+
+	kvm_emulate_instruction(vcpu, 0);
+
+	if (had_exception && !vcpu->arch.exception.pending) {
+		vcpu->arch.exception = saved_exception;
+		kvm_make_request(KVM_REQ_EVENT, vcpu);
+	}
+	if (had_interrupt && !vcpu->arch.interrupt.injected) {
+		vcpu->arch.interrupt = saved_interrupt;
+		kvm_make_request(KVM_REQ_EVENT, vcpu);
+	}
+}
+
 /**
  * handle_cr_response - Handle CR event response
  * @vcpu: The vCPU re-entering after a CR event.
@@ -191,6 +219,26 @@ static void handle_msr_response(struct kvm_vcpu *vcpu, u32 resp)
 		return;
 
 	if (resp & KVM_VMI_RESPONSE_DENY)
+		kvm_skip_emulated_instruction(vcpu);
+}
+
+/**
+ * handle_cpuid_response - Handle CPUID event response
+ * @vcpu: The vCPU re-entering after a CPUID event.
+ * @resp: KVM_VMI_RESPONSE_* bitmask from userspace.
+ *
+ * EMULATE: Emulate CPUID instruction (write results + advance RIP).
+ * DENY: Advance RIP without emulating (CPUID appears as NOP).
+ * SET_REGS: Agent controls everything.
+ */
+static void handle_cpuid_response(struct kvm_vcpu *vcpu, u32 resp)
+{
+	if (resp & KVM_VMI_RESPONSE_SET_REGS)
+		return;
+
+	if (resp & KVM_VMI_RESPONSE_EMULATE)
+		vmi_emulate_insn(vcpu);
+	else if (resp & KVM_VMI_RESPONSE_DENY)
 		kvm_skip_emulated_instruction(vcpu);
 }
 
@@ -246,6 +294,9 @@ void kvm_vmi_handle_event_response(struct kvm_vcpu *vcpu, u32 event_type,
 		break;
 	case KVM_VMI_EVENT_MSR:
 		handle_msr_response(vcpu, resp);
+		break;
+	case KVM_VMI_EVENT_CPUID:
+		handle_cpuid_response(vcpu, resp);
 		break;
 	default:
 		break;
@@ -715,6 +766,35 @@ int kvm_vmi_msr_write(struct kvm_vcpu *vcpu, u32 msr, u64 old_val,
 	ret = kvm_vmi_deliver_via_ring(vcpu, &ring_event);
 	/* Deferred-write: return 0 (caller applies write) unless DENY */
 	return (ret > 0 && (ret & KVM_VMI_RESPONSE_DENY)) ? 1 : 0;
+}
+
+/**
+ * kvm_vmi_cpuid - Check if a CPUID instruction should generate a VMI event
+ * @vcpu: The vCPU executing CPUID.
+ * @leaf: The CPUID leaf (EAX value).
+ * @subleaf: The CPUID subleaf (ECX value).
+ *
+ * Called from kvm_emulate_cpuid() BEFORE the CPUID is executed.
+ *
+ * Return: 0 (let caller execute CPUID normally),
+ *         1 (handled - instruction skipped or exception pending),
+ *         negative errno on error.
+ */
+int kvm_vmi_cpuid(struct kvm_vcpu *vcpu, u32 leaf, u32 subleaf)
+{
+	struct kvm_vmi_ring_event ring_event = {};
+
+	if (!kvm_vmi_event_enabled(vcpu, KVM_VMI_EVENT_CPUID))
+		return 0;
+
+	ring_event.type = KVM_VMI_EVENT_CPUID;
+	ring_event.vcpu_id = vcpu->vcpu_id;
+	ring_event.insn_len = kvm_x86_call(vmi_get_instruction_len)(vcpu);
+	ring_event.arch.cpuid.leaf = leaf;
+	ring_event.arch.cpuid.subleaf = subleaf;
+	trace_kvm_vmi_event_deliver(vcpu->vcpu_id, KVM_VMI_EVENT_CPUID, leaf);
+	kvm_vmi_deliver_via_ring(vcpu, &ring_event);
+	return 1; /* Response handler controls emulation via flags */
 }
 
 /* Memory access */
