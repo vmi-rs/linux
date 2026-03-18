@@ -15,7 +15,8 @@
  * x86 VMI Event Types
  */
 #define KVM_VMI_EVENT_CR		KVM_VMI_ARCH_EVENT(0)  /* Control register write */
-#define KVM_VMI_NUM_EVENTS		KVM_VMI_ARCH_EVENT(1)
+#define KVM_VMI_EVENT_MSR		KVM_VMI_ARCH_EVENT(1)  /* MSR write */
+#define KVM_VMI_NUM_EVENTS		KVM_VMI_ARCH_EVENT(2)
 
 /*
  * x86 CR Indices (for kvm_vmi_control_event.cr.index)
@@ -99,9 +100,17 @@ struct kvm_vmi_event_cr {
 	__u64 new_value;
 };
 
+struct kvm_vmi_event_msr {
+	__u32 index;
+	__u32 pad;
+	__u64 old_value;
+	__u64 new_value;
+};
+
 /**
  * union kvm_vmi_arch_control_data - x86-specific control_event parameters
  * @cr: CR event parameters
+ * @msr: MSR event parameters
  */
 union kvm_vmi_arch_control_data {
 	struct {
@@ -110,6 +119,11 @@ union kvm_vmi_arch_control_data {
 		__u8  pad[6];
 		__u64 bitmask;
 	} cr;
+	struct {
+		__u32 msr;
+		__u8  onchangeonly;
+		__u8  pad[3];
+	} msr;
 };
 
 /**
@@ -117,6 +131,7 @@ union kvm_vmi_arch_control_data {
  */
 union kvm_vmi_arch_event_data {
 	struct kvm_vmi_event_cr cr;
+	struct kvm_vmi_event_msr msr;
 };
 
 #endif /* _UAPI_ASM_X86_KVM_VMI_H */
