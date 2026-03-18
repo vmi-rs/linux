@@ -55,6 +55,7 @@ struct kvm_arch_vmi {
  * @cr_event_old_val: Old CR value saved for DENY.
  * @cr_event_new_val: New CR value saved for CONTINUE.
  * @bp_insn_length: INT3 instruction length for #BP reinject.
+ * @dbg_dr6: DR6 value for #DB reinject.
  */
 struct kvm_arch_vcpu_vmi {
 	gpa_t emul_gpa;
@@ -63,6 +64,7 @@ struct kvm_arch_vcpu_vmi {
 	u64 cr_event_old_val;
 	u64 cr_event_new_val;
 	u32 bp_insn_length;
+	u64 dbg_dr6;
 };
 
 #ifdef CONFIG_KVM_VMI
@@ -92,6 +94,7 @@ int kvm_vmi_cr_write(struct kvm_vcpu *vcpu, int cr_num, u64 old_val,
 int kvm_vmi_msr_write(struct kvm_vcpu *vcpu, u32 msr, u64 old_val, u64 new_val);
 int kvm_vmi_cpuid(struct kvm_vcpu *vcpu, u32 leaf, u32 subleaf);
 int kvm_vmi_breakpoint(struct kvm_vcpu *vcpu);
+int kvm_vmi_debug_exception(struct kvm_vcpu *vcpu, u64 dr6);
 
 /* Memory access (TDP MMU integration) */
 int kvm_vmi_check_mem_access(struct kvm_vcpu *vcpu, gpa_t gpa,
