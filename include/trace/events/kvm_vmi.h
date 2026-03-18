@@ -13,7 +13,8 @@
 	, { KVM_VMI_EVENT_CR,		"cr" }		\
 	, { KVM_VMI_EVENT_MSR,		"msr" }		\
 	, { KVM_VMI_EVENT_CPUID,	"cpuid" }	\
-	, { KVM_VMI_EVENT_BREAKPOINT,	"breakpoint" }
+	, { KVM_VMI_EVENT_BREAKPOINT,	"breakpoint" }	\
+	, { KVM_VMI_EVENT_DEBUG,	"debug" }
 #else
 #define kvm_vmi_event_types_arch
 #endif
