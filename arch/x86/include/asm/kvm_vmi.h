@@ -50,17 +50,11 @@ struct kvm_arch_vmi {
 /**
  * struct kvm_arch_vcpu_vmi - x86-specific per-vCPU VMI state
  * @emul_gpa: Faulting GPA saved for ACTION_EMULATE.
- * @cr_event_type: Last CR event type for response handling.
- * @cr_event_cr_num: Actual CR number (0/3/4) for DENY.
- * @cr_event_old_val: Old CR value saved for DENY.
- * @cr_event_new_val: New CR value saved for CONTINUE.
+ * @bp_insn_length: INT3 instruction length for #BP reinject.
  */
 struct kvm_arch_vcpu_vmi {
 	gpa_t emul_gpa;
-	u32 cr_event_type;
-	int cr_event_cr_num;
-	u64 cr_event_old_val;
-	u64 cr_event_new_val;
+	u32 bp_insn_length;
 };
 
 #ifdef CONFIG_KVM_VMI
@@ -82,12 +76,14 @@ static inline int vmi_cr_index(u8 cr)
 
 /* VMCS intercept queries (called from vmx.c to build VMCS state) */
 bool kvm_vmi_cr3_intercept(struct kvm *kvm);
+bool kvm_vmi_bp_intercept(struct kvm *kvm);
 
 /* Event handlers - VM-exit intercepts (arch/x86/kvm/vmi.c) */
 int kvm_vmi_cr_write(struct kvm_vcpu *vcpu, int cr_num, u64 old_val,
 		     u64 new_val);
 int kvm_vmi_msr_write(struct kvm_vcpu *vcpu, u32 msr, u64 old_val, u64 new_val);
 int kvm_vmi_cpuid(struct kvm_vcpu *vcpu, u32 leaf, u32 subleaf);
+int kvm_vmi_breakpoint(struct kvm_vcpu *vcpu);
 
 /* Memory access (TDP MMU integration) */
 int kvm_vmi_check_mem_access(struct kvm_vcpu *vcpu, gpa_t gpa,
@@ -98,6 +94,7 @@ void kvm_vmi_setup_page_fault(struct kvm_vcpu *vcpu,
 #else /* !CONFIG_KVM_VMI */
 
 static inline bool kvm_vmi_cr3_intercept(struct kvm *kvm) { return false; }
+static inline bool kvm_vmi_bp_intercept(struct kvm *kvm) { return false; }
 
 #endif /* CONFIG_KVM_VMI */
 
