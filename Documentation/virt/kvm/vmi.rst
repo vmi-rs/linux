@@ -489,6 +489,9 @@ defined in ``<asm/kvm_vmi.h>``.
    * - 0
      - ``MEM_ACCESS``
      - generic (per-view access violation)
+   * - 8
+     - ``CR``
+     - control register write
 
 6.3 Generic events
 ------------------
@@ -519,6 +522,43 @@ Responses: ``SET_REGS``, ``SWITCH_VIEW``, ``SINGLESTEP``, ``SINGLESTEP_FAST``.
 the view's permissions. A bare ``CONTINUE`` does not by itself resolve the fault
 (the access is re-attempted); the agent must widen the permission, emulate, or
 step past it (``SINGLESTEP_FAST``) to make progress.
+
+6.4 x86 architecture events
+---------------------------
+
+x86 arch event parameters use ``union kvm_vmi_arch_control_data`` /
+``union kvm_vmi_arch_event_data`` from ``<asm/kvm_vmi.h>``.
+
+KVM_VMI_EVENT_CR (8)
+~~~~~~~~~~~~~~~~~~~~~
+
+:Trigger: guest write to CR0, CR3 or CR4 (before the write is applied)
+:Data: ``struct kvm_vmi_event_cr``
+:Responses: CONTINUE (allow), DENY (suppress + advance RIP), SET_REGS
+
+::
+
+    struct kvm_vmi_event_cr {
+        __u32 index;       /* 0, 3 or 4 */
+        __u32 pad;
+        __u64 old_value;
+        __u64 new_value;
+    };
+
+Control parameters (``arch.cr``): ``index`` (``KVM_VMI_CR0`` = 0,
+``KVM_VMI_CR3`` = 3, ``KVM_VMI_CR4`` = 4), ``onchangeonly`` (skip writes that do
+not change the value), ``bitmask`` (fire only if changed bits intersect the
+mask). The ``bitmask`` filter is applied **only when** ``onchangeonly`` is also
+set; with ``onchangeonly`` = 0 every write fires and ``bitmask`` is ignored.
+Each CR is enabled/disabled independently.
+
+.. note::
+   ``KVM_VMI_XCR0`` (index 64) is accepted by ``CONTROL_EVENT`` but produces no
+   event: the ``XSETBV`` path has no VMI hook. Do not rely on XCR0 monitoring.
+
+DENY suppresses the write (the old value was never overwritten) and advances
+RIP. ``SET_REGS`` *without* DENY writes back GP regs but still lets the original
+CR write proceed - combine ``SET_REGS|DENY`` to both modify and suppress.
 
 7. Alternate memory views
 =========================

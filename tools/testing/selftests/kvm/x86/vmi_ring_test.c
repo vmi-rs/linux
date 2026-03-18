@@ -24,6 +24,16 @@ static void guest_halt(void)
 		asm volatile("hlt");
 }
 
+static void guest_cr3_write(void)
+{
+	uint64_t cr3;
+
+	GUEST_SYNC(1);
+	__asm__ __volatile__("mov %%cr3, %0" : "=r"(cr3));
+	__asm__ __volatile__("mov %0, %%cr3" : : "r"(cr3));
+	GUEST_DONE();
+}
+
 /*
  * Test 1: Create a VMI session. Verify vmi_fd >= 0.
  */
@@ -100,6 +110,99 @@ static void test_ring_setup(void)
 }
 
 /*
+ * Test 4: Enable CR3 monitoring, trigger CR3 write from guest,
+ * verify event is delivered via ring and guest completes after response.
+ */
+static void test_ring_event_delivery(void)
+{
+	struct kvm_vm *vm;
+	struct kvm_vcpu *vcpu;
+	struct vmi_test_ring ring;
+	struct vmi_vcpu_thread_arg targ;
+	pthread_t thread;
+	struct kvm_vmi_ring_event *ev;
+	int vmi_fd;
+
+	vmi_fd = vmi_test_setup(&vm, &vcpu, guest_cr3_write, &ring);
+
+	/* Enable CR3 monitoring - all writes */
+	vmi_control_cr(vmi_fd, KVM_VMI_CR3, 0, ~0ULL, 1);
+
+	/* Start vCPU thread */
+	targ.vcpu = vcpu;
+	targ.done = 0;
+	pthread_create(&thread, NULL, vmi_vcpu_thread_fn, &targ);
+
+	/* Wait for CR3 write event via ring */
+	ev = vmi_wait_event_timeout(&ring, 5000);
+	TEST_ASSERT(ev != NULL, "Timeout waiting for CR3 event via ring");
+	TEST_ASSERT(ev->type == KVM_VMI_EVENT_CR,
+		    "Expected CR event type (%u), got %u",
+		    KVM_VMI_EVENT_CR, ev->type);
+	TEST_ASSERT(ev->arch.cr.index == KVM_VMI_CR3,
+		    "Expected CR3 index, got %u", ev->arch.cr.index);
+	TEST_ASSERT(ev->vcpu_id == 0,
+		    "Expected vcpu_id 0, got %u", ev->vcpu_id);
+
+	/* Respond and allow */
+	ev->response = KVM_VMI_RESPONSE_CONTINUE;
+	vmi_ack_event(&ring, 0);
+
+	/* Guest should complete */
+	pthread_join(thread, NULL);
+	TEST_ASSERT(targ.done, "Guest should have completed after ring ack");
+
+	vmi_test_teardown(vm, vmi_fd, &ring);
+	pr_info("PASS: test_ring_event_delivery\n");
+}
+
+/*
+ * Test 5: Close vmi_fd without acking an outstanding event.
+ * The vCPU should be woken up (not hang forever).
+ */
+static void test_session_close_wakes_vcpu(void)
+{
+	struct kvm_vm *vm;
+	struct kvm_vcpu *vcpu;
+	struct vmi_test_ring ring;
+	struct vmi_vcpu_thread_arg targ;
+	pthread_t thread;
+	struct kvm_vmi_ring_event *ev;
+	int vmi_fd;
+
+	vmi_fd = vmi_test_setup(&vm, &vcpu, guest_cr3_write, &ring);
+
+	/* Enable CR3 monitoring */
+	vmi_control_cr(vmi_fd, KVM_VMI_CR3, 0, ~0ULL, 1);
+
+	/* Start vCPU thread */
+	targ.vcpu = vcpu;
+	targ.done = 0;
+	pthread_create(&thread, NULL, vmi_vcpu_thread_fn, &targ);
+
+	/* Wait for the CR3 event */
+	ev = vmi_wait_event_timeout(&ring, 5000);
+	TEST_ASSERT(ev != NULL, "Timeout waiting for CR3 event");
+	TEST_ASSERT(ev->type == KVM_VMI_EVENT_CR, "Expected CR event");
+
+	/*
+	 * Close vmi_fd WITHOUT acking the event. This should tear down
+	 * the session and wake the blocked vCPU so the thread can exit.
+	 */
+	vmi_teardown_ring(&ring);
+	close(vmi_fd);
+
+	/*
+	 * The vCPU thread should unblock and exit. It may see an error
+	 * or UCALL_ABORT, but it must not hang.
+	 */
+	pthread_join(thread, NULL);
+
+	kvm_vm_free(vm);
+	pr_info("PASS: test_session_close_wakes_vcpu\n");
+}
+
+/*
  * Test 6: Setup ring, then teardown via KVM_VMI_TEARDOWN_RING ioctl.
  */
 static void test_ring_teardown(void)
@@ -146,6 +249,8 @@ int main(int argc, char *argv[])
 	test_session_create();
 	test_session_only_one();
 	test_ring_setup();
+	test_ring_event_delivery();
+	test_session_close_wakes_vcpu();
 	test_ring_teardown();
 
 	return 0;
