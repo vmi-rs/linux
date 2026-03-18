@@ -12,7 +12,8 @@
 #define kvm_vmi_event_types_arch			\
 	, { KVM_VMI_EVENT_CR,		"cr" }		\
 	, { KVM_VMI_EVENT_MSR,		"msr" }		\
-	, { KVM_VMI_EVENT_CPUID,	"cpuid" }
+	, { KVM_VMI_EVENT_CPUID,	"cpuid" }	\
+	, { KVM_VMI_EVENT_BREAKPOINT,	"breakpoint" }
 #else
 #define kvm_vmi_event_types_arch
 #endif
@@ -25,7 +26,8 @@
 	{ KVM_VMI_RESPONSE_DENY,		"DENY" },	\
 	{ KVM_VMI_RESPONSE_SET_REGS,		"SET_REGS" },	\
 	{ KVM_VMI_RESPONSE_SWITCH_VIEW,		"SWITCH_VIEW" },\
-	{ KVM_VMI_RESPONSE_EMULATE,		"EMULATE" }
+	{ KVM_VMI_RESPONSE_EMULATE,		"EMULATE" },	\
+	{ KVM_VMI_RESPONSE_REINJECT,		"REINJECT" }
 
 #define kvm_vmi_access_flags					\
 	{ KVM_VMI_ACCESS_R,		"R" },			\

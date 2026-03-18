@@ -947,6 +947,8 @@ void vmx_update_exception_bitmap(struct kvm_vcpu *vcpu)
 	     (KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_USE_SW_BP)) ==
 	    (KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_USE_SW_BP))
 		eb |= 1u << BP_VECTOR;
+	if (kvm_vmi_bp_intercept(vcpu->kvm))
+		eb |= 1u << BP_VECTOR;
 	if (to_vmx(vcpu)->rmode.vm86_active)
 		eb = ~0;
 	if (!vmx_need_pf_intercept(vcpu))
@@ -5349,6 +5351,9 @@ void vmx_vmi_apply_vmcs_state(struct kvm_vcpu *vcpu)
 	vmx_vmi_update_cr3_intercept(vcpu,
 				     kvm_vmi_cr3_intercept(vcpu->kvm));
 
+	/* Exception bitmap: picks up BP intercept state */
+	vmx_update_exception_bitmap(vcpu);
+
 	/* MSR write intercepts: VM-wide config */
 	vmx_vmi_apply_msr_intercepts(vcpu);
 
@@ -5645,6 +5650,12 @@ static int handle_exception_nmi(struct kvm_vcpu *vcpu)
 		kvm_run->debug.arch.dr7 = vmcs_readl(GUEST_DR7);
 		fallthrough;
 	case BP_VECTOR:
+#ifdef CONFIG_KVM_VMI
+		/* VMI breakpoint interception takes priority over debug exit */
+		if (ex_no == BP_VECTOR && vcpu->vmi &&
+		    kvm_vmi_breakpoint(vcpu))
+			return 1;
+#endif
 		/*
 		 * Update instruction length as we may reinject #BP from
 		 * user space while in guest debugging mode. Reading it for
