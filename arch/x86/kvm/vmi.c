@@ -262,6 +262,33 @@ static void handle_bp_response(struct kvm_vcpu *vcpu, u32 resp)
 }
 
 /**
+ * handle_debug_response - Handle debug exception event response
+ * @vcpu: The vCPU re-entering after a debug exception event.
+ * @resp: KVM_VMI_RESPONSE_* bitmask from userspace.
+ *
+ * If REINJECT: Inject #DB into the guest with the original DR6 value
+ * so its IDT handler fires.
+ * If CONTINUE: Set the Resume Flag (RF) in guest RFLAGS so the CPU
+ * skips code breakpoints for one instruction, allowing the faulting
+ * instruction to execute without re-triggering #DB. The CPU clears
+ * RF automatically after one instruction.
+ *
+ * Return: 0 on success.
+ */
+static void handle_debug_response(struct kvm_vcpu *vcpu, u32 resp)
+{
+	if (resp & KVM_VMI_RESPONSE_REINJECT) {
+		struct kvm_vcpu_vmi *vcpu_vmi = vcpu->vmi;
+
+		kvm_queue_exception_p(vcpu, DB_VECTOR, vcpu_vmi->arch.dbg_dr6);
+		return;
+	}
+
+	if (!(resp & KVM_VMI_RESPONSE_DENY))
+		kvm_set_rflags(vcpu, kvm_get_rflags(vcpu) | X86_EFLAGS_RF);
+}
+
+/**
  * handle_emulate - Emulate faulting instruction for ACTION_EMULATE
  * @vcpu: The vCPU that received ACTION_EMULATE response.
  *
@@ -319,6 +346,9 @@ void kvm_vmi_handle_event_response(struct kvm_vcpu *vcpu, u32 event_type,
 		break;
 	case KVM_VMI_EVENT_BREAKPOINT:
 		handle_bp_response(vcpu, resp);
+		break;
+	case KVM_VMI_EVENT_DEBUG:
+		handle_debug_response(vcpu, resp);
 		break;
 	default:
 		break;
@@ -861,6 +891,40 @@ int kvm_vmi_breakpoint(struct kvm_vcpu *vcpu)
 	return kvm_vmi_deliver_via_ring(vcpu, &ring_event) >= 0;
 }
 EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_vmi_breakpoint);
+
+/**
+ * kvm_vmi_debug_exception - Check if a #DB should generate a VMI event
+ * @vcpu: The vCPU that hit the #DB.
+ * @dr6: The DR6 exit qualification value.
+ *
+ * Called from handle_exception_nmi() when VMI debug monitoring is enabled
+ * and the #DB is not ICEBP and not from guest debug mode.
+ */
+int kvm_vmi_debug_exception(struct kvm_vcpu *vcpu, u64 dr6)
+{
+	struct kvm_vcpu_vmi *vcpu_vmi = vcpu->vmi;
+	struct kvm_vmi_ring_event ring_event = {};
+	struct x86_exception exception;
+	gva_t rip;
+	gpa_t gpa;
+
+	if (!kvm_vmi_event_enabled(vcpu, KVM_VMI_EVENT_DEBUG))
+		return 0;
+
+	/* Save for potential REINJECT response */
+	vcpu_vmi->arch.dbg_dr6 = dr6;
+
+	rip = kvm_get_linear_rip(vcpu);
+	gpa = kvm_mmu_gva_to_gpa_fetch(vcpu, rip, &exception);
+
+	ring_event.type = KVM_VMI_EVENT_DEBUG;
+	ring_event.vcpu_id = vcpu->vcpu_id;
+	ring_event.arch.debug.pending_dbg = dr6;
+	ring_event.arch.debug.gpa = gpa;
+	trace_kvm_vmi_event_deliver(vcpu->vcpu_id, KVM_VMI_EVENT_DEBUG, dr6);
+	return kvm_vmi_deliver_via_ring(vcpu, &ring_event) >= 0;
+}
+EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_vmi_debug_exception);
 
 /* Memory access */
 
