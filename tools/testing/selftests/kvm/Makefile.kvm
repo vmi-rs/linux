@@ -212,6 +212,7 @@ TEST_GEN_PROGS_arm64 += arm64/no-vgic-v3
 TEST_GEN_PROGS_arm64 += arm64/kvm-uuid
 TEST_GEN_PROGS_arm64 += arm64/vmi_basic_test
 TEST_GEN_PROGS_arm64 += arm64/vmi_lifecycle_test
+TEST_GEN_PROGS_arm64 += arm64/vmi_guest_mmap_test
 TEST_GEN_PROGS_arm64 += access_tracking_perf_test
 TEST_GEN_PROGS_arm64 += arch_timer
 TEST_GEN_PROGS_arm64 += coalesced_io_test
