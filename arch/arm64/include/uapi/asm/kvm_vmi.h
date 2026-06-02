@@ -44,6 +44,30 @@
  * fields are added by the register-capture commit.
  */
 struct kvm_vmi_regs {
+	/* General-purpose registers, stack pointers, PC, processor state */
+	__u64 regs[31];		/* x0..x30 */
+	__u64 sp_el0;
+	__u64 sp_el1;
+	__u64 pc;
+	__u64 pstate;
+
+	/* Translation / control system registers */
+	__u64 ttbr0_el1;
+	__u64 ttbr1_el1;
+	__u64 tcr_el1;
+	__u64 sctlr_el1;
+	__u64 mair_el1;
+	__u64 vbar_el1;
+	__u64 contextidr_el1;
+
+	/* Exception / thread-context system registers */
+	__u64 elr_el1;
+	__u64 spsr_el1;
+	__u64 esr_el1;
+	__u64 far_el1;
+	__u64 tpidr_el0;
+	__u64 tpidr_el1;
+	__u64 tpidrro_el0;
 };
 
 /*
