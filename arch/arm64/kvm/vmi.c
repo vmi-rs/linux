@@ -336,6 +336,71 @@ bool kvm_vmi_view_denies(struct kvm_vcpu *vcpu, gfn_t gfn, u8 attempted)
 }
 
 /*
+ * Resolve a per-GFN remap (change_gfn) for the vCPU's active view. The generic
+ * core stores gfn_overrides[gfn] as the raw target HPA cast to a pointer; the
+ * fault path maps that HPA instead of the host PFN. View 0 (NULL current_view)
+ * never remaps.
+ *
+ * Return: true and *hpa set if @gfn is remapped in the active view.
+ */
+bool kvm_vmi_view_remap(struct kvm_vcpu *vcpu, gfn_t gfn, hpa_t *hpa)
+{
+	struct kvm_vcpu_vmi *vcpu_vmi = vcpu->vmi;
+	struct kvm_vmi_view_data *view;
+	void *entry;
+
+	if (!vcpu_vmi)
+		return false;
+	view = vcpu_vmi->current_view;	/* NULL == host view 0 */
+	if (!view)
+		return false;
+	entry = xa_load(&view->gfn_overrides, gfn);
+	if (!entry)
+		return false;
+	*hpa = (hpa_t)(unsigned long)entry;
+	return true;
+}
+
+/*
+ * Stage-2 block size in host pages. At the 16K granule PMD_SIZE is 32 MB
+ * (PMD_SHIFT == 25), so a block spans PMD_SIZE >> PAGE_SHIFT host pages. Always
+ * derive from PMD_SIZE; never hardcode (see docs/vmi-arm64/risks.md#R6).
+ */
+#define VMI_BLOCK_PAGES		(PMD_SIZE >> PAGE_SHIFT)
+
+/*
+ * True if the fault for @gfn must be mapped at PTE (page) granularity in the
+ * active view. Two reasons: (1) the view has per-GFN access overrides (K7
+ * behavior, preserved via kvm_vmi_view_force_pte); or (2) @gfn is itself
+ * remapped, or a remapped GFN shares its 32 MB PMD block - a block leaf would
+ * otherwise map the remapped GFN with the original (non-override) HPA.
+ */
+bool kvm_vmi_view_force_pte_gfn(struct kvm_vcpu *vcpu, gfn_t gfn)
+{
+	struct kvm_vcpu_vmi *vcpu_vmi = vcpu->vmi;
+	struct kvm_vmi_view_data *view;
+	gfn_t block_start, block_end;
+	unsigned long idx;
+	void *entry;
+
+	if (kvm_vmi_view_force_pte(vcpu))	/* K7: access overrides */
+		return true;
+	if (!vcpu_vmi)
+		return false;
+	view = vcpu_vmi->current_view;
+	if (!view)
+		return false;
+	if (xa_load(&view->gfn_overrides, gfn))
+		return true;
+	block_start = ALIGN_DOWN(gfn, VMI_BLOCK_PAGES);
+	block_end = block_start + VMI_BLOCK_PAGES;
+	xa_for_each_range(&view->gfn_overrides, idx, entry,
+			  block_start, block_end - 1)
+		return true;
+	return false;
+}
+
+/*
  * Deliver a KVM_VMI_EVENT_MEM_ACCESS event for a view access violation and
  * block until the agent acks. mem_access is implicitly enabled (it is not
  * gated on enabled_events), but with no ring attached there is no agent to

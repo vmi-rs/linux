@@ -79,6 +79,8 @@ void kvm_vmi_clamp_view_prot(struct kvm_vcpu *vcpu, gfn_t gfn,
 bool kvm_vmi_view_denies(struct kvm_vcpu *vcpu, gfn_t gfn, u8 attempted);
 int  kvm_vmi_mem_access(struct kvm_vcpu *vcpu, gpa_t gpa, u8 attempted);
 bool kvm_vmi_view_force_pte(struct kvm_vcpu *vcpu);
+bool kvm_vmi_view_remap(struct kvm_vcpu *vcpu, gfn_t gfn, hpa_t *hpa);
+bool kvm_vmi_view_force_pte_gfn(struct kvm_vcpu *vcpu, gfn_t gfn);
 
 #else /* !CONFIG_KVM_VMI */
 
@@ -91,6 +93,10 @@ static inline bool kvm_vmi_view_denies(struct kvm_vcpu *vcpu, gfn_t gfn,
 static inline int kvm_vmi_mem_access(struct kvm_vcpu *vcpu, gpa_t gpa,
 				     u8 attempted) { return 0; }
 static inline bool kvm_vmi_view_force_pte(struct kvm_vcpu *vcpu) { return false; }
+static inline bool kvm_vmi_view_remap(struct kvm_vcpu *vcpu, gfn_t gfn,
+				      hpa_t *hpa) { return false; }
+static inline bool kvm_vmi_view_force_pte_gfn(struct kvm_vcpu *vcpu,
+					      gfn_t gfn) { return false; }
 
 #endif /* CONFIG_KVM_VMI */
 

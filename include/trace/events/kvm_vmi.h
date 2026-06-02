@@ -293,6 +293,29 @@ TRACE_EVENT(kvm_vmi_zap_view_gfn,
 	TP_printk("view %u gfn 0x%llx", __entry->view_id, __entry->gfn)
 );
 
+/*
+ * Trace a view fault that installs a remapped (override) HPA for a GFN.
+ */
+TRACE_EVENT(kvm_vmi_view_remap_fault,
+	TP_PROTO(__u32 view_id, __u64 gfn, __u64 hpa),
+	TP_ARGS(view_id, gfn, hpa),
+
+	TP_STRUCT__entry(
+		__field(__u32,	view_id)
+		__field(__u64,	gfn)
+		__field(__u64,	hpa)
+	),
+
+	TP_fast_assign(
+		__entry->view_id = view_id;
+		__entry->gfn = gfn;
+		__entry->hpa = hpa;
+	),
+
+	TP_printk("view %u gfn 0x%llx -> hpa 0x%llx",
+		  __entry->view_id, __entry->gfn, __entry->hpa)
+);
+
 #endif /* _TRACE_KVM_VMI_H */
 
 #undef TRACE_INCLUDE_PATH

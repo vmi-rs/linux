@@ -22,6 +22,7 @@
 #include <asm/kvm_emulate.h>
 #include <asm/kvm_vmi.h>
 #include <asm/virt.h>
+#include <trace/events/kvm_vmi.h>
 
 #include "trace.h"
 
@@ -1672,7 +1673,7 @@ static int user_mem_abort(struct kvm_vcpu *vcpu, phys_addr_t fault_ipa,
 	 * and defeat per-GFN control. Set before force_pte is first consumed.
 	 */
 	if (vcpu->arch.hw_mmu != &vcpu->kvm->arch.mmu &&
-	    kvm_vmi_view_force_pte(vcpu))
+	    kvm_vmi_view_force_pte_gfn(vcpu, fault_ipa >> PAGE_SHIFT))
 		force_pte = true;
 
 	if (fault_is_perm)
@@ -1908,8 +1909,29 @@ static int user_mem_abort(struct kvm_vcpu *vcpu, phys_addr_t fault_ipa,
 		adjust_nested_exec_perms(kvm, nested, &prot);
 
 	/* VMI: clamp to the active view's per-GFN permissions, if any. */
-	if (vcpu->arch.hw_mmu != &vcpu->kvm->arch.mmu)
+	bool mark_dirty = writable;
+
+	if (vcpu->arch.hw_mmu != &vcpu->kvm->arch.mmu) {
+		hpa_t remap_hpa;
+
 		kvm_vmi_clamp_view_prot(vcpu, gfn, &prot);
+
+		/*
+		 * A remapped GFN maps the override HPA at page granularity. The
+		 * original GFN's page was still faulted in above and is released
+		 * as usual at out_unlock; the override target is pinned by the
+		 * VMI core (shadow pages permanently; non-shadow via the pin
+		 * fixup). Suppress dirty marking - the override page is not in
+		 * this memslot.
+		 */
+		if (kvm_vmi_view_remap(vcpu, gfn, &remap_hpa)) {
+			pfn = __phys_to_pfn(remap_hpa);
+			vma_pagesize = PAGE_SIZE;
+			mark_dirty = false;
+			trace_kvm_vmi_view_remap_fault(vcpu->vmi->current_view_id,
+						       gfn, remap_hpa);
+		}
+	}
 
 	/*
 	 * Under the premise of getting a FSC_PERM fault, we just need to relax
@@ -1934,7 +1956,7 @@ out_unlock:
 	kvm_fault_unlock(kvm);
 
 	/* Mark the page dirty only if the fault is handled successfully */
-	if (writable && !ret)
+	if (mark_dirty && !ret)
 		mark_page_dirty_in_slot(kvm, memslot, gfn);
 
 	return ret != -EAGAIN ? ret : 0;
