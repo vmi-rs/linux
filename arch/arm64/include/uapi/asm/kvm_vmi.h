@@ -86,13 +86,34 @@ union kvm_vmi_arch_control_data {
 union kvm_vmi_arch_event_data {
 };
 
+/* kvm_vmi_inject_event.type */
+#define KVM_VMI_INJECT_SERROR	0	/* asynchronous SError (virtual SError) */
+#define KVM_VMI_INJECT_ABORT	1	/* synchronous abort to EL1 (FSC + FAR) */
+
 /*
  * Exception-injection descriptor for the KVM_VMI_INJECT_EVENT ioctl.
- * @vcpu_id is read by the generic ioctl to locate the target vCPU; the
- * remaining fields are added by the event-injection commit.
+ * @vcpu_id is read by the generic ioctl to locate the target vCPU.
+ *
+ * @type    KVM_VMI_INJECT_*.
+ * @addr    ABORT: faulting VA written to FAR_EL1.
+ * @esr     SERROR: ISS/syndrome bits, valid iff @has_esr (requires RAS).
+ * @iabt    ABORT: 1 = instruction abort, 0 = data abort.
+ * @has_esr SERROR: @esr is valid.
+ * @fsc     ABORT: fault status code (ESR_ELx_FSC_*; e.g. translation FAULT
+ *          for the demand-paging / x86 #PF analog).
+ * @write   ABORT data abort: WnR - write fault (1) vs read fault (0).
+ * @pad     must be zero.
  */
 struct kvm_vmi_inject_event {
 	__u32 vcpu_id;
+	__u32 type;
+	__u64 addr;
+	__u64 esr;
+	__u8  iabt;
+	__u8  has_esr;
+	__u8  fsc;
+	__u8  write;
+	__u8  pad[4];
 };
 
 #endif /* _UAPI_ASM_ARM64_KVM_VMI_H */

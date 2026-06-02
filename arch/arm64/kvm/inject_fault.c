@@ -253,6 +253,61 @@ int kvm_inject_sea(struct kvm_vcpu *vcpu, bool iabt, u64 addr)
 	return 1;
 }
 
+/*
+ * kvm_inject_dabt_with_fsc - inject a synchronous abort with a caller-chosen FSC
+ * @vcpu:  target vCPU (must be parked; caller holds vcpu->mutex)
+ * @iabt:  true = instruction abort, false = data abort
+ * @addr:  faulting VA, written to FAR_EL1
+ * @fsc:   fault status code (ESR_ELx_FSC_*), e.g. ESR_ELx_FSC_FAULT
+ * @write: data-abort WnR (ignored for instruction aborts)
+ *
+ * Unlike kvm_inject_sea() (which always reports an external abort), this lets
+ * a VMI agent synthesize translation/permission/access faults - the arm64
+ * analog of x86 #PF injection. EC current-vs-lower and the IL bit are derived
+ * exactly as inject_abt64() does. SCTLR2.EASE only reroutes *external* aborts
+ * to the SError vector, so gate that on the FSC being external.
+ *
+ * Returns 1 (an exception was pended), matching the kvm_inject_* convention.
+ */
+int kvm_inject_dabt_with_fsc(struct kvm_vcpu *vcpu, bool iabt,
+			     u64 addr, u8 fsc, bool write)
+{
+	unsigned long cpsr = *vcpu_cpsr(vcpu);
+	bool is_aarch32 = vcpu_mode_is_32bit(vcpu);
+	bool is_ext = (fsc == ESR_ELx_FSC_EXTABT) || esr_fsc_is_sea_ttw(fsc);
+	u64 esr = 0;
+
+	if (is_ext && effective_sctlr2_ease(vcpu))
+		pend_serror_exception(vcpu);
+	else
+		pend_sync_exception(vcpu);
+
+	if (kvm_vcpu_trap_il_is32bit(vcpu))
+		esr |= ESR_ELx_IL;
+
+	/*
+	 * Same EC idiom as inject_abt64(): pick IABT_{LOW,CUR} from the guest
+	 * mode, then OR in DABT for a data abort (DABT_x == IABT_x | 0x4).
+	 */
+	if (is_aarch32 || (cpsr & PSR_MODE_MASK) == PSR_MODE_EL0t)
+		esr |= (ESR_ELx_EC_IABT_LOW << ESR_ELx_EC_SHIFT);
+	else
+		esr |= (ESR_ELx_EC_IABT_CUR << ESR_ELx_EC_SHIFT);
+
+	if (!iabt)
+		esr |= ESR_ELx_EC_DABT_LOW << ESR_ELx_EC_SHIFT;
+
+	esr |= (fsc & ESR_ELx_FSC);
+
+	if (!iabt && write)
+		esr |= ESR_ELx_WNR;
+
+	vcpu_write_sys_reg(vcpu, addr, exception_far_elx(vcpu));
+	vcpu_write_sys_reg(vcpu, esr, exception_esr_elx(vcpu));
+
+	return 1;
+}
+
 void kvm_inject_size_fault(struct kvm_vcpu *vcpu)
 {
 	unsigned long addr, esr;
