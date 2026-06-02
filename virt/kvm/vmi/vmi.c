@@ -435,16 +435,17 @@ bool kvm_vmi_vcpu_paused(struct kvm_vcpu *vcpu)
  * kvm_vmi_vcpu_pause_wait - Sleep until a paused vCPU is unpaused.
  * @vcpu: The vCPU to sleep.
  *
- * Called from vcpu_run() when kvm_vmi_vcpu_paused() returns true.
- * Releases vcpu->mutex, VMCS state, and SRCU read lock so the VMI
- * agent can call KVM ioctls (KVM_GET_REGS, etc.) on this vCPU while
- * it sleeps.  Re-acquires everything before returning.
+ * Called from the vCPU run loop when kvm_vmi_vcpu_paused() returns true.
+ * Releases vcpu->mutex and unloads vCPU state so the VMI agent can call
+ * KVM ioctls (register reads, etc.) on this vCPU while it sleeps, and
+ * re-acquires them before returning.  The caller owns any per-vCPU SRCU
+ * read lock held across the run loop (x86 drops and re-takes it around
+ * this call; arm64 holds none here), since that is arch-specific.
  */
 void kvm_vmi_vcpu_pause_wait(struct kvm_vcpu *vcpu)
 {
 	struct kvm_vcpu_vmi *vcpu_vmi = vcpu->vmi;
 
-	kvm_vcpu_srcu_read_unlock(vcpu);
 	vcpu_put(vcpu);
 	mutex_unlock(&vcpu->mutex);
 
@@ -463,7 +464,6 @@ void kvm_vmi_vcpu_pause_wait(struct kvm_vcpu *vcpu)
 	 */
 	mutex_lock(&vcpu->mutex);
 	vcpu_load(vcpu);
-	kvm_vcpu_srcu_read_lock(vcpu);
 }
 
 /**
