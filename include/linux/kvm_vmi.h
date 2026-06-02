@@ -25,6 +25,8 @@ struct eventfd_ctx;
  * @visible: VMFUNC visibility (for future EPTP list, currently unused).
  * @access_overrides: Xarray mapping GFN -> u8 access permissions.
  * @gfn_overrides: Xarray mapping GFN -> HPA for change_gfn remappings.
+ * @gfn_override_pages: Xarray mapping GFN -> struct page* pinning non-shadow
+ *	change_gfn remap targets; dropped on revert/destroy.
  * @arch: Architecture-specific view data.
  */
 struct kvm_vmi_view_data {
@@ -34,6 +36,7 @@ struct kvm_vmi_view_data {
 	bool visible;
 	struct xarray access_overrides;
 	struct xarray gfn_overrides;
+	struct xarray gfn_override_pages;
 	struct kvm_arch_vmi_view arch;
 };
 

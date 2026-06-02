@@ -518,6 +518,17 @@ out_unlock:
 	return r;
 }
 
+/* Drop all non-shadow target pins held by a view and free the tracking xarray. */
+static void kvm_vmi_drop_override_pins(struct kvm_vmi_view_data *view)
+{
+	struct page *page;
+	unsigned long idx;
+
+	xa_for_each(&view->gfn_override_pages, idx, page)
+		put_page(page);
+	xa_destroy(&view->gfn_override_pages);
+}
+
 /**
  * kvm_vmi_create_view - Create an alternate memory view
  * @kvm: The target VM.
@@ -554,12 +565,14 @@ static int kvm_vmi_create_view(struct kvm *kvm, struct kvm_vmi_view *uview)
 	atomic_set(&view->vcpu_count, 0);
 	view->default_access = uview->default_access;
 	view->visible = true;
-	xa_init(&view->gfn_overrides);
 	xa_init(&view->access_overrides);
+	xa_init(&view->gfn_overrides);
+	xa_init(&view->gfn_override_pages);
 
 	/* Allocate arch-specific EPT root */
 	ret = kvm_arch_vmi_create_view(kvm, view);
 	if (ret) {
+		kvm_vmi_drop_override_pins(view);
 		xa_destroy(&view->gfn_overrides);
 		xa_destroy(&view->access_overrides);
 		kfree(view);
@@ -574,6 +587,7 @@ static int kvm_vmi_create_view(struct kvm *kvm, struct kvm_vmi_view *uview)
 
 	if (ret) {
 		kvm_arch_vmi_destroy_view(kvm, view);
+		kvm_vmi_drop_override_pins(view);
 		xa_destroy(&view->gfn_overrides);
 		xa_destroy(&view->access_overrides);
 		kfree(view);
@@ -628,6 +642,7 @@ static int kvm_vmi_destroy_view(struct kvm *kvm, struct kvm_vmi_view *uview)
 	kvm_arch_vmi_destroy_view(kvm, view);
 
 	/* Free override xarrays */
+	kvm_vmi_drop_override_pins(view);
 	xa_destroy(&view->gfn_overrides);
 	xa_destroy(&view->access_overrides);
 
@@ -871,9 +886,11 @@ static int kvm_vmi_change_gfn(struct kvm *kvm, struct kvm_vmi_change_gfn *change
 	struct kvm_vmi_view_data *view;
 	struct kvm_memory_slot *slot;
 	struct page *shadow;
+	struct page *prev;
 	bool writable;
 	kvm_pfn_t pfn;
 	hpa_t new_hpa;
+	int err;
 
 	if (!vmi)
 		return -EINVAL;
@@ -890,7 +907,10 @@ static int kvm_vmi_change_gfn(struct kvm *kvm, struct kvm_vmi_change_gfn *change
 
 	if (change->new_gfn == KVM_VMI_INVALID_GFN) {
 		/* Revert: remove remapping, restore host mapping */
+		prev = xa_erase(&view->gfn_override_pages, change->old_gfn);
 		xa_erase(&view->gfn_overrides, change->old_gfn);
+		if (prev)
+			put_page(prev);
 
 		if (kvm_arch_vmi_view_has_root(view))
 			kvm_arch_vmi_invalidate_gfn_revert(kvm, view,
@@ -920,9 +940,35 @@ static int kvm_vmi_change_gfn(struct kvm *kvm, struct kvm_vmi_change_gfn *change
 		new_hpa = (hpa_t)pfn << PAGE_SHIFT;
 	}
 
+	/* Drop any prior non-shadow pin before overwriting this GFN. */
+	prev = xa_erase(&view->gfn_override_pages, change->old_gfn);
+	if (prev)
+		put_page(prev);
+
 	/* Store the remapping: old_gfn -> new_hpa */
 	xa_store(&view->gfn_overrides, change->old_gfn,
 		 (void *)(unsigned long)new_hpa, GFP_KERNEL);
+
+	/*
+	 * Pin a non-shadow target for the override's lifetime by retaining the
+	 * faultin ref (recorded in gfn_override_pages). The mmu_notifier skips
+	 * remapped GFNs, so without this the stored HPA could go stale on
+	 * migration/swap. This is a normal GUP ref (not a longterm pin): it
+	 * keeps the HPA valid but can impede compaction of a movable page; a
+	 * dedicated longterm-pin API could replace it later if needed. Shadow
+	 * targets (refcounted_page == NULL) are already pinned kernel pages.
+	 */
+	if (refcounted_page) {
+		err = xa_err(xa_store(&view->gfn_override_pages,
+				      change->old_gfn, refcounted_page,
+				      GFP_KERNEL));
+		if (err) {
+			xa_erase(&view->gfn_overrides, change->old_gfn);
+			put_page(refcounted_page);
+			return err;
+		}
+		refcounted_page = NULL;	/* ref transferred to the xarray */
+	}
 
 	/* Zap old mapping so next fault installs with remap PFN */
 	if (kvm_arch_vmi_view_has_root(view))
@@ -1597,6 +1643,7 @@ static int kvm_vmi_release(struct inode *inode, struct file *file)
 			continue;
 		xa_erase(&vmi->views, index);
 		kvm_arch_vmi_destroy_view(kvm, view);
+		kvm_vmi_drop_override_pins(view);
 		xa_destroy(&view->gfn_overrides);
 		xa_destroy(&view->access_overrides);
 		kfree(view);
