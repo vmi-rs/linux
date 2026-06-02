@@ -16,9 +16,11 @@
 #include <linux/kvm_host.h>
 #include <linux/kvm_vmi.h>
 #include <linux/bitops.h>
+#include <linux/slab.h>
 
 #include <asm/kvm_vmi.h>
 #include <asm/kvm_emulate.h>
+#include <asm/kvm_mmu.h>
 #include <asm/esr.h>
 #include <asm/cpufeature.h>
 #include <asm/virt.h>
@@ -124,15 +126,32 @@ void kvm_arch_vmi_block_end(struct kvm_vcpu *vcpu)
 {
 }
 
-/*
- * Re-apply VMI hardware state on the running vCPU. Called from the run
- * loop when KVM_REQ_VMI_UPDATE is pending. No trap or view state exists
- * yet, so this is a no-op; later commits (pause, views, sysreg traps)
- * extend it. Keeping the request/apply wiring here avoids a stuck
- * request once kvm_arch_vmi_update() runs from kvm_create_vmi().
- */
 void kvm_vmi_apply_state(struct kvm_vcpu *vcpu)
 {
+	struct kvm_vcpu_vmi *vcpu_vmi = vcpu->vmi;
+	struct kvm_s2_mmu *mmu = &vcpu->kvm->arch.mmu;
+
+	/*
+	 * Materialize the active memory view into the hardware stage-2. This
+	 * is the authoritative sync point, driven by KVM_REQ_VMI_UPDATE: the
+	 * VM-wide KVM_VMI_SWITCH_VIEW ioctl only updates the generic
+	 * current_view and kicks, so we derive the target mmu from current_view
+	 * here (mirroring x86's apply, which reads current_view to program the
+	 * EPTP). arm64 loads stage-2 only at vcpu_load, not per guest entry, so
+	 * we must reprogram VTTBR_EL2/VTCR_EL2 now, before the next entry.
+	 * Update the view's VMID first (kvm_get_vttbr reads mmu->vmid.id);
+	 * distinct per-view VMIDs mean no TLB flush is needed on switch.
+	 */
+	if (vcpu_vmi && vcpu_vmi->current_view_id != 0) {
+		struct kvm_vmi_view_data *view = READ_ONCE(vcpu_vmi->current_view);
+
+		if (view && view->arch.mmu)
+			mmu = view->arch.mmu;
+	}
+
+	vcpu->arch.hw_mmu = mmu;
+	kvm_arm_vmid_update(&mmu->vmid);
+	__load_stage2(mmu, mmu->arch);
 }
 
 /*
@@ -152,30 +171,45 @@ void kvm_arch_vmi_set_singlestep(struct kvm_vcpu *vcpu, bool enable)
 
 int kvm_arch_vmi_create_view(struct kvm *kvm, struct kvm_vmi_view_data *view)
 {
-	return -EOPNOTSUPP;
+	int ret;
+
+	view->arch.mmu = kzalloc(sizeof(*view->arch.mmu), GFP_KERNEL_ACCOUNT);
+	if (!view->arch.mmu)
+		return -ENOMEM;
+
+	ret = kvm_init_stage2_mmu(kvm, view->arch.mmu, kvm_get_pa_bits(kvm));
+	if (ret) {
+		kfree(view->arch.mmu);
+		view->arch.mmu = NULL;
+	}
+
+	return ret;
 }
 
 void kvm_arch_vmi_destroy_view(struct kvm *kvm, struct kvm_vmi_view_data *view)
 {
+	kvm_free_stage2_pgd(view->arch.mmu);
+	kfree(view->arch.mmu);
+	view->arch.mmu = NULL;
 }
 
 void kvm_arch_vmi_switch_view(struct kvm_vcpu *vcpu,
 			      struct kvm_vmi_view_data *view)
 {
+	/* view == NULL means the host view (view 0). */
+	vcpu->arch.hw_mmu = view ? view->arch.mmu : &vcpu->kvm->arch.mmu;
+	kvm_make_request(KVM_REQ_VMI_UPDATE, vcpu);
 }
 
-/*
- * Return the vCPU to the host view (view 0). Only called by the generic
- * core when a vCPU is on an alternate view; views do not exist yet, so
- * this is a no-op until the alternate-views commit.
- */
 void kvm_arch_vmi_reset_view(struct kvm_vcpu *vcpu)
 {
+	vcpu->arch.hw_mmu = &vcpu->kvm->arch.mmu;
+	kvm_make_request(KVM_REQ_VMI_UPDATE, vcpu);
 }
 
 bool kvm_arch_vmi_view_has_root(struct kvm_vmi_view_data *view)
 {
-	return false;
+	return view->arch.mmu && view->arch.mmu->pgt;
 }
 
 void kvm_arch_vmi_invalidate_gfn(struct kvm *kvm,
