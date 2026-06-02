@@ -346,6 +346,7 @@ int kvm_vm_ioctl_check_extension(struct kvm *kvm, long ext)
 	case KVM_CAP_VMI_GUEST_MMAP:
 	case KVM_CAP_VMI_PAUSE:
 	case KVM_CAP_VMI_INJECT:
+	case KVM_CAP_VMI_ALLOC_GFN:
 		r = kvm_vmi_has_cap();
 		break;
 #endif
