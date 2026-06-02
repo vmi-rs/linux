@@ -657,6 +657,20 @@ void kvm_arch_vmi_set_singlestep(struct kvm_vcpu *vcpu, bool enable)
 }
 
 /*
+ * x86 holds the per-vCPU SRCU read lock across the entire run loop, so it
+ * must be dropped before the VMI ring delivery blocks and re-taken after.
+ */
+void kvm_arch_vmi_block_begin(struct kvm_vcpu *vcpu)
+{
+	kvm_vcpu_srcu_read_unlock(vcpu);
+}
+
+void kvm_arch_vmi_block_end(struct kvm_vcpu *vcpu)
+{
+	kvm_vcpu_srcu_read_lock(vcpu);
+}
+
+/*
  * Reset arch-specific per-vCPU VMI state during session teardown.
  *
  * Called from the release path (not the vCPU thread), so this must NOT

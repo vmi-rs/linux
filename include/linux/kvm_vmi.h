@@ -144,6 +144,16 @@ void kvm_arch_vmi_update(struct kvm *kvm);
 
 void kvm_arch_vmi_set_singlestep(struct kvm_vcpu *vcpu, bool enable);
 
+/*
+ * Shed/re-take any per-vCPU read-side locks the arch run loop holds across
+ * the run, around a VMI operation that blocks the vCPU thread (e.g. ring
+ * delivery). Lets synchronize_srcu() complete while the vCPU is parked.
+ * x86 drops/re-takes the per-vCPU SRCU read lock; arm64 holds none here and
+ * implements both as no-ops.
+ */
+void kvm_arch_vmi_block_begin(struct kvm_vcpu *vcpu);
+void kvm_arch_vmi_block_end(struct kvm_vcpu *vcpu);
+
 int kvm_arch_vmi_create_view(struct kvm *kvm, struct kvm_vmi_view_data *view);
 void kvm_arch_vmi_destroy_view(struct kvm *kvm, struct kvm_vmi_view_data *view);
 void kvm_arch_vmi_switch_view(struct kvm_vcpu *vcpu,

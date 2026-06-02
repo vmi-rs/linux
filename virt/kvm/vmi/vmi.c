@@ -330,13 +330,14 @@ int kvm_vmi_deliver_via_ring(struct kvm_vcpu *vcpu,
 	eventfd_signal(vcpu_vmi->event_fd_ctx);
 
 	/*
-	 * Release vcpu->mutex and SRCU read lock before blocking.
-	 * This allows the agent to call standard KVM vCPU ioctls
-	 * (KVM_GET_FPU, KVM_GET_XSAVE, etc.) on the duplicated vCPU fd
-	 * while the vCPU is blocked, and allows synchronize_srcu() in
-	 * kvm_vmi_release() to complete.
+	 * Release vcpu->mutex and unload vCPU state before blocking so the
+	 * agent can call standard KVM vCPU ioctls on the duplicated vCPU fd
+	 * while the vCPU is parked. kvm_arch_vmi_block_begin()/_end() shed and
+	 * re-take any per-vCPU read-side lock the arch run loop holds (the SRCU
+	 * read lock on x86; nothing on arm64), so synchronize_srcu() in
+	 * kvm_vmi_release() can complete.
 	 */
-	kvm_vcpu_srcu_read_unlock(vcpu);
+	kvm_arch_vmi_block_begin(vcpu);
 	vcpu_put(vcpu);
 	mutex_unlock(&vcpu->mutex);
 
@@ -351,7 +352,7 @@ int kvm_vmi_deliver_via_ring(struct kvm_vcpu *vcpu,
 
 	mutex_lock(&vcpu->mutex);
 	vcpu_load(vcpu);
-	kvm_vcpu_srcu_read_lock(vcpu);
+	kvm_arch_vmi_block_end(vcpu);
 
 	/*
 	 * Re-read under SRCU - call_srcu() may have freed vcpu_vmi
