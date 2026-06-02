@@ -9,6 +9,15 @@
 #include <linux/kvm_types.h>
 #include <uapi/asm/kvm_vmi.h>
 
+/*
+ * enum kvm_pgtable_prot is defined in <asm/kvm_pgtable.h>. We cannot include
+ * it here: kvm_pgtable.h pulls in <linux/kvm_host.h>, whose VMI plumbing
+ * reaches back to this header, so a direct include is circular. The only
+ * users of the prot-clamp prototype (arch/arm64/kvm/{mmu,vmi}.c) include
+ * kvm_pgtable.h ahead of this header, so the type is in scope at use sites.
+ */
+enum kvm_pgtable_prot;
+
 struct kvm;
 struct kvm_vcpu;
 struct kvm_vmi_view_data;
@@ -61,10 +70,27 @@ struct kvm_arch_vcpu_vmi {
 void kvm_vmi_apply_state(struct kvm_vcpu *vcpu);
 int kvm_vmi_hypercall(struct kvm_vcpu *vcpu);
 
+/*
+ * Per-GFN access enforcement for alternate views, reached from the arm64
+ * stage-2 fault path (arch/arm64/kvm/mmu.c).
+ */
+void kvm_vmi_clamp_view_prot(struct kvm_vcpu *vcpu, gfn_t gfn,
+			     enum kvm_pgtable_prot *prot);
+bool kvm_vmi_view_denies(struct kvm_vcpu *vcpu, gfn_t gfn, u8 attempted);
+int  kvm_vmi_mem_access(struct kvm_vcpu *vcpu, gpa_t gpa, u8 attempted);
+bool kvm_vmi_view_force_pte(struct kvm_vcpu *vcpu);
+
 #else /* !CONFIG_KVM_VMI */
 
 static inline void kvm_vmi_apply_state(struct kvm_vcpu *vcpu) {}
 static inline int kvm_vmi_hypercall(struct kvm_vcpu *vcpu) { return 0; }
+static inline void kvm_vmi_clamp_view_prot(struct kvm_vcpu *vcpu, gfn_t gfn,
+					   enum kvm_pgtable_prot *prot) {}
+static inline bool kvm_vmi_view_denies(struct kvm_vcpu *vcpu, gfn_t gfn,
+				       u8 attempted) { return false; }
+static inline int kvm_vmi_mem_access(struct kvm_vcpu *vcpu, gpa_t gpa,
+				     u8 attempted) { return 0; }
+static inline bool kvm_vmi_view_force_pte(struct kvm_vcpu *vcpu) { return false; }
 
 #endif /* CONFIG_KVM_VMI */
 

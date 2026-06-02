@@ -212,21 +212,157 @@ bool kvm_arch_vmi_view_has_root(struct kvm_vmi_view_data *view)
 	return view->arch.mmu && view->arch.mmu->pgt;
 }
 
+/*
+ * Drop the leaf stage-2 mapping for @gfn in a view's private stage-2, so the
+ * next access re-faults and is re-installed with the view's current per-GFN
+ * permissions. kvm_stage2_unmap_range() asserts the mmu write lock is held and
+ * does not self-lock, so @locked tells us whether the caller already holds it
+ * (only the mmu_notifier path does).
+ */
+static void kvm_vmi_zap_view_gfn(struct kvm *kvm,
+				 struct kvm_vmi_view_data *view, gfn_t gfn,
+				 bool locked)
+{
+	struct kvm_s2_mmu *mmu = view->arch.mmu;	/* POINTER, per K6 */
+
+	if (!mmu || !mmu->pgt)
+		return;
+	trace_kvm_vmi_zap_view_gfn(view->id, gfn);
+	if (!locked)
+		write_lock(&kvm->mmu_lock);
+	kvm_stage2_unmap_range(mmu, gfn_to_gpa(gfn), PAGE_SIZE, false);
+	if (!locked)
+		write_unlock(&kvm->mmu_lock);
+}
+
 void kvm_arch_vmi_invalidate_gfn(struct kvm *kvm,
 				 struct kvm_vmi_view_data *view, gfn_t gfn)
 {
+	kvm_vmi_zap_view_gfn(kvm, view, gfn, false);
 }
 
 void kvm_arch_vmi_invalidate_gfn_locked(struct kvm *kvm,
 					struct kvm_vmi_view_data *view,
 					gfn_t gfn)
 {
+	kvm_vmi_zap_view_gfn(kvm, view, gfn, true);
 }
 
 void kvm_arch_vmi_invalidate_gfn_revert(struct kvm *kvm,
 					struct kvm_vmi_view_data *view,
 					gfn_t gfn)
 {
+	kvm_vmi_zap_view_gfn(kvm, view, gfn, false);
+}
+
+/*
+ * Resolve a view's effective per-GFN access. The generic core stores
+ * per-GFN overrides as xa_mk_value(access) in @access_overrides; absent an
+ * override the view's default applies. The generic resolver is static, so
+ * mirror it here (matching x86 K7).
+ */
+static u8 kvm_vmi_view_gfn_access(struct kvm_vmi_view_data *view, gfn_t gfn)
+{
+	void *entry;
+
+	if (!view)
+		return KVM_VMI_ACCESS_RWX;
+	entry = xa_load(&view->access_overrides, gfn);
+	if (entry)
+		return (u8)xa_to_value(entry);
+	return view->default_access;
+}
+
+/*
+ * Clamp the stage-2 leaf permissions about to be installed for @gfn down to
+ * what the vCPU's active view allows. Called from the fault path with the
+ * finalized prot; only ever narrows, never widens. View 0 (NULL current_view)
+ * is the unrestricted host view.
+ */
+void kvm_vmi_clamp_view_prot(struct kvm_vcpu *vcpu, gfn_t gfn,
+			     enum kvm_pgtable_prot *prot)
+{
+	struct kvm_vcpu_vmi *vcpu_vmi = vcpu->vmi;
+	struct kvm_vmi_view_data *view;
+	u8 access;
+
+	if (!vcpu_vmi)
+		return;
+	view = vcpu_vmi->current_view;	/* NULL == host view 0 */
+	if (!view)
+		return;
+	access = kvm_vmi_view_gfn_access(view, gfn);
+	if (!(access & KVM_VMI_ACCESS_R))
+		*prot &= ~KVM_PGTABLE_PROT_R;
+	if (!(access & KVM_VMI_ACCESS_W))
+		*prot &= ~KVM_PGTABLE_PROT_W;
+	if (!(access & KVM_VMI_ACCESS_X))
+		*prot &= ~KVM_PGTABLE_PROT_X;
+}
+
+/*
+ * True if the active alt view has per-GFN access overrides, so the fault
+ * path must map at PTE granularity - otherwise a hugepage leaf would apply
+ * one gfn's access to the whole block and defeat per-GFN control. Views with
+ * only a uniform default_access (no overrides) can keep block mappings.
+ */
+bool kvm_vmi_view_force_pte(struct kvm_vcpu *vcpu)
+{
+	struct kvm_vcpu_vmi *vcpu_vmi = vcpu->vmi;
+	struct kvm_vmi_view_data *view;
+
+	if (!vcpu_vmi)
+		return false;
+	view = vcpu_vmi->current_view;
+	return view && !xa_empty(&view->access_overrides);
+}
+
+/*
+ * Report whether the vCPU's active view denies @attempted (R/W/X bits) for
+ * @gfn. Used by the abort handler to distinguish a real VMI access violation
+ * from an ordinary stage-2 fault. View 0 never denies.
+ */
+bool kvm_vmi_view_denies(struct kvm_vcpu *vcpu, gfn_t gfn, u8 attempted)
+{
+	struct kvm_vcpu_vmi *vcpu_vmi = vcpu->vmi;
+	struct kvm_vmi_view_data *view;
+
+	if (!vcpu_vmi)
+		return false;
+	view = vcpu_vmi->current_view;
+	if (!view)
+		return false;
+	return (kvm_vmi_view_gfn_access(view, gfn) & attempted) != attempted;
+}
+
+/*
+ * Deliver a KVM_VMI_EVENT_MEM_ACCESS event for a view access violation and
+ * block until the agent acks. mem_access is implicitly enabled (it is not
+ * gated on enabled_events), but with no ring attached there is no agent to
+ * consult, so return 0 (CONTINUE) and let the clamped leaf stand.
+ *
+ * Return: the agent's response flags (>= 0), or 0 (CONTINUE) if no ring.
+ */
+int kvm_vmi_mem_access(struct kvm_vcpu *vcpu, gpa_t gpa, u8 attempted)
+{
+	struct kvm_vmi_ring_event ring_event = {};
+	int ret;
+
+	if (!vcpu->vmi || !READ_ONCE(vcpu->vmi->ring))
+		return 0;
+
+	ring_event.type = KVM_VMI_EVENT_MEM_ACCESS;
+	ring_event.vcpu_id = vcpu->vcpu_id;
+	ring_event.insn_len = 0;
+	ring_event.mem_access.gpa = gpa;
+	ring_event.mem_access.access = attempted;
+
+	trace_kvm_vmi_mem_violation(vcpu->vcpu_id, gpa, attempted,
+				    kvm_vmi_view_gfn_access(vcpu->vmi->current_view,
+							    gpa_to_gfn(gpa)));
+	ret = kvm_vmi_deliver_via_ring(vcpu, &ring_event);
+
+	return ret;
 }
 
 /*

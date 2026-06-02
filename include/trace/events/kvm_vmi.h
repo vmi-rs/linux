@@ -273,6 +273,26 @@ TRACE_EVENT(kvm_vmi_pause,
 		  __entry->vcpu_id == -1 ? 0 : __entry->vcpu_id)
 );
 
+/*
+ * Trace leaf zap of a single GFN in a view's private stage-2.
+ */
+TRACE_EVENT(kvm_vmi_zap_view_gfn,
+	TP_PROTO(__u32 view_id, __u64 gfn),
+	TP_ARGS(view_id, gfn),
+
+	TP_STRUCT__entry(
+		__field(__u32,	view_id)
+		__field(__u64,	gfn)
+	),
+
+	TP_fast_assign(
+		__entry->view_id = view_id;
+		__entry->gfn = gfn;
+	),
+
+	TP_printk("view %u gfn 0x%llx", __entry->view_id, __entry->gfn)
+);
+
 #endif /* _TRACE_KVM_VMI_H */
 
 #undef TRACE_INCLUDE_PATH
