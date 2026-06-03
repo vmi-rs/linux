@@ -38,9 +38,10 @@
  */
 /* arm64 arch-specific event IDs (start at KVM_VMI_ARCH_EVENT(0) == 8). */
 #define KVM_VMI_EVENT_SYSREG		KVM_VMI_ARCH_EVENT(0)	/* = 8 */
+#define KVM_VMI_EVENT_BREAKPOINT	KVM_VMI_ARCH_EVENT(1)	/* = 9 */
 
 /* One past the last defined arm64 event. */
-#define KVM_VMI_NUM_EVENTS		KVM_VMI_ARCH_EVENT(1)	/* = 9 */
+#define KVM_VMI_NUM_EVENTS		KVM_VMI_ARCH_EVENT(2)	/* = 10 */
 
 /*
  * Identifiers for the monitorable EL1 VM system registers, the set routed
@@ -116,8 +117,16 @@ struct kvm_vmi_event_sysreg {
 	__u64 new_value;	/* value the guest is writing (observe-only) */
 };
 
+/* KVM_VMI_EVENT_BREAKPOINT payload (delivered as ring_event.arch.breakpoint). */
+struct kvm_vmi_event_breakpoint {
+	__u64 ipa;	/* guest-physical address (IPA) of the BRK instruction */
+	__u32 imm;	/* BRK comment field, ESR_ELx.ISS[15:0] */
+	__u32 pad;
+};
+
 union kvm_vmi_arch_event_data {
-	struct kvm_vmi_event_sysreg sysreg;
+	struct kvm_vmi_event_sysreg	sysreg;
+	struct kvm_vmi_event_breakpoint	breakpoint;
 };
 
 /* kvm_vmi_inject_event.type */

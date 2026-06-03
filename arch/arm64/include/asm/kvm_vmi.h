@@ -96,6 +96,16 @@ bool kvm_vmi_sysreg_write(struct kvm_vcpu *vcpu, int idx, u64 old_val,
 			  u64 new_val);
 
 /*
+ * Breakpoint (BRK) monitoring (K11). kvm_vmi_bp_monitoring() is read from
+ * the debug fast paths (kvm_arm_setup_mdcr_el2, kvm_vcpu_load_debug,
+ * kvm_vmi_apply_state) to decide whether to force-keep MDCR_EL2.TDE and
+ * host-owned debug. kvm_vmi_breakpoint() delivers a BREAKPOINT event for a
+ * guest BRK trapped to EL2 and applies the agent's response.
+ */
+bool kvm_vmi_bp_monitoring(struct kvm *kvm);
+int  kvm_vmi_breakpoint(struct kvm_vcpu *vcpu);
+
+/*
  * Per-GFN access enforcement for alternate views, reached from the arm64
  * stage-2 fault path (arch/arm64/kvm/mmu.c).
  */
@@ -115,6 +125,8 @@ static inline bool kvm_vmi_sysreg_monitoring(struct kvm *kvm) { return false; }
 static inline int  kvm_vmi_sysreg_index(int reg) { return -1; }
 static inline bool kvm_vmi_sysreg_write(struct kvm_vcpu *vcpu, int idx,
 					u64 old_val, u64 new_val) { return false; }
+static inline bool kvm_vmi_bp_monitoring(struct kvm *kvm) { return false; }
+static inline int  kvm_vmi_breakpoint(struct kvm_vcpu *vcpu) { return 1; }
 static inline void kvm_vmi_clamp_view_prot(struct kvm_vcpu *vcpu, gfn_t gfn,
 					   enum kvm_pgtable_prot *prot) {}
 static inline bool kvm_vmi_view_denies(struct kvm_vcpu *vcpu, gfn_t gfn,

@@ -205,6 +205,25 @@ static int kvm_handle_guest_debug(struct kvm_vcpu *vcpu)
 {
 	struct kvm_run *run = vcpu->run;
 	u64 esr = kvm_vcpu_get_esr(vcpu);
+	u32 ec = ESR_ELx_EC(esr);
+
+	/* VMI breakpoint monitoring claims guest BRK, priority over KVM_GUESTDBG. */
+	if (ec == ESR_ELx_EC_BRK64 && kvm_vmi_bp_monitoring(vcpu->kvm))
+		return kvm_vmi_breakpoint(vcpu);
+
+	/*
+	 * Non-BRK debug classes cannot originate from the guest while VMI is
+	 * monitoring (guest debug is neutralized via VCPU_DEBUG_HOST_OWNED, see
+	 * debug.c). Reaching here with one means that invariant was violated --
+	 * with one narrow, benign exception: if monitoring is enabled mid-run on a
+	 * vCPU that already had guest HW debug live, neutralization (applied at
+	 * vcpu_load) lags the TDE force-keep (applied immediately via
+	 * kvm_vmi_apply_state) until the next load, so a stale guest debug
+	 * exception can trip this once. It is harmless: PC is not advanced and it
+	 * falls through to the normal KVM_EXIT_DEBUG path.
+	 */
+	WARN_ON_ONCE(!vcpu->guest_debug && kvm_vmi_bp_monitoring(vcpu->kvm) &&
+		     ec != ESR_ELx_EC_BRK64);
 
 	if (!vcpu->guest_debug && forward_debug_exception(vcpu))
 		return 1;
@@ -214,7 +233,7 @@ static int kvm_handle_guest_debug(struct kvm_vcpu *vcpu)
 	run->debug.arch.hsr_high = upper_32_bits(esr);
 	run->flags = KVM_DEBUG_ARCH_HSR_HIGH_VALID;
 
-	switch (ESR_ELx_EC(esr)) {
+	switch (ec) {
 	case ESR_ELx_EC_WATCHPT_LOW:
 		run->debug.arch.far = vcpu->arch.fault.far_el2;
 		break;

@@ -51,9 +51,8 @@ static void kvm_arm_setup_mdcr_el2(struct kvm_vcpu *vcpu)
 				MDCR_EL2_TDRA |
 				MDCR_EL2_TDOSA);
 
-	/* Is the VM being debugged by userspace? */
-	if (vcpu->guest_debug)
-		/* Route all software debug exceptions to EL2 */
+	/* Route software debug exceptions to EL2 for userspace debug or VMI BRK. */
+	if (vcpu->guest_debug || kvm_vmi_bp_monitoring(vcpu->kvm))
 		vcpu->arch.mdcr_el2 |= MDCR_EL2_TDE;
 
 	/*
@@ -169,7 +168,8 @@ void kvm_vcpu_load_debug(struct kvm_vcpu *vcpu)
 	 *  - VCPU_DEBUG_FREE: Neither of the above apply, no breakpoint/watchpoint
 	 *    context needs to be loaded on the CPU.
 	 */
-	if (vcpu->guest_debug || kvm_vcpu_os_lock_enabled(vcpu)) {
+	if (vcpu->guest_debug || kvm_vcpu_os_lock_enabled(vcpu) ||
+	    kvm_vmi_bp_monitoring(vcpu->kvm)) {
 		vcpu->arch.debug_owner = VCPU_DEBUG_HOST_OWNED;
 		setup_external_mdscr(vcpu);
 
