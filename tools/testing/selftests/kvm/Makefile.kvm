@@ -228,6 +228,7 @@ TEST_GEN_PROGS_arm64 += arm64/vmi_exec_only_test
 TEST_GEN_PROGS_arm64 += arm64/vmi_alloc_gfn_test
 TEST_GEN_PROGS_arm64 += arm64/vmi_gfn_remap_test
 TEST_GEN_PROGS_arm64 += arm64/vmi_hugepage_remap_test
+TEST_GEN_PROGS_arm64 += arm64/vmi_sysreg_test
 TEST_GEN_PROGS_arm64 += access_tracking_perf_test
 TEST_GEN_PROGS_arm64 += arch_timer
 TEST_GEN_PROGS_arm64 += coalesced_io_test

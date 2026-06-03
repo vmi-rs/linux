@@ -29,6 +29,7 @@
 #include <asm/kvm_hyp.h>
 #include <asm/kvm_mmu.h>
 #include <asm/kvm_nested.h>
+#include <asm/kvm_vmi.h>
 #include <asm/perf_event.h>
 #include <asm/sysreg.h>
 
@@ -558,21 +559,37 @@ static bool access_vm_reg(struct kvm_vcpu *vcpu,
 			  const struct sys_reg_desc *r)
 {
 	bool was_enabled = vcpu_has_cache_enabled(vcpu);
-	u64 val, mask, shift;
+	u64 val, mask, shift, old_val, new_val;
+	int vmi_idx;
 
 	BUG_ON(!p->is_write);
 
 	get_access_mask(r, &mask, &shift);
 
-	if (~mask) {
-		val = vcpu_read_sys_reg(vcpu, r->reg);
-		val &= ~mask;
-	} else {
+	old_val = vcpu_read_sys_reg(vcpu, r->reg);
+	if (~mask)
+		val = old_val & ~mask;
+	else
 		val = 0;
+
+	new_val = val | ((p->regval & (mask >> shift)) << shift);
+
+	/*
+	 * VMI: if this VM register is monitored, deliver a SYSREG event and
+	 * honor a deferred-write DENY before committing. The trap that brought
+	 * us here is force-kept by HCR_EL2.TVM (see kvm_toggle_cache /
+	 * kvm_vmi_apply_state). On DENY the write is skipped (register keeps
+	 * old_val); PC still advances via the sysreg dispatch (instruction
+	 * consumed with no effect), matching x86's skip-the-write semantics.
+	 */
+	vmi_idx = kvm_vmi_sysreg_index(r->reg);
+	if (vmi_idx >= 0 &&
+	    kvm_vmi_sysreg_write(vcpu, vmi_idx, old_val, new_val)) {
+		kvm_toggle_cache(vcpu, was_enabled);
+		return true;
 	}
 
-	val |= (p->regval & (mask >> shift)) << shift;
-	vcpu_write_sys_reg(vcpu, val, r->reg);
+	vcpu_write_sys_reg(vcpu, new_val, r->reg);
 
 	kvm_toggle_cache(vcpu, was_enabled);
 	return true;

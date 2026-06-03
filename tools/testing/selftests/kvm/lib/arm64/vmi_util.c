@@ -135,6 +135,22 @@ int vmi_control_event_err(int vmi_fd, uint32_t event, int enable)
 	return ioctl(vmi_fd, KVM_VMI_CONTROL_EVENT, &ctl);
 }
 
+void vmi_control_sysreg(int vmi_fd, uint8_t reg, uint8_t onchangeonly,
+			uint64_t bitmask, int enable)
+{
+	struct kvm_vmi_control_event ctl = {};
+	int ret;
+
+	ctl.event = KVM_VMI_EVENT_SYSREG;
+	ctl.enable = enable;
+	ctl.arch.sysreg.reg = reg;
+	ctl.arch.sysreg.onchangeonly = onchangeonly;
+	ctl.arch.sysreg.bitmask = bitmask;
+
+	ret = ioctl(vmi_fd, KVM_VMI_CONTROL_EVENT, &ctl);
+	TEST_ASSERT(ret == 0, "KVM_VMI_CONTROL_EVENT(SYSREG) failed: %d", ret);
+}
+
 int vmi_inject_event(int vmi_fd, struct kvm_vmi_inject_event *inject)
 {
 	int ret = ioctl(vmi_fd, KVM_VMI_INJECT_EVENT, inject);

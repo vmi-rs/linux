@@ -316,6 +316,33 @@ TRACE_EVENT(kvm_vmi_view_remap_fault,
 		  __entry->view_id, __entry->gfn, __entry->hpa)
 );
 
+/*
+ * Trace a monitored guest write to an EL1 VM system register (K10). @reg is a
+ * KVM_VMI_SYSREG_* index; @denied is the agent's deferred-write verdict.
+ */
+TRACE_EVENT(kvm_vmi_sysreg_write,
+	TP_PROTO(int reg, __u64 old_value, __u64 new_value, bool denied),
+	TP_ARGS(reg, old_value, new_value, denied),
+
+	TP_STRUCT__entry(
+		__field(int,	reg)
+		__field(__u64,	old_value)
+		__field(__u64,	new_value)
+		__field(bool,	denied)
+	),
+
+	TP_fast_assign(
+		__entry->reg = reg;
+		__entry->old_value = old_value;
+		__entry->new_value = new_value;
+		__entry->denied = denied;
+	),
+
+	TP_printk("sysreg %d 0x%llx -> 0x%llx %s",
+		  __entry->reg, __entry->old_value, __entry->new_value,
+		  __entry->denied ? "DENIED" : "allowed")
+);
+
 #endif /* _TRACE_KVM_VMI_H */
 
 #undef TRACE_INCLUDE_PATH

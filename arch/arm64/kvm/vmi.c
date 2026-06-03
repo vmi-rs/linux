@@ -70,6 +70,8 @@ void kvm_arch_vmi_session_cleanup(struct kvm_vmi *vmi)
  */
 void kvm_arch_vmi_session_reset(struct kvm_vmi *vmi)
 {
+	memset(vmi->arch.sysreg_monitor, 0, sizeof(vmi->arch.sysreg_monitor));
+	vmi->arch.sysreg_monitor_count = 0;
 }
 
 /**
@@ -88,6 +90,36 @@ int kvm_arch_vmi_control_event(struct kvm *kvm,
 			       struct kvm_vmi_control_event *ctrl)
 {
 	switch (ctrl->event) {
+	case KVM_VMI_EVENT_SYSREG: {
+		struct kvm_vmi *vmi = kvm_vmi_get(kvm);
+		__u8 reg = ctrl->arch.sysreg.reg;
+
+		if (reg >= KVM_VMI_NR_SYSREG_MONITORS)
+			return -EINVAL;
+
+		if (ctrl->enable) {
+			if (!vmi->arch.sysreg_monitor[reg].enabled)
+				vmi->arch.sysreg_monitor_count++;
+			vmi->arch.sysreg_monitor[reg].enabled = true;
+			vmi->arch.sysreg_monitor[reg].onchangeonly =
+				ctrl->arch.sysreg.onchangeonly;
+			vmi->arch.sysreg_monitor[reg].bitmask =
+				ctrl->arch.sysreg.bitmask;
+			vmi->enabled_events |= BIT_ULL(KVM_VMI_EVENT_SYSREG);
+		} else {
+			if (vmi->arch.sysreg_monitor[reg].enabled)
+				vmi->arch.sysreg_monitor_count--;
+			vmi->arch.sysreg_monitor[reg].enabled = false;
+			vmi->arch.sysreg_monitor[reg].onchangeonly = 0;
+			vmi->arch.sysreg_monitor[reg].bitmask = 0;
+			if (vmi->arch.sysreg_monitor_count == 0)
+				vmi->enabled_events &=
+					~BIT_ULL(KVM_VMI_EVENT_SYSREG);
+		}
+
+		kvm_arch_vmi_update(kvm);
+		return 0;
+	}
 	default:
 		return -EOPNOTSUPP;
 	}
@@ -152,6 +184,18 @@ void kvm_vmi_apply_state(struct kvm_vcpu *vcpu)
 	vcpu->arch.hw_mmu = mmu;
 	kvm_arm_vmid_update(&mmu->vmid);
 	__load_stage2(mmu, mmu->arch);
+
+	/*
+	 * VMI sysreg monitoring keeps the VM-register write trap on. This is
+	 * the apply-on-re-entry point (KVM_REQ_VMI_UPDATE), mirroring x86's
+	 * vmx_vmi_apply_vmcs_state asserting its intercepts: assert TVM when
+	 * monitoring is active (it was force-kept across kvm_toggle_cache), and
+	 * restore the default (cleared once caches are on) when it is not.
+	 */
+	if (kvm_vmi_sysreg_monitoring(vcpu->kvm))
+		*vcpu_hcr(vcpu) |= HCR_TVM;
+	else if (vcpu_has_cache_enabled(vcpu))
+		*vcpu_hcr(vcpu) &= ~HCR_TVM;
 }
 
 /*
@@ -445,6 +489,89 @@ static bool kvm_vmi_event_enabled(struct kvm_vcpu *vcpu, u32 event_type)
 	       vcpu->vmi && vcpu->vmi->ring;
 }
 
+/*
+ * Map an enum vcpu_sysreg (as seen in sys_reg_desc.reg / access_vm_reg) to its
+ * stable KVM_VMI_SYSREG_* index, or -1 if the register is not in the monitorable
+ * set. Confirmed 1:1 against the SYS_DESC entries that use access_vm_reg.
+ */
+int kvm_vmi_sysreg_index(int reg)
+{
+	switch (reg) {
+	case SCTLR_EL1:		return KVM_VMI_SYSREG_SCTLR_EL1;
+	case TTBR0_EL1:		return KVM_VMI_SYSREG_TTBR0_EL1;
+	case TTBR1_EL1:		return KVM_VMI_SYSREG_TTBR1_EL1;
+	case TCR_EL1:		return KVM_VMI_SYSREG_TCR_EL1;
+	case CONTEXTIDR_EL1:	return KVM_VMI_SYSREG_CONTEXTIDR_EL1;
+	case MAIR_EL1:		return KVM_VMI_SYSREG_MAIR_EL1;
+	default:		return -1;
+	}
+}
+
+/*
+ * True if any system register is currently monitored on @kvm. Read from the
+ * trap-keep fast paths; cheap (one count read, no array scan).
+ */
+bool kvm_vmi_sysreg_monitoring(struct kvm *kvm)
+{
+	struct kvm_vmi *vmi = kvm_vmi_get(kvm);
+
+	return vmi && vmi->arch.sysreg_monitor_count > 0;
+}
+
+/**
+ * kvm_vmi_sysreg_write - Deliver a SYSREG event for a monitored VM-reg write.
+ * @vcpu:    The vCPU performing the write (trapped in access_vm_reg).
+ * @idx:     KVM_VMI_SYSREG_* index of the register (from kvm_vmi_sysreg_index).
+ * @old_val: Current register value (before the write).
+ * @new_val: Value the guest is writing.
+ *
+ * Applies onchangeonly/bitmask filtering, builds the ring event, and blocks
+ * until the agent acks. Deferred-write pattern: return false so the caller
+ * applies the write (CONTINUE / filtered / no agent), true so the caller skips
+ * it (DENY, or SET_REGS which is deferred to K-opt6 and treated as DENY).
+ *
+ * Holds no kvm->srcu (the sysreg-trap path takes none, unlike the abort path),
+ * so it blocks on the ring directly, like kvm_vmi_hypercall.
+ */
+bool kvm_vmi_sysreg_write(struct kvm_vcpu *vcpu, int idx, u64 old_val,
+			  u64 new_val)
+{
+	struct kvm_vmi_ring_event ring_event = {};
+	struct kvm_vmi *vmi;
+	u64 changed;
+	bool denied;
+	int ret;
+
+	if (!kvm_vmi_event_enabled(vcpu, KVM_VMI_EVENT_SYSREG))
+		return false;
+
+	vmi = kvm_vmi_get(vcpu->kvm);
+	if (!vmi || !vmi->arch.sysreg_monitor[idx].enabled)
+		return false;
+
+	changed = old_val ^ new_val;
+	if (vmi->arch.sysreg_monitor[idx].onchangeonly && !changed)
+		return false;
+	if (vmi->arch.sysreg_monitor[idx].bitmask &&
+	    !(changed & vmi->arch.sysreg_monitor[idx].bitmask))
+		return false;
+
+	ring_event.type = KVM_VMI_EVENT_SYSREG;
+	ring_event.vcpu_id = vcpu->vcpu_id;
+	ring_event.insn_len = 4;	/* MSR is a 4-byte instruction */
+	ring_event.arch.sysreg.reg = idx;
+	ring_event.arch.sysreg.old_value = old_val;
+	ring_event.arch.sysreg.new_value = new_val;
+
+	ret = kvm_vmi_deliver_via_ring(vcpu, &ring_event);
+
+	/* DENY (and, until K-opt6, SET_REGS) -> skip the write. */
+	denied = (ret > 0 && (ret & (KVM_VMI_RESPONSE_DENY |
+				     KVM_VMI_RESPONSE_SET_REGS)));
+	trace_kvm_vmi_sysreg_write(idx, old_val, new_val, denied);
+	return denied;
+}
+
 /**
  * kvm_vmi_hypercall - Deliver a HYPERCALL event for a trapped guest HVC.
  * @vcpu: The vCPU that executed HVC.
@@ -548,6 +675,20 @@ void kvm_vmi_restore_regs(struct kvm_vcpu *vcpu, struct kvm_vmi_regs *regs)
 void kvm_vmi_handle_event_response(struct kvm_vcpu *vcpu, u32 event_type,
 				   u32 resp)
 {
+	switch (event_type) {
+	case KVM_VMI_EVENT_SYSREG:
+		/*
+		 * The deferred-write verdict (CONTINUE vs DENY) is applied at
+		 * the access_vm_reg() callsite via the kvm_vmi_sysreg_write()
+		 * return value, and the sysreg path's automatic PC increment
+		 * already consumes the instruction. SET_REGS for sysreg writes
+		 * is deferred (K-opt6); the generic core's GPR restore on
+		 * SET_REGS has already run, so there is nothing to do here.
+		 */
+		break;
+	default:
+		break;
+	}
 }
 
 /* kvm_inject_* return 1 when an exception was pended; normalize to 0. */
