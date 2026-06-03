@@ -264,6 +264,7 @@ static void test_guest_mmap_large_range(void)
 
 int main(int argc, char *argv[])
 {
+	vmi_force_el1_guests();
 	TEST_REQUIRE(kvm_has_cap(KVM_CAP_VMI));
 	TEST_REQUIRE(kvm_has_cap(KVM_CAP_VMI_GUEST_MMAP));
 

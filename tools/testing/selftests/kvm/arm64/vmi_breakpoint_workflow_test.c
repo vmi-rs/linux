@@ -190,6 +190,7 @@ static void run_workflow(bool use_alloc_gfn)
 
 int main(int argc, char *argv[])
 {
+	vmi_force_el1_guests();
 	TEST_REQUIRE(kvm_has_cap(KVM_CAP_VMI));
 	TEST_REQUIRE(kvm_has_cap(KVM_CAP_VMI_RING));
 

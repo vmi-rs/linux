@@ -15,6 +15,7 @@
 #include <unistd.h>
 #include <poll.h>
 #include <errno.h>
+#include <stdlib.h>
 
 #include "test_util.h"
 #include "kvm_util.h"
@@ -345,6 +346,15 @@ void *vmi_vcpu_thread_fn(void *arg)
 }
 
 /*
+ * Force VMI test guests to run at EL1 (opt out of the framework's vEL2
+ * auto-promotion on a nested host). See the declaration in vmi_util.h.
+ */
+void vmi_force_el1_guests(void)
+{
+	setenv("NV", "0", 1);
+}
+
+/*
  * Common test setup: create VM, create VMI session, setup ring.
  * Returns vmi_fd. Caller should call vmi_test_teardown() to clean up.
  */
@@ -353,6 +363,7 @@ int vmi_test_setup(struct kvm_vm **vm, struct kvm_vcpu **vcpu,
 {
 	int vmi_fd;
 
+	vmi_force_el1_guests();
 	*vm = vm_create_with_one_vcpu(vcpu, guest_fn);
 	vmi_fd = vmi_create(*vm);
 	vmi_setup_ring(vmi_fd, 0, ring);

@@ -68,6 +68,7 @@ int main(int argc, char *argv[])
 	uint32_t view_id;
 	int vmi_fd;
 
+	vmi_force_el1_guests();
 	TEST_REQUIRE(kvm_has_cap(KVM_CAP_VMI));
 	TEST_ASSERT(psz == 16384, "test assumes 16K host pages, got %zu", psz);
 

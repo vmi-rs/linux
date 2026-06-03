@@ -150,6 +150,7 @@ static void run_fast_singlestep(bool use_switch_view)
 
 int main(int argc, char *argv[])
 {
+	vmi_force_el1_guests();
 	TEST_REQUIRE(kvm_has_cap(KVM_CAP_VMI));
 	TEST_REQUIRE(kvm_has_cap(KVM_CAP_VMI_RING));
 

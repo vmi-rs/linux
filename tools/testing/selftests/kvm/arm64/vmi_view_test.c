@@ -79,6 +79,7 @@ static void test_view_create_many(void)
 
 int main(int argc, char *argv[])
 {
+	vmi_force_el1_guests();
 	TEST_REQUIRE(kvm_has_cap(KVM_CAP_VMI));
 
 	test_view_create_destroy();

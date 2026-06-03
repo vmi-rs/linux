@@ -122,6 +122,7 @@ static void test_recreate_after_release(void)
 
 int main(int argc, char *argv[])
 {
+	vmi_force_el1_guests();
 	TEST_REQUIRE(kvm_has_cap(KVM_CAP_VMI));
 
 	test_create_release();

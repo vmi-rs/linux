@@ -130,6 +130,7 @@ static void test_multi_vcpu_views(void)
 
 int main(int argc, char *argv[])
 {
+	vmi_force_el1_guests();
 	TEST_REQUIRE(kvm_has_cap(KVM_CAP_VMI));
 	test_multi_vcpu_views();
 	pr_info("PASS: vmi_view_stress\n");

@@ -33,6 +33,18 @@ struct vmi_vcpu_thread_arg {
 	volatile int done;
 };
 
+/*
+ * Force VMI test guests to run at EL1. Call before creating the VM.
+ *
+ * On a nested-capable host (kvm-arm.mode=nested) the selftest framework
+ * auto-promotes guests to vEL2 (KVM_ARM_VCPU_HAS_EL2; see vm_supports_el2()),
+ * which changes the EL1 system-register / HVC / exception-injection and
+ * stage-2 view semantics these tests rely on. VMI targets a guest OS running
+ * at EL1 (mirroring the x86 series); introspecting a vEL2 guest hypervisor
+ * (e.g. Windows with VBS) is future work. Opt out via the framework's NV knob.
+ */
+void vmi_force_el1_guests(void);
+
 int vmi_create(struct kvm_vm *vm);
 void vmi_setup_ring(int vmi_fd, uint32_t vcpu_id, struct vmi_test_ring *r);
 struct kvm_vmi_ring_event *vmi_wait_event(struct vmi_test_ring *r);

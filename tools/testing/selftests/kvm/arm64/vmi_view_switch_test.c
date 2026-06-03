@@ -73,6 +73,7 @@ static void test_view_switch_basic(void)
 
 int main(int argc, char *argv[])
 {
+	vmi_force_el1_guests();
 	TEST_REQUIRE(kvm_has_cap(KVM_CAP_VMI));
 	test_view_switch_basic();
 	pr_info("PASS: vmi_view_switch\n");

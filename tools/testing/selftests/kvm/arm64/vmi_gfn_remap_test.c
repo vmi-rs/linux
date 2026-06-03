@@ -60,6 +60,7 @@ int main(int argc, char *argv[])
 	uint32_t view_id;
 	int vmi_fd, ret;
 
+	vmi_force_el1_guests();
 	TEST_REQUIRE(kvm_has_cap(KVM_CAP_VMI));
 
 	vm = vm_create_with_one_vcpu(&vcpu, guest_main);

@@ -116,6 +116,7 @@ static void test_teardown_while_faulting(void)
 
 int main(int argc, char *argv[])
 {
+	vmi_force_el1_guests();
 	TEST_REQUIRE(kvm_has_cap(KVM_CAP_VMI));
 	test_teardown_while_faulting();
 	pr_info("PASS: vmi_teardown_race (no crash)\n");
