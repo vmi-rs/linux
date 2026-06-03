@@ -51,8 +51,12 @@ static void kvm_arm_setup_mdcr_el2(struct kvm_vcpu *vcpu)
 				MDCR_EL2_TDRA |
 				MDCR_EL2_TDOSA);
 
-	/* Route software debug exceptions to EL2 for userspace debug or VMI BRK. */
-	if (vcpu->guest_debug || kvm_vmi_bp_monitoring(vcpu->kvm))
+	/*
+	 * Route software debug exceptions to EL2 for userspace debug, VMI BRK,
+	 * or VMI single-step.
+	 */
+	if (vcpu->guest_debug || kvm_vmi_bp_monitoring(vcpu->kvm) ||
+	    kvm_vmi_singlestep_active(vcpu))
 		vcpu->arch.mdcr_el2 |= MDCR_EL2_TDE;
 
 	/*
@@ -136,7 +140,8 @@ static void setup_external_mdscr(struct kvm_vcpu *vcpu)
 							   MDSCR_EL1_MDE |
 							   MDSCR_EL1_KDE);
 
-	if (vcpu->guest_debug & KVM_GUESTDBG_SINGLESTEP)
+	if ((vcpu->guest_debug & KVM_GUESTDBG_SINGLESTEP) ||
+	    kvm_vmi_singlestep_active(vcpu))
 		mdscr |= MDSCR_EL1_SS;
 
 	if (vcpu->guest_debug & KVM_GUESTDBG_USE_HW)
@@ -169,7 +174,7 @@ void kvm_vcpu_load_debug(struct kvm_vcpu *vcpu)
 	 *    context needs to be loaded on the CPU.
 	 */
 	if (vcpu->guest_debug || kvm_vcpu_os_lock_enabled(vcpu) ||
-	    kvm_vmi_bp_monitoring(vcpu->kvm)) {
+	    kvm_vmi_bp_monitoring(vcpu->kvm) || kvm_vmi_singlestep_active(vcpu)) {
 		vcpu->arch.debug_owner = VCPU_DEBUG_HOST_OWNED;
 		setup_external_mdscr(vcpu);
 
@@ -177,7 +182,8 @@ void kvm_vcpu_load_debug(struct kvm_vcpu *vcpu)
 		 * Steal the guest's single-step state machine if userspace wants
 		 * single-step the guest.
 		 */
-		if (vcpu->guest_debug & KVM_GUESTDBG_SINGLESTEP) {
+		if ((vcpu->guest_debug & KVM_GUESTDBG_SINGLESTEP) ||
+		    kvm_vmi_singlestep_active(vcpu)) {
 			if (*vcpu_cpsr(vcpu) & DBG_SPSR_SS)
 				vcpu_clear_flag(vcpu, GUEST_SS_ACTIVE_PENDING);
 			else
@@ -205,7 +211,8 @@ void kvm_vcpu_put_debug(struct kvm_vcpu *vcpu)
 	if (has_vhe())
 		write_sysreg(*host_data_ptr(host_debug_state.mdcr_el2), mdcr_el2);
 
-	if (likely(!(vcpu->guest_debug & KVM_GUESTDBG_SINGLESTEP)))
+	if (likely(!(vcpu->guest_debug & KVM_GUESTDBG_SINGLESTEP) &&
+		   !kvm_vmi_singlestep_active(vcpu)))
 		return;
 
 	/*
@@ -222,6 +229,49 @@ void kvm_vcpu_put_debug(struct kvm_vcpu *vcpu)
 	else
 		*vcpu_cpsr(vcpu) |= DBG_SPSR_SS;
 }
+
+#ifdef CONFIG_KVM_VMI
+/*
+ * Arm or disarm VMI hardware single-step on @vcpu, materialized LIVE because
+ * under VHE MDSCR_EL1 is loaded only at vcpu_load. Called from
+ * kvm_vmi_apply_state() on KVM_REQ_VMI_UPDATE. Models VMI single-step as a
+ * host-side stepper: it shares MDSCR_EL1.SS / PSTATE.SS and the guest-SS
+ * save/restore (kvm_vcpu_load_debug/put_debug) with userspace
+ * KVM_GUESTDBG_SINGLESTEP, so the two coexist without corruption.
+ */
+void kvm_vmi_apply_singlestep(struct kvm_vcpu *vcpu)
+{
+	bool want = kvm_vmi_singlestep_active(vcpu);
+
+	/*
+	 * Skip only when nothing host-side needs managing: not arming now and
+	 * not already host-owned. Keying the skip off host-ownership (not
+	 * guest_debug) is essential for DISARM: a step armed by a prior
+	 * apply_state left the vCPU host-owned, so a later CONTINUE (want==false,
+	 * no guest_debug) MUST fall through here to clear MDSCR_EL1.SS, else the
+	 * guest keeps stepping into SOFTSTP_LOW exceptions singlestep_active no
+	 * longer claims.
+	 */
+	if (!want && !kvm_host_owns_debug_regs(vcpu))
+		return;
+
+	if (want)
+		vcpu->arch.debug_owner = VCPU_DEBUG_HOST_OWNED;
+
+	setup_external_mdscr(vcpu);	/* sets MDSCR_EL1.SS iff (want || udbg_ss) */
+
+	if (want)
+		*vcpu_cpsr(vcpu) |= DBG_SPSR_SS;
+	else if (!(vcpu->guest_debug & KVM_GUESTDBG_SINGLESTEP))
+		*vcpu_cpsr(vcpu) &= ~DBG_SPSR_SS;
+
+	if (has_vhe()) {
+		preempt_disable();
+		write_sysreg(vcpu->arch.external_mdscr_el1, mdscr_el1);
+		preempt_enable();
+	}
+}
+#endif /* CONFIG_KVM_VMI */
 
 /*
  * Updates ownership of the debug registers after a trapped guest access to a

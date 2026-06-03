@@ -211,6 +211,10 @@ static int kvm_handle_guest_debug(struct kvm_vcpu *vcpu)
 	if (ec == ESR_ELx_EC_BRK64 && kvm_vmi_bp_monitoring(vcpu->kvm))
 		return kvm_vmi_breakpoint(vcpu);
 
+	/* VMI singlestep claims the software-step exception it armed. */
+	if (ec == ESR_ELx_EC_SOFTSTP_LOW && kvm_vmi_singlestep_active(vcpu))
+		return kvm_vmi_singlestep(vcpu);
+
 	/*
 	 * Non-BRK debug classes cannot originate from the guest while VMI is
 	 * monitoring (guest debug is neutralized via VCPU_DEBUG_HOST_OWNED, see
@@ -223,7 +227,7 @@ static int kvm_handle_guest_debug(struct kvm_vcpu *vcpu)
 	 * falls through to the normal KVM_EXIT_DEBUG path.
 	 */
 	WARN_ON_ONCE(!vcpu->guest_debug && kvm_vmi_bp_monitoring(vcpu->kvm) &&
-		     ec != ESR_ELx_EC_BRK64);
+		     ec != ESR_ELx_EC_BRK64 && ec != ESR_ELx_EC_SOFTSTP_LOW);
 
 	if (!vcpu->guest_debug && forward_debug_exception(vcpu))
 		return 1;

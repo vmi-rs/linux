@@ -64,11 +64,13 @@ struct kvm_arch_vmi {
 
 /**
  * struct kvm_arch_vcpu_vmi - arm64-specific per-vCPU VMI state
- *
- * Saved single-step state and pending-event scratch. Populated by the
- * single-step / breakpoint commits; empty until then.
+ * @singlestep_active: a hardware single-step is armed/pending on this vCPU
+ *                     (set by KVM_VMI_RESPONSE_SINGLESTEP, one-shot-cleared at
+ *                     the step exit). Read from the debug fast paths to arm
+ *                     MDSCR_EL1.SS / PSTATE.SS / MDCR_EL2.TDE.
  */
 struct kvm_arch_vcpu_vmi {
+	bool singlestep_active;
 };
 
 #ifdef CONFIG_KVM_VMI
@@ -106,6 +108,18 @@ bool kvm_vmi_bp_monitoring(struct kvm *kvm);
 int  kvm_vmi_breakpoint(struct kvm_vcpu *vcpu);
 
 /*
+ * Singlestep monitoring (K12). kvm_vmi_singlestep_active() is read from the
+ * debug fast paths (kvm_arm_setup_mdcr_el2, setup_external_mdscr,
+ * kvm_vcpu_load_debug, kvm_vcpu_put_debug, kvm_vmi_apply_state) to drive
+ * hardware software-step. kvm_vmi_apply_singlestep() materializes MDSCR_EL1.SS /
+ * PSTATE.SS live (called from kvm_vmi_apply_state). kvm_vmi_singlestep()
+ * delivers a SINGLESTEP event for a step trapped to EL2.
+ */
+bool kvm_vmi_singlestep_active(struct kvm_vcpu *vcpu);
+void kvm_vmi_apply_singlestep(struct kvm_vcpu *vcpu);
+int  kvm_vmi_singlestep(struct kvm_vcpu *vcpu);
+
+/*
  * Per-GFN access enforcement for alternate views, reached from the arm64
  * stage-2 fault path (arch/arm64/kvm/mmu.c).
  */
@@ -127,6 +141,9 @@ static inline bool kvm_vmi_sysreg_write(struct kvm_vcpu *vcpu, int idx,
 					u64 old_val, u64 new_val) { return false; }
 static inline bool kvm_vmi_bp_monitoring(struct kvm *kvm) { return false; }
 static inline int  kvm_vmi_breakpoint(struct kvm_vcpu *vcpu) { return 1; }
+static inline bool kvm_vmi_singlestep_active(struct kvm_vcpu *vcpu) { return false; }
+static inline void kvm_vmi_apply_singlestep(struct kvm_vcpu *vcpu) {}
+static inline int  kvm_vmi_singlestep(struct kvm_vcpu *vcpu) { return 1; }
 static inline void kvm_vmi_clamp_view_prot(struct kvm_vcpu *vcpu, gfn_t gfn,
 					   enum kvm_pgtable_prot *prot) {}
 static inline bool kvm_vmi_view_denies(struct kvm_vcpu *vcpu, gfn_t gfn,
