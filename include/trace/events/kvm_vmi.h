@@ -17,6 +17,10 @@
 	, { KVM_VMI_EVENT_DEBUG,	"debug" }	\
 	, { KVM_VMI_EVENT_DESC_ACCESS,	"desc" }	\
 	, { KVM_VMI_EVENT_IO,		"io" }
+#elif defined(__aarch64__)
+#define kvm_vmi_event_types_arch			\
+	, { KVM_VMI_EVENT_SYSREG,	"sysreg" }	\
+	, { KVM_VMI_EVENT_BREAKPOINT,	"breakpoint" }
 #else
 #define kvm_vmi_event_types_arch
 #endif
