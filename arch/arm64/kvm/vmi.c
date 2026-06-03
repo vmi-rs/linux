@@ -224,8 +224,10 @@ void kvm_arch_vmi_reset_vcpu_state(struct kvm_vcpu *vcpu)
 {
 	struct kvm_vcpu_vmi *vcpu_vmi = vcpu->vmi;
 
-	if (vcpu_vmi)
+	if (vcpu_vmi) {
 		vcpu_vmi->arch.singlestep_active = false;
+		vcpu_vmi->fast_singlestep_active = false;
+	}
 }
 
 void kvm_arch_vmi_set_singlestep(struct kvm_vcpu *vcpu, bool enable)
@@ -731,17 +733,38 @@ int kvm_vmi_breakpoint(struct kvm_vcpu *vcpu)
 
 /*
  * Software-step exception trapped to EL2 (MDCR_EL2.TDE) for a step this vCPU
- * armed. One-shot: disarm now (the agent re-arms via RESPONSE_SINGLESTEP), then
- * deliver a SINGLESTEP event carrying the stepped-to IPA. The disarm also
- * requests KVM_REQ_VMI_UPDATE, so kvm_vmi_apply_state reconciles the final
- * (re-armed or disarmed) state after the agent responds. Always returns 1.
+ * armed. One-shot: disarm now (the agent re-arms via RESPONSE_SINGLESTEP). If
+ * this was a fast singlestep (RESPONSE_SINGLESTEP_FAST), switch back to the
+ * restore view and suppress the event. Otherwise deliver a SINGLESTEP event
+ * carrying the stepped-to IPA. The disarm also requests KVM_REQ_VMI_UPDATE, so
+ * kvm_vmi_apply_state reconciles the final (re-armed or disarmed) state after
+ * the agent responds. Always returns 1.
  */
 int kvm_vmi_singlestep(struct kvm_vcpu *vcpu)
 {
+	struct kvm_vcpu_vmi *vcpu_vmi = vcpu->vmi;
 	struct kvm_vmi_ring_event ring_event = {};
 	gpa_t gpa;
 
 	kvm_arch_vmi_set_singlestep(vcpu, false);
+
+	/*
+	 * Fast singlestep (K13): the guest executed one instruction in the
+	 * target view. Switch back to the view the vCPU was on when the event
+	 * fired and suppress the singlestep event. Checked before the
+	 * event-enabled gate below: a fast step is armed by the
+	 * SINGLESTEP_FAST response flag, not by enabling the SINGLESTEP event,
+	 * so the view MUST be restored regardless of whether SINGLESTEP
+	 * delivery is enabled. The switch-back requests KVM_REQ_VMI_UPDATE (as
+	 * does the disarm above), so kvm_vmi_apply_state reconciles the final
+	 * view + single-step state on the next entry.
+	 */
+	if (vcpu_vmi->fast_singlestep_active) {
+		kvm_vmi_vcpu_switch_view(vcpu,
+					 vcpu_vmi->fast_singlestep_restore_view);
+		vcpu_vmi->fast_singlestep_active = false;
+		return 1;
+	}
 
 	if (!kvm_vmi_event_enabled(vcpu, KVM_VMI_EVENT_SINGLESTEP))
 		return 1;
