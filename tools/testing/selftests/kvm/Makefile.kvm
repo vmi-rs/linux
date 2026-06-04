@@ -233,6 +233,7 @@ TEST_GEN_PROGS_arm64 += arm64/vmi_brk_test
 TEST_GEN_PROGS_arm64 += arm64/vmi_brk_skip_test
 TEST_GEN_PROGS_arm64 += arm64/vmi_singlestep_test
 TEST_GEN_PROGS_arm64 += arm64/vmi_fast_singlestep_test
+TEST_GEN_PROGS_arm64 += arm64/vmi_singlestep_host_leak_test
 TEST_GEN_PROGS_arm64 += arm64/vmi_breakpoint_workflow_test
 TEST_GEN_PROGS_arm64 += access_tracking_perf_test
 TEST_GEN_PROGS_arm64 += arch_timer

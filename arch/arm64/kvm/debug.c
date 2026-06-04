@@ -157,8 +157,16 @@ void kvm_vcpu_load_debug(struct kvm_vcpu *vcpu)
 	/* Must be called before kvm_vcpu_load_vhe() */
 	KVM_BUG_ON(vcpu_get_flag(vcpu, SYSREGS_ON_CPU), vcpu->kvm);
 
-	if (has_vhe())
+	if (has_vhe()) {
 		*host_data_ptr(host_debug_state.mdcr_el2) = read_sysreg(mdcr_el2);
+		/*
+		 * Snapshot the genuine host MDSCR_EL1 before any VMI single-step
+		 * setup can write the live, VHE-shared register. Restored
+		 * unconditionally in kvm_vcpu_put_debug() so the host never
+		 * resumes EL0 with a leaked MDSCR_EL1.SS.
+		 */
+		*host_data_ptr(host_debug_state.mdscr_el1) = read_sysreg(mdscr_el1);
+	}
 
 	/*
 	 * Determine which of the possible debug states we're in:
@@ -208,8 +216,19 @@ void kvm_vcpu_load_debug(struct kvm_vcpu *vcpu)
 
 void kvm_vcpu_put_debug(struct kvm_vcpu *vcpu)
 {
-	if (has_vhe())
+	if (has_vhe()) {
 		write_sysreg(*host_data_ptr(host_debug_state.mdcr_el2), mdcr_el2);
+		/*
+		 * VMI single-step may have written MDSCR_EL1.SS into the live,
+		 * VHE-shared register (kvm_vmi_apply_singlestep()). Restore the
+		 * genuine host value before the early return below: the
+		 * plain-singlestep ring-block path disarms
+		 * kvm_vmi_singlestep_active() before this runs, so the early
+		 * return would otherwise skip the restore and leave the host
+		 * resuming EL0 with single-step armed.
+		 */
+		write_sysreg(*host_data_ptr(host_debug_state.mdscr_el1), mdscr_el1);
+	}
 
 	if (likely(!(vcpu->guest_debug & KVM_GUESTDBG_SINGLESTEP) &&
 		   !kvm_vmi_singlestep_active(vcpu)))
