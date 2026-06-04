@@ -126,6 +126,7 @@ int  kvm_vmi_singlestep(struct kvm_vcpu *vcpu);
 void kvm_vmi_clamp_view_prot(struct kvm_vcpu *vcpu, gfn_t gfn,
 			     enum kvm_pgtable_prot *prot);
 bool kvm_vmi_view_denies(struct kvm_vcpu *vcpu, gfn_t gfn, u8 attempted);
+u16  kvm_vmi_view_autostep_mask(struct kvm_vcpu *vcpu, gfn_t gfn);
 int  kvm_vmi_mem_access(struct kvm_vcpu *vcpu, gpa_t gpa, u8 attempted);
 bool kvm_vmi_view_force_pte(struct kvm_vcpu *vcpu);
 bool kvm_vmi_view_remap(struct kvm_vcpu *vcpu, gfn_t gfn, hpa_t *hpa);
@@ -148,6 +149,8 @@ static inline void kvm_vmi_clamp_view_prot(struct kvm_vcpu *vcpu, gfn_t gfn,
 					   enum kvm_pgtable_prot *prot) {}
 static inline bool kvm_vmi_view_denies(struct kvm_vcpu *vcpu, gfn_t gfn,
 				       u8 attempted) { return false; }
+static inline u16 kvm_vmi_view_autostep_mask(struct kvm_vcpu *vcpu,
+					     gfn_t gfn) { return 0; }
 static inline int kvm_vmi_mem_access(struct kvm_vcpu *vcpu, gpa_t gpa,
 				     u8 attempted) { return 0; }
 static inline bool kvm_vmi_view_force_pte(struct kvm_vcpu *vcpu) { return false; }

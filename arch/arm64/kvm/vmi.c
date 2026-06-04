@@ -53,12 +53,15 @@ bool kvm_arch_vmi_has_paging_write(void)
 }
 
 /*
- * No in-kernel sub-page auto-step on arm64 yet, so report it unsupported and
- * let the generic core reject a nonzero KVM_VMI_SET_MEM_ACCESS autostep_mask.
+ * arm64 can retire a denied data access in the kernel by single-stepping it on
+ * the default view (the fast-singlestep machinery). This backs the
+ * KVM_VMI_SET_MEM_ACCESS autostep_mask, which lets a 16K stage-2 leaf hide a
+ * breakpoint without storming userspace on every access to the guest-4K pages
+ * fused into the same host page.
  */
 bool kvm_arch_vmi_has_auto_step(void)
 {
-	return false;
+	return true;
 }
 
 void kvm_arch_vmi_session_init(struct kvm_vmi *vmi)
@@ -419,6 +422,30 @@ bool kvm_vmi_view_denies(struct kvm_vcpu *vcpu, gfn_t gfn, u8 attempted)
 	if (!view)
 		return false;
 	return (kvm_vmi_view_gfn_access(view, gfn) & attempted) != attempted;
+}
+
+/*
+ * Sub-page auto-step mask for @gfn in the vCPU's active view: the set of 4K
+ * sub-pages (within the host page) whose denied data accesses the abort path
+ * single-steps in the kernel instead of delivering MEM_ACCESS. The mask is
+ * packed above the access byte in the access_overrides value entry (see
+ * kvm_vmi_set_gfn_access). Returns 0 on view 0 or when @gfn has no override.
+ */
+u16 kvm_vmi_view_autostep_mask(struct kvm_vcpu *vcpu, gfn_t gfn)
+{
+	struct kvm_vcpu_vmi *vcpu_vmi = vcpu->vmi;
+	struct kvm_vmi_view_data *view;
+	void *entry;
+
+	if (!vcpu_vmi)
+		return 0;
+	view = vcpu_vmi->current_view;
+	if (!view)
+		return 0;
+	entry = xa_load(&view->access_overrides, gfn);
+	if (!entry)
+		return 0;
+	return (xa_to_value(entry) >> 8) & 0xffff;
 }
 
 /*

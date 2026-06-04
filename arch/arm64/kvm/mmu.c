@@ -2182,28 +2182,49 @@ int kvm_handle_guest_abort(struct kvm_vcpu *vcpu)
 			       is_write      ? KVM_VMI_ACCESS_W : KVM_VMI_ACCESS_R;
 
 		if (kvm_vmi_view_denies(vcpu, fault_ipa >> PAGE_SHIFT, attempted)) {
-			int resp;
+			u16 autostep = kvm_vmi_view_autostep_mask(vcpu,
+						fault_ipa >> PAGE_SHIFT);
+			unsigned int subpage = (fault_ipa & (PAGE_SIZE - 1)) >> 12;
 
-			srcu_read_unlock(&vcpu->kvm->srcu, idx);
-			resp = kvm_vmi_mem_access(vcpu, fault_ipa, attempted);
-			idx = srcu_read_lock(&vcpu->kvm->srcu);
+			if (attempted != KVM_VMI_ACCESS_X &&
+			    (autostep & (1u << subpage))) {
+				/*
+				 * 16K/4K page fusion: this 4K sub-page is a
+				 * neighbor of a protected page sharing the same
+				 * stage-2 leaf, not the access the agent wants
+				 * to see. Retire it in the kernel by single-
+				 * stepping on the default view - no MEM_ACCESS
+				 * ring round-trip - then fall through so
+				 * user_mem_abort maps the leaf on view 0 (as the
+				 * SINGLESTEP_FAST response path does). The arch
+				 * single-step handler restores the alt view
+				 * afterwards.
+				 */
+				kvm_vmi_begin_fast_singlestep(vcpu, 0);
+			} else {
+				int resp;
 
-			if (resp & KVM_VMI_RESPONSE_DENY) {
-				kvm_inject_dabt_with_fsc(vcpu, is_exec_fault,
-							 fault_ipa,
-							 ESR_ELx_FSC_PERM_L(3),
-							 is_write);
-				ret = 1;
-				goto out_unlock;
+				srcu_read_unlock(&vcpu->kvm->srcu, idx);
+				resp = kvm_vmi_mem_access(vcpu, fault_ipa, attempted);
+				idx = srcu_read_lock(&vcpu->kvm->srcu);
+
+				if (resp & KVM_VMI_RESPONSE_DENY) {
+					kvm_inject_dabt_with_fsc(vcpu, is_exec_fault,
+								 fault_ipa,
+								 ESR_ELx_FSC_PERM_L(3),
+								 is_write);
+					ret = 1;
+					goto out_unlock;
+				}
+				/*
+				 * CONTINUE: fall through; the leaf is (re)mapped
+				 * with the view's current perms (clamped in
+				 * user_mem_abort). If the agent did not widen
+				 * access via KVM_VMI_SET_MEM_ACCESS the access
+				 * faults again - breaking that loop is the
+				 * agent's responsibility.
+				 */
 			}
-			/*
-			 * CONTINUE: fall through; the leaf is (re)mapped with the
-			 * view's current perms (clamped in user_mem_abort). If the
-			 * agent did not widen access via KVM_VMI_SET_MEM_ACCESS the
-			 * access faults again - breaking that loop is the agent's
-			 * responsibility (no in-kernel singlestep escape on arm64
-			 * yet).
-			 */
 		}
 	}
 

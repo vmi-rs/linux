@@ -218,6 +218,22 @@ void vmi_set_mem_access(int vmi_fd, uint32_t view_id, uint64_t gfn,
 	TEST_ASSERT(ret == 0, "KVM_VMI_SET_MEM_ACCESS failed: %d", ret);
 }
 
+void vmi_set_mem_access_autostep(int vmi_fd, uint32_t view_id, uint64_t gfn,
+				 uint8_t access, uint16_t autostep_mask)
+{
+	struct kvm_vmi_mem_access ma = {};
+	int ret;
+
+	ma.view_id = view_id;
+	ma.access = access;
+	ma.gfn = gfn;
+	ma.autostep_mask = autostep_mask;
+
+	ret = ioctl(vmi_fd, KVM_VMI_SET_MEM_ACCESS, &ma);
+	TEST_ASSERT(ret == 0, "KVM_VMI_SET_MEM_ACCESS(autostep) failed: %d errno=%d",
+		    ret, errno);
+}
+
 int __vmi_change_gfn_err(int vmi_fd, uint32_t view_id, uint64_t old_gfn,
 			 uint64_t new_gfn)
 {
