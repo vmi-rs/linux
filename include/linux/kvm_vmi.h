@@ -118,6 +118,13 @@ int kvm_vmi_deliver_via_ring(struct kvm_vcpu *vcpu,
 
 /* View management */
 int kvm_vmi_vcpu_switch_view(struct kvm_vcpu *vcpu, u32 view_id);
+/*
+ * Begin an in-kernel fast single-step: run one instruction in @target_view,
+ * then auto-switch back to the view the vCPU is on now and suppress the
+ * single-step event. Used by the SINGLESTEP_FAST response and by arch fault
+ * handlers that retire a denied access without a userspace round-trip.
+ */
+void kvm_vmi_begin_fast_singlestep(struct kvm_vcpu *vcpu, u32 target_view);
 void kvm_vmi_propagate_change(struct kvm *kvm, gfn_t start, gfn_t end);
 
 /* Pause support (called from vcpu_run) */
@@ -135,6 +142,12 @@ int kvm_vmi_inject_event(struct kvm_vcpu *vcpu,
 /* Arch callbacks (generic -> arch contract) */
 bool kvm_arch_vmi_supported(void);
 bool kvm_arch_vmi_has_paging_write(void);
+/*
+ * True if the arch can single-step a denied data access in the kernel (the
+ * KVM_VMI_SET_MEM_ACCESS autostep_mask). Gates the uapi so an unsupporting arch
+ * rejects a nonzero mask. See struct kvm_vmi_mem_access::autostep_mask.
+ */
+bool kvm_arch_vmi_has_auto_step(void);
 
 void kvm_arch_vmi_session_init(struct kvm_vmi *vmi);
 void kvm_arch_vmi_session_cleanup(struct kvm_vmi *vmi);

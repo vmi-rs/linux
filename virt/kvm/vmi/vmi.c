@@ -207,6 +207,31 @@ void kvm_vmi_vcpu_destroy(struct kvm_vcpu *vcpu)
 }
 
 /**
+ * kvm_vmi_begin_fast_singlestep - Arm a one-shot single-step in another view
+ * @vcpu: The vCPU to single-step.
+ * @target_view: View to run the single instruction in (0 = default/host view).
+ *
+ * Remembers the current view, arms a one-shot hardware single-step, and
+ * switches to @target_view. The vCPU executes one instruction there; the arch
+ * single-step handler then switches back to the remembered view and suppresses
+ * the single-step event. Used both by the KVM_VMI_RESPONSE_SINGLESTEP_FAST
+ * response and by arch fault handlers that retire a denied access in the kernel
+ * without a userspace round-trip.
+ */
+void kvm_vmi_begin_fast_singlestep(struct kvm_vcpu *vcpu, u32 target_view)
+{
+	struct kvm_vcpu_vmi *vcpu_vmi = vcpu->vmi;
+
+	if (!vcpu_vmi)
+		return;
+
+	vcpu_vmi->fast_singlestep_active = true;
+	vcpu_vmi->fast_singlestep_restore_view = vcpu_vmi->current_view_id;
+	kvm_arch_vmi_set_singlestep(vcpu, true);
+	kvm_vmi_vcpu_switch_view(vcpu, target_view);
+}
+
+/**
  * kvm_vmi_apply_ring_response - Apply agent response from ring event
  * @vcpu: The vCPU whose event was processed.
  * @event: The ring event slot containing the agent's response.
@@ -246,17 +271,12 @@ static int kvm_vmi_apply_ring_response(struct kvm_vcpu *vcpu,
 	if ((resp & KVM_VMI_RESPONSE_SINGLESTEP_FAST) && vcpu_vmi) {
 		u32 target_view;
 
-		vcpu_vmi->fast_singlestep_active = true;
-		vcpu_vmi->fast_singlestep_restore_view =
-			vcpu_vmi->current_view_id;
-		kvm_arch_vmi_set_singlestep(vcpu, true);
-
 		if (resp & KVM_VMI_RESPONSE_SWITCH_VIEW)
 			target_view = READ_ONCE(event->view_id);
 		else
 			target_view = 0;
 
-		kvm_vmi_vcpu_switch_view(vcpu, target_view);
+		kvm_vmi_begin_fast_singlestep(vcpu, target_view);
 	} else if (resp & KVM_VMI_RESPONSE_SWITCH_VIEW) {
 		u32 view_id = READ_ONCE(event->view_id);
 
@@ -666,12 +686,21 @@ static int kvm_vmi_validate_access(u8 access)
 
 static void kvm_vmi_set_gfn_access(struct kvm *kvm,
 				    struct kvm_vmi_view_data *view,
-				    u32 view_id, u64 gfn, u8 access)
+				    u32 view_id, u64 gfn, u8 access,
+				    u16 autostep_mask)
 {
+	/*
+	 * Pack the sub-page auto-step mask above the access byte in the same
+	 * xarray value entry. Readers that only want the access mask the low
+	 * byte (xa_to_value cast to u8), so this is invisible to them and to
+	 * arches that never set a mask. See struct kvm_vmi_mem_access.
+	 */
+	unsigned long val = access | ((unsigned long)autostep_mask << 8);
+
 	trace_kvm_vmi_set_mem_access(view_id, gfn, access);
 
 	xa_store(&view->access_overrides, gfn,
-		 xa_mk_value(access), GFP_KERNEL);
+		 xa_mk_value(val), GFP_KERNEL);
 
 	if (kvm_arch_vmi_view_has_root(view))
 		kvm_arch_vmi_invalidate_gfn(kvm, view, gfn);
@@ -707,7 +736,7 @@ static int kvm_vmi_set_mem_access_batch(struct kvm *kvm,
 			goto out;
 
 		kvm_vmi_set_gfn_access(kvm, view, ma->view_id,
-				       gfns[i], accesses[i]);
+				       gfns[i], accesses[i], 0);
 	}
 
 	ret = 0;
@@ -738,8 +767,12 @@ static int kvm_vmi_set_mem_access(struct kvm *kvm, struct kvm_vmi_mem_access *ma
 		if (ret)
 			return ret;
 
+		/* In-kernel sub-page auto-step is arch-gated (see autostep_mask). */
+		if (ma->autostep_mask && !kvm_arch_vmi_has_auto_step())
+			return -EOPNOTSUPP;
+
 		kvm_vmi_set_gfn_access(kvm, view, ma->view_id,
-				       ma->gfn, ma->access);
+				       ma->gfn, ma->access, ma->autostep_mask);
 	} else {
 		ret = kvm_vmi_set_mem_access_batch(kvm, view, ma);
 		if (ret)

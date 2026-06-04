@@ -536,6 +536,16 @@ bool kvm_arch_vmi_has_paging_write(void)
 	return kvm_x86_call(vmi_has_ept_paging_write)();
 }
 
+/*
+ * x86 EPT uses 4K leaves matching the guest granule, so a view's per-GFN
+ * protection never spills onto neighbor guest pages -- there is no fusion to
+ * absorb. The autostep_mask is unnecessary; report unsupported.
+ */
+bool kvm_arch_vmi_has_auto_step(void)
+{
+	return false;
+}
+
 void kvm_arch_vmi_session_init(struct kvm_vmi *vmi)
 {
 	xa_init(&vmi->arch.msr_monitor);

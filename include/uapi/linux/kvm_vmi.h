@@ -173,7 +173,22 @@ struct kvm_vmi_mem_access {
 		struct {
 			__u64 gfn;
 			__u8  access;
-			__u8  pad[7];
+			__u8  pad;
+			/*
+			 * Sub-page auto-step mask (single-GFN mode). Bit i set means
+			 * the 4K sub-page at offset i*4K within @gfn's host page is
+			 * single-stepped in the kernel on a denied data access instead
+			 * of delivering a KVM_VMI_EVENT_MEM_ACCESS. Used on hosts whose
+			 * page size exceeds the guest granule (e.g. 16K host / 4K
+			 * guest), where one stage-2 leaf fuses several guest pages: it
+			 * lets a breakpoint's neighbor pages be handled in-kernel while
+			 * the breakpoint's own sub-page still delivers. 0 = deliver all
+			 * (default). 16 bits cover up to a 64K host page. Requires arch
+			 * auto-step support (KVM_VMI_SET_MEM_ACCESS returns -EOPNOTSUPP
+			 * otherwise).
+			 */
+			__u16 autostep_mask;
+			__u8  pad2[4];
 		};
 		struct {
 			__u64 gfns_uaddr;

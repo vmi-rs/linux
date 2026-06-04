@@ -52,6 +52,15 @@ bool kvm_arch_vmi_has_paging_write(void)
 	return false;
 }
 
+/*
+ * No in-kernel sub-page auto-step on arm64 yet, so report it unsupported and
+ * let the generic core reject a nonzero KVM_VMI_SET_MEM_ACCESS autostep_mask.
+ */
+bool kvm_arch_vmi_has_auto_step(void)
+{
+	return false;
+}
+
 void kvm_arch_vmi_session_init(struct kvm_vmi *vmi)
 {
 }
