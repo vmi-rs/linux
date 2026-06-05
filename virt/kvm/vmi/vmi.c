@@ -1453,6 +1453,21 @@ static int kvm_vmi_switch_view(struct kvm *kvm,
 		vcpu_vmi->current_view = new_view;
 
 		/*
+		 * A vCPU mid in-kernel fast-singlestep has snapshotted the view
+		 * to return to when the step completes. An explicit VM-wide
+		 * switch supersedes that intent: redirect the pending restore to
+		 * the new view so the completing step does not resurrect the
+		 * vCPU onto the view the agent just switched away from. Without
+		 * this, a teardown switch to view 0 is silently undone by the
+		 * restore, leaving the vCPU on the old (alternate) view after
+		 * breakpoint monitoring has been disabled, so the next planted
+		 * BRK is delivered to the guest instead of the agent and the
+		 * old view cannot be destroyed (its vcpu_count never drops).
+		 */
+		if (vcpu_vmi->fast_singlestep_active)
+			vcpu_vmi->fast_singlestep_restore_view = sv->view_id;
+
+		/*
 		 * When switching back to view 0, ask the arch layer
 		 * to reload the host page table root on next entry.
 		 */
