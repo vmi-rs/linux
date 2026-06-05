@@ -181,6 +181,7 @@ int kvm_vmi_vcpu_init(struct kvm_vcpu *vcpu)
 
 	vcpu_vmi->current_view_id = 0; /* Default to host view */
 
+	spin_lock_init(&vcpu_vmi->view_lock);
 	init_waitqueue_head(&vcpu_vmi->wq);
 	init_waitqueue_head(&vcpu_vmi->pause_wq);
 	atomic_set(&vcpu_vmi->pause_count, 0);
@@ -206,6 +207,8 @@ void kvm_vmi_vcpu_destroy(struct kvm_vcpu *vcpu)
 	vcpu->vmi = NULL;
 }
 
+static int __kvm_vmi_vcpu_switch_view_locked(struct kvm_vcpu *vcpu, u32 view_id);
+
 /**
  * kvm_vmi_begin_fast_singlestep - Arm a one-shot single-step in another view
  * @vcpu: The vCPU to single-step.
@@ -217,6 +220,10 @@ void kvm_vmi_vcpu_destroy(struct kvm_vcpu *vcpu)
  * the single-step event. Used both by the KVM_VMI_RESPONSE_SINGLESTEP_FAST
  * response and by arch fault handlers that retire a denied access in the kernel
  * without a userspace round-trip.
+ *
+ * The whole arm sequence runs under view_lock so the snapshot of the current
+ * view (the restore target) and the switch to @target_view are atomic with
+ * respect to a concurrent VM-wide switch.
  */
 void kvm_vmi_begin_fast_singlestep(struct kvm_vcpu *vcpu, u32 target_view)
 {
@@ -225,10 +232,46 @@ void kvm_vmi_begin_fast_singlestep(struct kvm_vcpu *vcpu, u32 target_view)
 	if (!vcpu_vmi)
 		return;
 
+	spin_lock(&vcpu_vmi->view_lock);
 	vcpu_vmi->fast_singlestep_active = true;
 	vcpu_vmi->fast_singlestep_restore_view = vcpu_vmi->current_view_id;
 	kvm_arch_vmi_set_singlestep(vcpu, true);
-	kvm_vmi_vcpu_switch_view(vcpu, target_view);
+	__kvm_vmi_vcpu_switch_view_locked(vcpu, target_view);
+	spin_unlock(&vcpu_vmi->view_lock);
+}
+
+/**
+ * kvm_vmi_complete_fast_singlestep - Finish an in-kernel fast single-step
+ * @vcpu: The vCPU whose single-step just completed.
+ *
+ * If a fast single-step is armed, switch back to the recorded restore view and
+ * disarm it. Runs under view_lock so the read of the restore target, the
+ * switch-back, and clearing the armed flag are atomic with respect to a
+ * concurrent VM-wide switch: an explicit VM-wide switch either fully precedes
+ * this (and has already redirected the restore target) or fully follows it
+ * (and observes the disarmed state) -- it can never land in the middle and
+ * resurrect a refcount on a view the agent is tearing down.
+ *
+ * Return: true if a fast single-step was active and was completed here.
+ */
+bool kvm_vmi_complete_fast_singlestep(struct kvm_vcpu *vcpu)
+{
+	struct kvm_vcpu_vmi *vcpu_vmi = vcpu->vmi;
+	bool was_active;
+
+	if (!vcpu_vmi)
+		return false;
+
+	spin_lock(&vcpu_vmi->view_lock);
+	was_active = vcpu_vmi->fast_singlestep_active;
+	if (was_active) {
+		__kvm_vmi_vcpu_switch_view_locked(vcpu,
+					vcpu_vmi->fast_singlestep_restore_view);
+		vcpu_vmi->fast_singlestep_active = false;
+	}
+	spin_unlock(&vcpu_vmi->view_lock);
+
+	return was_active;
 }
 
 /**
@@ -389,22 +432,25 @@ int kvm_vmi_deliver_via_ring(struct kvm_vcpu *vcpu,
 	return kvm_vmi_apply_ring_response(vcpu, slot);
 }
 
-/**
- * kvm_vmi_vcpu_switch_view - Switch a vCPU to an alternate memory view
- * @vcpu: The target vCPU.
- * @view_id: The view ID to switch to (0 = host view).
+/*
+ * __kvm_vmi_vcpu_switch_view_locked - Core per-vCPU view switch.
+ *
+ * Does the refcount bookkeeping, the arch-specific stage-2/EPTP switch, and
+ * updates current_view. The caller must hold @vcpu->vmi->view_lock so this
+ * cannot interleave with a concurrent VM-wide KVM_VMI_SWITCH_VIEW; that
+ * serialization is what keeps the view refcounts consistent (see
+ * struct kvm_vcpu_vmi::view_lock).
  *
  * Return: 0 on success, negative errno on failure.
  */
-int kvm_vmi_vcpu_switch_view(struct kvm_vcpu *vcpu, u32 view_id)
+static int __kvm_vmi_vcpu_switch_view_locked(struct kvm_vcpu *vcpu, u32 view_id)
 {
 	struct kvm_vmi *vmi = vcpu->kvm->vmi;
 	struct kvm_vcpu_vmi *vcpu_vmi = vcpu->vmi;
 	struct kvm_vmi_view_data *new_view, *old_view;
 	u32 old_view_id;
 
-	if (!vmi || !vcpu_vmi)
-		return -EINVAL;
+	lockdep_assert_held(&vcpu_vmi->view_lock);
 
 	old_view_id = vcpu_vmi->current_view_id;
 
@@ -436,6 +482,27 @@ int kvm_vmi_vcpu_switch_view(struct kvm_vcpu *vcpu, u32 view_id)
 	vcpu_vmi->current_view_id = view_id;
 	vcpu_vmi->current_view = new_view;
 	return 0;
+}
+
+/**
+ * kvm_vmi_vcpu_switch_view - Switch a vCPU to an alternate memory view
+ * @vcpu: The target vCPU.
+ * @view_id: The view ID to switch to (0 = host view).
+ *
+ * Return: 0 on success, negative errno on failure.
+ */
+int kvm_vmi_vcpu_switch_view(struct kvm_vcpu *vcpu, u32 view_id)
+{
+	struct kvm_vcpu_vmi *vcpu_vmi = vcpu->vmi;
+	int ret;
+
+	if (!vcpu->kvm->vmi || !vcpu_vmi)
+		return -EINVAL;
+
+	spin_lock(&vcpu_vmi->view_lock);
+	ret = __kvm_vmi_vcpu_switch_view_locked(vcpu, view_id);
+	spin_unlock(&vcpu_vmi->view_lock);
+	return ret;
 }
 
 /**
@@ -1436,9 +1503,21 @@ static int kvm_vmi_switch_view(struct kvm *kvm,
 		if (!vcpu_vmi)
 			continue;
 
+		/*
+		 * Serialize this VM-wide mutation against the vCPU's own view
+		 * switches (fast-singlestep completion and ring-response
+		 * switches run on the vCPU thread). Without it the refcount
+		 * update and the restore-target redirect below race those
+		 * paths, and a fast-singlestep completing in the window can
+		 * resurrect a refcount on the view we are switching away from.
+		 */
+		spin_lock(&vcpu_vmi->view_lock);
+
 		old_view_id = vcpu_vmi->current_view_id;
-		if (sv->view_id == old_view_id)
+		if (sv->view_id == old_view_id) {
+			spin_unlock(&vcpu_vmi->view_lock);
 			continue;
+		}
 
 		/* Update refcounts */
 		if (old_view_id != 0) {
@@ -1463,6 +1542,8 @@ static int kvm_vmi_switch_view(struct kvm *kvm,
 		 * breakpoint monitoring has been disabled, so the next planted
 		 * BRK is delivered to the guest instead of the agent and the
 		 * old view cannot be destroyed (its vcpu_count never drops).
+		 * The view_lock above makes this redirect atomic with the
+		 * completion's read of the restore target.
 		 */
 		if (vcpu_vmi->fast_singlestep_active)
 			vcpu_vmi->fast_singlestep_restore_view = sv->view_id;
@@ -1473,6 +1554,8 @@ static int kvm_vmi_switch_view(struct kvm *kvm,
 		 */
 		if (sv->view_id == 0 && old_view_id != 0)
 			kvm_arch_vmi_reset_view(vcpu);
+
+		spin_unlock(&vcpu_vmi->view_lock);
 	}
 
 	/* Schedule VMCS sync + kick on all vCPUs */

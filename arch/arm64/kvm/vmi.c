@@ -778,7 +778,6 @@ int kvm_vmi_breakpoint(struct kvm_vcpu *vcpu)
  */
 int kvm_vmi_singlestep(struct kvm_vcpu *vcpu)
 {
-	struct kvm_vcpu_vmi *vcpu_vmi = vcpu->vmi;
 	struct kvm_vmi_ring_event ring_event = {};
 	gpa_t gpa;
 
@@ -793,14 +792,11 @@ int kvm_vmi_singlestep(struct kvm_vcpu *vcpu)
 	 * so the view MUST be restored regardless of whether SINGLESTEP
 	 * delivery is enabled. The switch-back requests KVM_REQ_VMI_UPDATE (as
 	 * does the disarm above), so kvm_vmi_apply_state reconciles the final
-	 * view + single-step state on the next entry.
+	 * view + single-step state on the next entry. The completion runs under
+	 * the per-vCPU view_lock so it cannot race a concurrent VM-wide switch.
 	 */
-	if (vcpu_vmi->fast_singlestep_active) {
-		kvm_vmi_vcpu_switch_view(vcpu,
-					 vcpu_vmi->fast_singlestep_restore_view);
-		vcpu_vmi->fast_singlestep_active = false;
+	if (kvm_vmi_complete_fast_singlestep(vcpu))
 		return 1;
-	}
 
 	if (!kvm_vmi_event_enabled(vcpu, KVM_VMI_EVENT_SINGLESTEP))
 		return 1;

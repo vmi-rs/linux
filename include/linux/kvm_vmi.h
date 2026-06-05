@@ -7,6 +7,7 @@
 
 #include <linux/types.h>
 #include <linux/mutex.h>
+#include <linux/spinlock.h>
 #include <linux/xarray.h>
 #include <linux/atomic.h>
 #include <linux/wait.h>
@@ -66,11 +67,19 @@ struct kvm_vmi {
 
 /**
  * struct kvm_vcpu_vmi - Per-vCPU VMI state
+ * @view_lock: Serializes all transitions of this vCPU's view state
+ *	(@current_view_id, @current_view, the view refcounts, and the
+ *	fast-singlestep restore target) so the VM-wide KVM_VMI_SWITCH_VIEW
+ *	ioctl thread cannot interleave with the vCPU's own switches
+ *	(fast-singlestep completion / ring response). Without it a vCPU
+ *	completing a fast-singlestep can resurrect a refcount on a view the
+ *	agent just switched away from, leaking it (destroy_view -EBUSY).
  * @current_view_id: ID of the memory view this vCPU is currently on.
  * @current_view: Pointer to current alternate view (NULL when on view 0).
  * @arch: Architecture-specific per-vCPU VMI state.
  */
 struct kvm_vcpu_vmi {
+	spinlock_t view_lock;
 	u32 current_view_id;
 	struct kvm_vmi_view_data *current_view; /* NULL when on view 0 */
 
@@ -125,6 +134,13 @@ int kvm_vmi_vcpu_switch_view(struct kvm_vcpu *vcpu, u32 view_id);
  * handlers that retire a denied access without a userspace round-trip.
  */
 void kvm_vmi_begin_fast_singlestep(struct kvm_vcpu *vcpu, u32 target_view);
+/*
+ * Complete an in-kernel fast single-step: if one is armed, switch back to the
+ * recorded restore view and disarm it, serialized against a concurrent VM-wide
+ * switch. Returns true if a fast single-step was active (and was completed),
+ * false otherwise. Called from the arch single-step exit handler.
+ */
+bool kvm_vmi_complete_fast_singlestep(struct kvm_vcpu *vcpu);
 void kvm_vmi_propagate_change(struct kvm *kvm, gfn_t start, gfn_t end);
 
 /* Pause support (called from vcpu_run) */
