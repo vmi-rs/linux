@@ -826,7 +826,6 @@ EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_vmi_desc_intercept);
  */
 int kvm_vmi_singlestep(struct kvm_vcpu *vcpu)
 {
-	struct kvm_vcpu_vmi *vcpu_vmi = vcpu->vmi;
 	struct kvm_vmi_ring_event ring_event = {};
 	struct x86_exception exception;
 	gva_t rip;
@@ -838,14 +837,11 @@ int kvm_vmi_singlestep(struct kvm_vcpu *vcpu)
 	/*
 	 * Fast singlestep: the guest executed one instruction in the
 	 * target view. Switch back to the original view and suppress
-	 * the singlestep event.
+	 * the singlestep event. Runs under the per-vCPU view_lock so the
+	 * switch-back cannot race a concurrent VM-wide KVM_VMI_SWITCH_VIEW.
 	 */
-	if (vcpu_vmi->fast_singlestep_active) {
-		kvm_vmi_vcpu_switch_view(vcpu,
-					 vcpu_vmi->fast_singlestep_restore_view);
-		vcpu_vmi->fast_singlestep_active = false;
+	if (kvm_vmi_complete_fast_singlestep(vcpu))
 		return 1;
-	}
 
 	/* Deliver singlestep event if monitoring is enabled */
 	if (!kvm_vmi_event_enabled(vcpu, KVM_VMI_EVENT_SINGLESTEP))
