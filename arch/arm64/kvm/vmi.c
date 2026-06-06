@@ -185,9 +185,24 @@ void kvm_vmi_apply_state(struct kvm_vcpu *vcpu)
 	 * we must reprogram VTTBR_EL2/VTCR_EL2 now, before the next entry.
 	 * Update the view's VMID first (kvm_get_vttbr reads mmu->vmid.id);
 	 * distinct per-view VMIDs mean no TLB flush is needed on switch.
+	 *
+	 * Do this under the per-vCPU view_lock. A VM-wide KVM_VMI_SWITCH_VIEW
+	 * takes the same lock to drop this view's vcpu_count and NULL
+	 * current_view; holding it here keeps the current_view read and the
+	 * __load_stage2 below atomic against that switch, so
+	 * kvm_vmi_destroy_view() cannot kfree the view in between - a
+	 * use-after-free that would load a freed stage-2 root, a random guest
+	 * reset. Under the lock we either load the view while its vcpu_count is
+	 * still raised (so a concurrent destroy returns -EBUSY) or observe
+	 * current_view_id == 0. The e06638c view_lock serialized fast-singlestep
+	 * completion against the switch but left this apply - the actual hw
+	 * load - outside the lock.
 	 */
+	if (vcpu_vmi)
+		spin_lock(&vcpu_vmi->view_lock);
+
 	if (vcpu_vmi && vcpu_vmi->current_view_id != 0) {
-		struct kvm_vmi_view_data *view = READ_ONCE(vcpu_vmi->current_view);
+		struct kvm_vmi_view_data *view = vcpu_vmi->current_view;
 
 		if (view && view->arch.mmu)
 			mmu = view->arch.mmu;
@@ -196,6 +211,9 @@ void kvm_vmi_apply_state(struct kvm_vcpu *vcpu)
 	vcpu->arch.hw_mmu = mmu;
 	kvm_arm_vmid_update(&mmu->vmid);
 	__load_stage2(mmu, mmu->arch);
+
+	if (vcpu_vmi)
+		spin_unlock(&vcpu_vmi->view_lock);
 
 	/*
 	 * VMI sysreg monitoring keeps the VM-register write trap on. This is
@@ -277,6 +295,24 @@ int kvm_arch_vmi_create_view(struct kvm *kvm, struct kvm_vmi_view_data *view)
 
 void kvm_arch_vmi_destroy_view(struct kvm *kvm, struct kvm_vmi_view_data *view)
 {
+	/*
+	 * The generic caller has already erased this view from vmi->views (no
+	 * vCPU can switch to it now) and verified vcpu_count == 0 (every vCPU
+	 * has switched away in software). But arm64 loads the stage-2 into
+	 * VTTBR_EL2 lazily in kvm_vmi_apply_state() via KVM_REQ_VMI_UPDATE, so a
+	 * vCPU kicked off this view may still be executing in the guest on its
+	 * old hardware VTTBR, and an in-flight stage-2 abort handler may still
+	 * be walking this view's tables under mmu_lock. Freeing now would let
+	 * the guest run on a freed stage-2 (a silent firmware reset) or fault
+	 * the walker. Force every vCPU out of guest mode so none runs on this
+	 * view's VTTBR, then cycle mmu_lock to drain any in-flight fault that
+	 * captured this view's root, before freeing. Mirrors kvm_vmi_release()
+	 * and x86's vmx_vmi_destroy_view().
+	 */
+	kvm_make_all_cpus_request(kvm, KVM_REQ_OUTSIDE_GUEST_MODE);
+	write_lock(&kvm->mmu_lock);
+	write_unlock(&kvm->mmu_lock);
+
 	kvm_free_stage2_pgd(view->arch.mmu);
 	kfree(view->arch.mmu);
 	view->arch.mmu = NULL;
