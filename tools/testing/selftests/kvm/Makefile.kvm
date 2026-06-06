@@ -223,6 +223,7 @@ TEST_GEN_PROGS_arm64 += arm64/vmi_view_switch_test
 TEST_GEN_PROGS_arm64 += arm64/vmi_view_stress_test
 TEST_GEN_PROGS_arm64 += arm64/vmi_teardown_race_test
 TEST_GEN_PROGS_arm64 += arm64/vmi_mem_access_test
+TEST_GEN_PROGS_arm64 += arm64/vmi_mem_info_test
 TEST_GEN_PROGS_arm64 += arm64/vmi_default_access_test
 TEST_GEN_PROGS_arm64 += arm64/vmi_exec_only_test
 TEST_GEN_PROGS_arm64 += arm64/vmi_alloc_gfn_test
