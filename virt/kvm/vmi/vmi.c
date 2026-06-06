@@ -1817,6 +1817,37 @@ out:
 	return 0;
 }
 
+/*
+ * KVM_VMI_GET_MEM_INFO: report the guest RAM extent.
+ *
+ * Returns the exclusive upper-bound GFN of guest RAM, the maximum of
+ * base_gfn + npages over all memslots. The agent rejects reads of frames at or
+ * above this bound (which the VMM did not back with RAM) instead of faulting
+ * the vmi_fd mmap. KVM has no memslot-enumeration ioctl, so the agent cannot
+ * otherwise learn the layout the VMM programmed.
+ */
+static int kvm_vmi_get_mem_info(struct kvm *kvm, struct kvm_vmi_mem_info *info)
+{
+	struct kvm_memory_slot *memslot;
+	struct kvm_memslots *slots;
+	gfn_t max_gfn = 0;
+	int bkt, idx;
+
+	idx = srcu_read_lock(&kvm->srcu);
+	slots = kvm_memslots(kvm);
+	kvm_for_each_memslot(memslot, bkt, slots) {
+		gfn_t end = memslot->base_gfn + memslot->npages;
+
+		if (end > max_gfn)
+			max_gfn = end;
+	}
+	srcu_read_unlock(&kvm->srcu, idx);
+
+	info->max_gfn = max_gfn;
+	info->pad = 0;
+	return 0;
+}
+
 static long kvm_vmi_ioctl(struct file *file, unsigned int ioctl,
 			  unsigned long arg)
 {
@@ -1929,6 +1960,17 @@ static long kvm_vmi_ioctl(struct file *file, unsigned int ioctl,
 		if (copy_from_user(&change, argp, sizeof(change)))
 			return -EFAULT;
 		return kvm_vmi_change_gfn(kvm, &change);
+	}
+	case KVM_VMI_GET_MEM_INFO: {
+		struct kvm_vmi_mem_info info = {};
+		int r;
+
+		r = kvm_vmi_get_mem_info(kvm, &info);
+		if (r)
+			return r;
+		if (copy_to_user(argp, &info, sizeof(info)))
+			return -EFAULT;
+		return 0;
 	}
 	case KVM_VMI_PAUSE_VM:
 		return kvm_vmi_pause_vm(kvm);

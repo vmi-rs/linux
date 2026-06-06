@@ -67,6 +67,7 @@
 #define KVM_VMI_ALLOC_GFN         _IOWR(KVMIO, 0xf8, struct kvm_vmi_alloc_gfn)
 #define KVM_VMI_FREE_GFN          _IOW(KVMIO,  0xf9, struct kvm_vmi_free_gfn)
 #define KVM_VMI_CHANGE_GFN        _IOW(KVMIO,  0xfa, struct kvm_vmi_change_gfn)
+#define KVM_VMI_GET_MEM_INFO      _IOR(KVMIO,  0xfb, struct kvm_vmi_mem_info)
 
 /* Ring event response flags (bitmask, combinable) */
 #define KVM_VMI_RESPONSE_CONTINUE          (0)  /* Default: proceed with normal handling */
@@ -218,6 +219,20 @@ struct kvm_vmi_change_gfn {
 	__u32 pad;
 	__u64 old_gfn;
 	__u64 new_gfn;
+};
+
+/**
+ * struct kvm_vmi_mem_info - Guest RAM extent
+ * @max_gfn: out: exclusive upper-bound GFN of guest RAM, computed as the
+ *           maximum of base_gfn + npages over all memslots. Frames at or above
+ *           this bound (but below KVM_VMI_SHADOW_GFN_BASE) are not backed by
+ *           guest memory, so the agent rejects reads of them instead of
+ *           faulting the vmi_fd mmap.
+ * @pad: Reserved, set to zero.
+ */
+struct kvm_vmi_mem_info {
+	__u64 max_gfn;
+	__u64 pad;
 };
 
 /*
