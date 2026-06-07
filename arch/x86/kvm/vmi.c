@@ -698,6 +698,15 @@ void kvm_arch_vmi_reset_vcpu_state(struct kvm_vcpu *vcpu)
 	}
 }
 
+/*
+ * No-op on x86: VMI single-step does not mask guest interrupts, so there is no
+ * per-session CPU state to restore synchronously on teardown. See the arm64
+ * implementation and kvm_vmi_release().
+ */
+void kvm_arch_vmi_restore_singlestep(struct kvm_vcpu *vcpu)
+{
+}
+
 int kvm_arch_vmi_create_view(struct kvm *kvm, struct kvm_vmi_view_data *view)
 {
 	return kvm_x86_call(vmi_create_view)(kvm, view);

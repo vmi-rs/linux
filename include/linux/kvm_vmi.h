@@ -170,6 +170,16 @@ void kvm_arch_vmi_session_cleanup(struct kvm_vmi *vmi);
 void kvm_arch_vmi_session_reset(struct kvm_vmi *vmi);
 void kvm_arch_vmi_reset_vcpu_state(struct kvm_vcpu *vcpu);
 
+/*
+ * Synchronously undo any guest CPU state an in-flight VMI single-step left
+ * masked, before the per-session VMI state is freed on teardown. Called from
+ * kvm_vmi_release() with @vcpu->mutex held and the vCPU parked (not running),
+ * so it may touch the parked vCPU's saved state. arm64 restores the guest DAIF
+ * its single-step masked; arches whose single-step needs no such mask are
+ * no-ops.
+ */
+void kvm_arch_vmi_restore_singlestep(struct kvm_vcpu *vcpu);
+
 int kvm_arch_vmi_control_event(struct kvm *kvm,
 			       struct kvm_vmi_control_event *ctrl);
 void kvm_arch_vmi_update(struct kvm *kvm);

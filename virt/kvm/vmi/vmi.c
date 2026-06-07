@@ -1702,6 +1702,27 @@ static int kvm_vmi_release(struct inode *inode, struct file *file)
 	if (!vmi)
 		goto out;
 
+	/*
+	 * Restore any guest CPU state an in-flight single-step left masked, while
+	 * the per-session VMI state is still alive. A mid-step vCPU is parked in
+	 * kvm_vmi_deliver_via_ring()/kvm_vmi_vcpu_pause_wait() with vcpu->mutex
+	 * dropped, so acquiring the mutex here lets the arch layer safely touch the
+	 * parked vCPU's saved state. This must run before the teardown signal and
+	 * the WRITE_ONCE(vcpu->vmi, NULL) below: otherwise the restore is left to a
+	 * later apply that can no longer reach the per-session saved value, leaving
+	 * the guest with interrupts masked (a silent hang). kvm_vcpu_kick() nudges a
+	 * still-in-guest vCPU toward an exit so the mutex is acquired promptly; the
+	 * arch hook is a no-op where single-step masks no guest state.
+	 */
+	kvm_for_each_vcpu(i, vcpu, kvm) {
+		if (!vcpu->vmi)
+			continue;
+		kvm_vcpu_kick(vcpu);
+		mutex_lock(&vcpu->mutex);
+		kvm_arch_vmi_restore_singlestep(vcpu);
+		mutex_unlock(&vcpu->mutex);
+	}
+
 	/* Signal all vCPUs to teardown and wake any blocked ones */
 	kvm_for_each_vcpu(i, vcpu, kvm) {
 		if (!vcpu->vmi)
