@@ -68,9 +68,17 @@ struct kvm_arch_vmi {
  *                     (set by KVM_VMI_RESPONSE_SINGLESTEP, one-shot-cleared at
  *                     the step exit). Read from the debug fast paths to arm
  *                     MDSCR_EL1.SS / PSTATE.SS / MDCR_EL2.TDE.
+ * @daif_masked:       a VMI single-step has masked the guest's asynchronous
+ *                     exceptions (PSTATE.A/I/F) for the step window; cleared
+ *                     when the step disarms. Guards against re-saving the
+ *                     already-masked value across a re-arm.
+ * @saved_daif:        the guest's PSTATE.A/I/F bits captured before masking,
+ *                     restored verbatim when the step disarms.
  */
 struct kvm_arch_vcpu_vmi {
 	bool singlestep_active;
+	bool daif_masked;
+	u64  saved_daif;
 };
 
 #ifdef CONFIG_KVM_VMI

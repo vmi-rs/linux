@@ -251,6 +251,59 @@ void kvm_vcpu_put_debug(struct kvm_vcpu *vcpu)
 
 #ifdef CONFIG_KVM_VMI
 /*
+ * Asynchronous exceptions (SError/IRQ/FIQ) the VMI single-step masks in the
+ * guest's PSTATE for the duration of the one-instruction step window. PSTATE.D
+ * is deliberately left untouched: the step is routed to EL2 via MDCR_EL2.TDE,
+ * so a lower-EL debug mask cannot gate it, and masking it would only risk
+ * suppressing the step we are trying to take.
+ */
+#define VMI_SS_DAIF_MASK	(PSR_A_BIT | PSR_I_BIT | PSR_F_BIT)
+
+/*
+ * Mask the guest's asynchronous exceptions for a VMI single-step window.
+ *
+ * VMI steps a LIVE, preemptible guest that is not party to the software-step
+ * protocol (unlike the in-tree stepper, whose exception entry/exit hooks clear
+ * and restore MDSCR_EL1.SS per stepped thread). Were an interrupt taken between
+ * arming PSTATE.SS and the step trapping to EL2, the guest would enter its own
+ * handler with the step bit pending and hardware would have already saved
+ * SPSR_EL1.SS=1 into the interrupted thread's context in guest RAM, beyond KVM's
+ * reach; that thread later takes a spurious software-step exception (observed in
+ * a Windows guest as a stray STATUS_SINGLE_STEP at an arbitrary instruction).
+ *
+ * Masking SError/IRQ/FIQ makes the step atomic: exactly one instruction
+ * executes and traps to EL2, with no preemption to leak SS. This mirrors the
+ * in-tree invariant that a software step runs only with interrupts disabled
+ * (kernel_enable_single_step()'s WARN_ON(!irqs_disabled())). The masked
+ * interrupts are not lost -- they stay pending in the vGIC and are taken once
+ * the guest's real DAIF is restored at disarm.
+ */
+static void kvm_vmi_mask_singlestep_daif(struct kvm_vcpu *vcpu)
+{
+	struct kvm_vcpu_vmi *vcpu_vmi = vcpu->vmi;
+
+	if (!vcpu_vmi || vcpu_vmi->arch.daif_masked)
+		return;
+
+	vcpu_vmi->arch.saved_daif = *vcpu_cpsr(vcpu) & VMI_SS_DAIF_MASK;
+	*vcpu_cpsr(vcpu) |= VMI_SS_DAIF_MASK;
+	vcpu_vmi->arch.daif_masked = true;
+}
+
+/* Restore the guest's pre-step DAIF, undoing kvm_vmi_mask_singlestep_daif(). */
+static void kvm_vmi_unmask_singlestep_daif(struct kvm_vcpu *vcpu)
+{
+	struct kvm_vcpu_vmi *vcpu_vmi = vcpu->vmi;
+
+	if (!vcpu_vmi || !vcpu_vmi->arch.daif_masked)
+		return;
+
+	*vcpu_cpsr(vcpu) &= ~VMI_SS_DAIF_MASK;
+	*vcpu_cpsr(vcpu) |= vcpu_vmi->arch.saved_daif;
+	vcpu_vmi->arch.daif_masked = false;
+}
+
+/*
  * Arm or disarm VMI hardware single-step on @vcpu, materialized LIVE because
  * under VHE MDSCR_EL1 is loaded only at vcpu_load. Called from
  * kvm_vmi_apply_state() on KVM_REQ_VMI_UPDATE. Models VMI single-step as a
@@ -261,6 +314,20 @@ void kvm_vcpu_put_debug(struct kvm_vcpu *vcpu)
 void kvm_vmi_apply_singlestep(struct kvm_vcpu *vcpu)
 {
 	bool want = kvm_vmi_singlestep_active(vcpu);
+
+	/*
+	 * Restore any guest DAIF masked for a step window BEFORE the
+	 * host-ownership early-return below. A VMI session teardown
+	 * (kvm_vmi_release) clears bp-monitoring and the step, so the next
+	 * kvm_vcpu_load_debug() drops debug ownership; keying the skip off
+	 * ownership would then leave a vCPU torn down mid-step resuming with
+	 * A/I/F masked -> interrupts disabled -> silent spin/hang. This runs on
+	 * the vCPU's own thread with vcpu->vmi still valid (the SRCU teardown
+	 * defers the free past this KVM_REQ_VMI_UPDATE), and is idempotent
+	 * (guarded by daif_masked), so a normal disarm restores it exactly once.
+	 */
+	if (!want)
+		kvm_vmi_unmask_singlestep_daif(vcpu);
 
 	/*
 	 * Skip only when nothing host-side needs managing: not arming now and
@@ -279,16 +346,35 @@ void kvm_vmi_apply_singlestep(struct kvm_vcpu *vcpu)
 
 	setup_external_mdscr(vcpu);	/* sets MDSCR_EL1.SS iff (want || udbg_ss) */
 
-	if (want)
+	if (want) {
 		*vcpu_cpsr(vcpu) |= DBG_SPSR_SS;
-	else if (!(vcpu->guest_debug & KVM_GUESTDBG_SINGLESTEP))
+		kvm_vmi_mask_singlestep_daif(vcpu);
+	} else if (!(vcpu->guest_debug & KVM_GUESTDBG_SINGLESTEP)) {
 		*vcpu_cpsr(vcpu) &= ~DBG_SPSR_SS;
+	}
 
 	if (has_vhe()) {
 		preempt_disable();
 		write_sysreg(vcpu->arch.external_mdscr_el1, mdscr_el1);
 		preempt_enable();
 	}
+}
+
+/*
+ * Teardown-time restore of a guest DAIF masked for an in-flight VMI single-step.
+ *
+ * The normal disarm restores DAIF from a later kvm_vmi_apply_singlestep(), but a
+ * session teardown NULLs and frees vcpu->vmi (where saved_daif lives) before that
+ * apply can run, stranding the masked guest with interrupts disabled (a silent
+ * hang). kvm_vmi_release() calls this from the agent thread with vcpu->mutex held
+ * and the vCPU parked, while vcpu->vmi is still valid, so the saved value is
+ * restored exactly once (the unmask is idempotent, guarded by daif_masked). The
+ * hardware single-step bits are cleared by the post-teardown apply, which does
+ * not need vcpu->vmi, so only DAIF needs restoring here.
+ */
+void kvm_arch_vmi_restore_singlestep(struct kvm_vcpu *vcpu)
+{
+	kvm_vmi_unmask_singlestep_daif(vcpu);
 }
 #endif /* CONFIG_KVM_VMI */
 
