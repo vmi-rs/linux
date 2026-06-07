@@ -408,10 +408,16 @@ int kvm_vmi_deliver_via_ring(struct kvm_vcpu *vcpu,
 	 * Safe to access vcpu_vmi here: kvm_vmi_release() sets
 	 * teardown=true and wakes this waitqueue before call_srcu(),
 	 * so the wait completes while the struct is still alive.
+	 *
+	 * Check teardown FIRST. kvm_vmi_free_ring() sets teardown=true before it
+	 * __free_page()s the ring, so once teardown is observed @hdr points into
+	 * a freed page and must NOT be dereferenced; the short-circuit keeps this
+	 * wakeup off the freed page. (The producer "top section" above is kept off
+	 * it by vcpu->mutex, which free_ring takes.)
 	 */
 	wait_event(vcpu_vmi->wq,
-		READ_ONCE(hdr->req_cons) > prod ||
-		vcpu_vmi->teardown);
+		vcpu_vmi->teardown ||
+		READ_ONCE(hdr->req_cons) > prod);
 
 	mutex_lock(&vcpu->mutex);
 	vcpu_load(vcpu);
@@ -1421,6 +1427,21 @@ static void kvm_vmi_free_ring(struct kvm_vcpu *vcpu)
 	if (!vcpu_vmi)
 		return;
 
+	/*
+	 * Serialize against the kvm_vmi_deliver_via_ring() producer "top
+	 * section" (the ring-slot write at the start of event delivery), which
+	 * runs under vcpu->mutex from KVM_RUN. Taking vcpu->mutex here guarantees
+	 * no vCPU is mid-deliver on this ring when we __free_page() it. The
+	 * deliver path's wait/park section runs with vcpu->mutex dropped, but it
+	 * only re-touches the ring via the teardown-first wait condition, which
+	 * short-circuits once we set teardown below -- so it never reads the
+	 * freed page. kvm_vcpu_kick() bounces a vCPU out of guest mode so the
+	 * mutex is acquired promptly rather than only after the guest next exits.
+	 * Neither caller (teardown-ring ioctl, kvm_vmi_release) holds vcpu->mutex.
+	 */
+	kvm_vcpu_kick(vcpu);
+	mutex_lock(&vcpu->mutex);
+
 	vcpu_vmi->teardown = true;
 	wake_up(&vcpu_vmi->wq);
 	wake_up(&vcpu_vmi->pause_wq);
@@ -1445,6 +1466,8 @@ static void kvm_vmi_free_ring(struct kvm_vcpu *vcpu)
 	}
 	vcpu_vmi->ring = NULL;
 	vcpu_vmi->ring_file = NULL;
+
+	mutex_unlock(&vcpu->mutex);
 }
 
 /**
