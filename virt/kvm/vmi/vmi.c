@@ -825,30 +825,40 @@ static int kvm_vmi_set_mem_access(struct kvm *kvm, struct kvm_vmi_mem_access *ma
 	if (ma->view_id == 0)
 		return -EINVAL; /* Cannot modify host view permissions */
 
+	/* vmi->lock keeps the view alive vs kvm_vmi_destroy_view() (see change_gfn). */
+	mutex_lock(&vmi->lock);
+
 	view = xa_load(&vmi->views, ma->view_id);
-	if (!view)
-		return -ENOENT;
+	if (!view) {
+		ret = -ENOENT;
+		goto out;
+	}
 
 	if (ma->nr <= 1) {
 		ret = kvm_vmi_validate_access(ma->access);
 		if (ret)
-			return ret;
+			goto out;
 
 		/* In-kernel sub-page auto-step is arch-gated (see autostep_mask). */
-		if (ma->autostep_mask && !kvm_arch_vmi_has_auto_step())
-			return -EOPNOTSUPP;
+		if (ma->autostep_mask && !kvm_arch_vmi_has_auto_step()) {
+			ret = -EOPNOTSUPP;
+			goto out;
+		}
 
 		kvm_vmi_set_gfn_access(kvm, view, ma->view_id,
 				       ma->gfn, ma->access, ma->autostep_mask);
 	} else {
 		ret = kvm_vmi_set_mem_access_batch(kvm, view, ma);
 		if (ret)
-			return ret;
+			goto out;
 	}
 
 	kvm_flush_remote_tlbs(kvm);
+	ret = 0;
 
-	return 0;
+out:
+	mutex_unlock(&vmi->lock);
+	return ret;
 }
 
 static u8 kvm_vmi_get_gfn_access(struct kvm_vmi_view_data *view, u64 gfn)
@@ -906,22 +916,33 @@ static int kvm_vmi_get_mem_access(struct kvm *kvm, struct kvm_vmi_mem_access *ma
 {
 	struct kvm_vmi *vmi = kvm->vmi;
 	struct kvm_vmi_view_data *view = NULL;
+	int ret;
 
 	if (!vmi)
 		return -EINVAL;
 
+	/* vmi->lock keeps the view alive vs kvm_vmi_destroy_view() (see change_gfn). */
+	mutex_lock(&vmi->lock);
+
 	if (ma->view_id != 0) {
 		view = xa_load(&vmi->views, ma->view_id);
-		if (!view)
-			return -ENOENT;
+		if (!view) {
+			ret = -ENOENT;
+			goto out;
+		}
 	}
 
 	if (ma->nr <= 1) {
 		ma->access = kvm_vmi_get_gfn_access(view, ma->gfn);
-		return 0;
+		ret = 0;
+		goto out;
 	}
 
-	return kvm_vmi_get_mem_access_batch(kvm, view, ma);
+	ret = kvm_vmi_get_mem_access_batch(kvm, view, ma);
+
+out:
+	mutex_unlock(&vmi->lock);
+	return ret;
 }
 
 /**
@@ -990,6 +1011,7 @@ static int kvm_vmi_change_gfn(struct kvm *kvm, struct kvm_vmi_change_gfn *change
 	bool writable;
 	kvm_pfn_t pfn;
 	hpa_t new_hpa;
+	int srcu_idx;
 	int err;
 
 	if (!vmi)
@@ -998,9 +1020,24 @@ static int kvm_vmi_change_gfn(struct kvm *kvm, struct kvm_vmi_change_gfn *change
 	if (change->view_id == 0)
 		return -EINVAL; /* Cannot remap in host view */
 
+	/*
+	 * Hold vmi->lock for the whole view lifetime and kvm->srcu for the
+	 * memslot lookup/faultin below. kvm_vmi_destroy_view() erases the view
+	 * under vmi->lock and frees it (and its arch stage-2 root) right after,
+	 * so without the lock this otherwise lock-free xa_load() + dereference
+	 * races the free -> use-after-free in the arch invalidate path (proven
+	 * by vmi_change_gfn_uaf_test; KASAN slab-use-after-free in
+	 * __unmap_stage2_range). gfn_to_memslot()/__kvm_faultin_pfn() require
+	 * the SRCU read side so the memslots array cannot be swapped under us.
+	 */
+	srcu_idx = srcu_read_lock(&kvm->srcu);
+	mutex_lock(&vmi->lock);
+
 	view = xa_load(&vmi->views, change->view_id);
-	if (!view)
-		return -ENOENT;
+	if (!view) {
+		err = -ENOENT;
+		goto out;
+	}
 
 	trace_kvm_vmi_change_gfn(change->view_id, change->old_gfn,
 				 change->new_gfn);
@@ -1016,7 +1053,8 @@ static int kvm_vmi_change_gfn(struct kvm *kvm, struct kvm_vmi_change_gfn *change
 			kvm_arch_vmi_invalidate_gfn_revert(kvm, view,
 							   change->old_gfn);
 		kvm_flush_remote_tlbs(kvm);
-		return 0;
+		err = 0;
+		goto out;
 	}
 
 	/*
@@ -1025,18 +1063,24 @@ static int kvm_vmi_change_gfn(struct kvm *kvm, struct kvm_vmi_change_gfn *change
 	 */
 	if (change->new_gfn >= KVM_VMI_SHADOW_GFN_BASE) {
 		shadow = xa_load(&vmi->shadow_pages, change->new_gfn);
-		if (!shadow)
-			return -ENOENT;
+		if (!shadow) {
+			err = -ENOENT;
+			goto out;
+		}
 		new_hpa = page_to_phys(shadow);
 	} else {
 		slot = gfn_to_memslot(kvm, change->new_gfn);
-		if (!slot)
-			return -EFAULT;
+		if (!slot) {
+			err = -EFAULT;
+			goto out;
+		}
 
 		pfn = __kvm_faultin_pfn(slot, change->new_gfn, 0,
 					&writable, &refcounted_page);
-		if (is_error_noslot_pfn(pfn))
-			return -EFAULT;
+		if (is_error_noslot_pfn(pfn)) {
+			err = -EFAULT;
+			goto out;
+		}
 		new_hpa = (hpa_t)pfn << PAGE_SHIFT;
 	}
 
@@ -1065,7 +1109,8 @@ static int kvm_vmi_change_gfn(struct kvm *kvm, struct kvm_vmi_change_gfn *change
 		if (err) {
 			xa_erase(&view->gfn_overrides, change->old_gfn);
 			put_page(refcounted_page);
-			return err;
+			refcounted_page = NULL;
+			goto out;
 		}
 		refcounted_page = NULL;	/* ref transferred to the xarray */
 	}
@@ -1074,11 +1119,15 @@ static int kvm_vmi_change_gfn(struct kvm *kvm, struct kvm_vmi_change_gfn *change
 	if (kvm_arch_vmi_view_has_root(view))
 		kvm_arch_vmi_invalidate_gfn(kvm, view, change->old_gfn);
 
+	kvm_flush_remote_tlbs(kvm);
+	err = 0;
+
+out:
+	mutex_unlock(&vmi->lock);
+	srcu_read_unlock(&kvm->srcu, srcu_idx);
 	if (refcounted_page)
 		put_page(refcounted_page);
-	kvm_flush_remote_tlbs(kvm);
-
-	return 0;
+	return err;
 }
 
 static int kvm_vmi_alloc_gfn(struct kvm *kvm, struct kvm_vmi_alloc_gfn *alloc)
