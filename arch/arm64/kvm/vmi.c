@@ -588,10 +588,18 @@ int kvm_vmi_mem_access(struct kvm_vcpu *vcpu, gpa_t gpa, u8 attempted)
  */
 static bool kvm_vmi_event_enabled(struct kvm_vcpu *vcpu, u32 event_type)
 {
-	struct kvm_vmi *vmi = kvm_vmi_get(vcpu->kvm);
+	struct kvm_vmi *vmi;
+	bool enabled;
+	int srcu_idx;
 
-	return vmi && (vmi->enabled_events & BIT_ULL(event_type)) &&
-	       vcpu->vmi && vcpu->vmi->ring;
+	/* Run-loop fast path; arm64 holds no kvm->srcu here (see bp_monitoring). */
+	srcu_idx = srcu_read_lock(&vcpu->kvm->srcu);
+	vmi = kvm_vmi_get(vcpu->kvm);
+	enabled = vmi && (vmi->enabled_events & BIT_ULL(event_type)) &&
+		  vcpu->vmi && vcpu->vmi->ring;
+	srcu_read_unlock(&vcpu->kvm->srcu, srcu_idx);
+
+	return enabled;
 }
 
 /*
@@ -618,9 +626,17 @@ int kvm_vmi_sysreg_index(int reg)
  */
 bool kvm_vmi_sysreg_monitoring(struct kvm *kvm)
 {
-	struct kvm_vmi *vmi = kvm_vmi_get(kvm);
+	struct kvm_vmi *vmi;
+	bool active;
+	int srcu_idx;
 
-	return vmi && vmi->arch.sysreg_monitor_count > 0;
+	/* Run-loop fast path; arm64 holds no kvm->srcu here (see bp_monitoring). */
+	srcu_idx = srcu_read_lock(&kvm->srcu);
+	vmi = kvm_vmi_get(kvm);
+	active = vmi && vmi->arch.sysreg_monitor_count > 0;
+	srcu_read_unlock(&kvm->srcu, srcu_idx);
+
+	return active;
 }
 
 /*
@@ -631,9 +647,22 @@ bool kvm_vmi_sysreg_monitoring(struct kvm *kvm)
  */
 bool kvm_vmi_bp_monitoring(struct kvm *kvm)
 {
-	struct kvm_vmi *vmi = kvm_vmi_get(kvm);
+	struct kvm_vmi *vmi;
+	bool active;
+	int srcu_idx;
 
-	return vmi && (vmi->enabled_events & BIT_ULL(KVM_VMI_EVENT_BREAKPOINT));
+	/*
+	 * Called from the arm64 debug fast paths (vcpu_load / exit handling),
+	 * which on arm64 hold neither kvm->srcu nor kvm->lock -- unlike x86,
+	 * whose run loop keeps kvm->srcu across guest execution. kvm_vmi_get()
+	 * requires one of them, so take srcu around the deref + read here.
+	 */
+	srcu_idx = srcu_read_lock(&kvm->srcu);
+	vmi = kvm_vmi_get(kvm);
+	active = vmi && (vmi->enabled_events & BIT_ULL(KVM_VMI_EVENT_BREAKPOINT));
+	srcu_read_unlock(&kvm->srcu, srcu_idx);
+
+	return active;
 }
 
 /*

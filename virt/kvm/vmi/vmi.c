@@ -1763,13 +1763,25 @@ static void free_vcpu_vmi(struct rcu_head *head)
 static int kvm_vmi_release(struct inode *inode, struct file *file)
 {
 	struct kvm *kvm = file->private_data;
-	struct kvm_vmi *vmi = kvm_vmi_get(kvm);
 	struct kvm_vcpu *vcpu;
 	struct kvm_vmi_view_data *view;
+	struct kvm_vmi *vmi;
 	struct page *page;
 	unsigned long i, index;
+	int srcu_idx;
 
 	trace_kvm_vmi_session(false);
+
+	/*
+	 * kvm_vmi_get() must run under kvm->srcu (or kvm->lock); take srcu just
+	 * for the deref. The VMI session is torn down only here, on the last
+	 * vmi_fd put, so the returned pointer stays valid for the rest of this
+	 * function without holding srcu -- and we must not hold it across the
+	 * synchronize_srcu() below.
+	 */
+	srcu_idx = srcu_read_lock(&kvm->srcu);
+	vmi = kvm_vmi_get(kvm);
+	srcu_read_unlock(&kvm->srcu, srcu_idx);
 
 	if (!vmi)
 		goto out;
