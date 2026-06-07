@@ -2102,6 +2102,8 @@ static vm_fault_t kvm_vmi_guest_fault(struct vm_fault *vmf)
 	unsigned long hva;
 	struct page *page;
 	vm_fault_t ret;
+	bool same_mm;
+	int srcu_idx;
 	int r;
 
 	/* Check if this is a VMI-allocated shadow page */
@@ -2113,7 +2115,10 @@ static vm_fault_t kvm_vmi_guest_fault(struct vm_fault *vmf)
 				      page_to_pfn(page));
 	}
 
+	/* gfn_to_hva() walks the memslots; hold kvm->srcu across the lookup. */
+	srcu_idx = srcu_read_lock(&kvm->srcu);
 	hva = gfn_to_hva(kvm, gfn);
+	srcu_read_unlock(&kvm->srcu, srcu_idx);
 	if (kvm_is_error_hva(hva))
 		return VM_FAULT_SIGBUS;
 
@@ -2126,11 +2131,23 @@ static vm_fault_t kvm_vmi_guest_fault(struct vm_fault *vmf)
 	 * on fault (swapbacked), but classified as MM_ANONPAGES on
 	 * unmap (folio_test_anon), causing "Bad rss-counter state"
 	 * warnings on process exit. PFN mappings bypass RSS accounting.
+	 *
+	 * get_user_pages_remote() with locked==NULL requires mmap_lock held but
+	 * does not drop it. When the faulting task IS the VM owner (kvm->mm ==
+	 * current->mm -- e.g. a single process that both created the VM and
+	 * mmap'd its own guest memory, as in the selftests), the page-fault path
+	 * already holds kvm->mm's mmap_lock for read, so taking it again would be
+	 * a recursive read_lock (deadlock-prone if a writer queues). Only acquire
+	 * it when faulting on behalf of a different mm -- the normal case, where
+	 * a separate agent process reads the guest's memory.
 	 */
-	mmap_read_lock(kvm->mm);
+	same_mm = kvm->mm == current->mm;
+	if (!same_mm)
+		mmap_read_lock(kvm->mm);
 	r = get_user_pages_remote(kvm->mm, hva, 1,
 				  FOLL_WRITE, &page, NULL);
-	mmap_read_unlock(kvm->mm);
+	if (!same_mm)
+		mmap_read_unlock(kvm->mm);
 	if (r < 0)
 		return VM_FAULT_SIGBUS;
 
