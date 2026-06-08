@@ -1787,35 +1787,36 @@ static int kvm_vmi_release(struct inode *inode, struct file *file)
 		goto out;
 
 	/*
+	 * Pause every vCPU so it parks with vcpu->mutex DROPPED before we take that
+	 * mutex below. A vCPU halted in kvm_vcpu_block() (guest in WFI) or spinning
+	 * in-guest holds vcpu->mutex across the whole KVM_RUN, and on arm64 a bare
+	 * kvm_vcpu_kick() only wakes it to re-block -- it never releases the mutex.
+	 * The mutex_lock()s below (single-step DAIF restore here, and
+	 * kvm_vmi_free_ring() later) would then deadlock against it, wedging
+	 * close(vmi_fd) in 'D'. kvm_vmi_pause_vm() (KVM_REQ_OUTSIDE_GUEST_MODE +
+	 * KVM_REQ_UNBLOCK) drives each vCPU to the run-loop pause check, where
+	 * kvm_vmi_vcpu_pause_wait() drops the mutex; a vCPU already parked in
+	 * kvm_vmi_deliver_via_ring() has dropped it too. Do NOT signal teardown
+	 * here: kvm_vmi_free_ring() does it per vCPU as it frees each ring, so
+	 * paused vCPUs stay parked (mutex droppable) through the whole teardown
+	 * rather than waking and re-grabbing the mutex.
+	 */
+	kvm_vmi_pause_vm(kvm);
+
+	/*
 	 * Restore any guest CPU state an in-flight single-step left masked, while
-	 * the per-session VMI state is still alive. A mid-step vCPU is parked in
-	 * kvm_vmi_deliver_via_ring()/kvm_vmi_vcpu_pause_wait() with vcpu->mutex
-	 * dropped, so acquiring the mutex here lets the arch layer safely touch the
-	 * parked vCPU's saved state. This must run before the teardown signal and
-	 * the WRITE_ONCE(vcpu->vmi, NULL) below: otherwise the restore is left to a
-	 * later apply that can no longer reach the per-session saved value, leaving
-	 * the guest with interrupts masked (a silent hang). kvm_vcpu_kick() nudges a
-	 * still-in-guest vCPU toward an exit so the mutex is acquired promptly; the
-	 * arch hook is a no-op where single-step masks no guest state.
+	 * the per-session VMI state is still alive and the vCPU is parked (mutex
+	 * dropped). This must run before kvm_vmi_free_ring() NULLs vcpu->vmi below:
+	 * otherwise the restore is left to a later apply that can no longer reach
+	 * the per-session saved value, leaving the guest with interrupts masked (a
+	 * silent hang). The arch hook is a no-op where single-step masks no state.
 	 */
 	kvm_for_each_vcpu(i, vcpu, kvm) {
 		if (!vcpu->vmi)
 			continue;
-		kvm_vcpu_kick(vcpu);
 		mutex_lock(&vcpu->mutex);
 		kvm_arch_vmi_restore_singlestep(vcpu);
 		mutex_unlock(&vcpu->mutex);
-	}
-
-	/* Signal all vCPUs to teardown and wake any blocked ones */
-	kvm_for_each_vcpu(i, vcpu, kvm) {
-		if (!vcpu->vmi)
-			continue;
-		vcpu->vmi->teardown = true;
-		atomic_set(&vcpu->vmi->pause_count, 0);
-		wake_up(&vcpu->vmi->wq);
-		wake_up(&vcpu->vmi->pause_wq);
-		kvm_vcpu_kick(vcpu);
 	}
 
 	/* Clear VM-wide event monitoring state */
@@ -1898,6 +1899,13 @@ static int kvm_vmi_release(struct inode *inode, struct file *file)
 		if (!vcpu_vmi)
 			continue;
 		kvm_vmi_free_ring(vcpu);
+		/*
+		 * Drop the teardown pause taken above. kvm_vmi_free_ring() already
+		 * set teardown=true and woke the vCPU; clearing pause_count before
+		 * NULLing vcpu->vmi keeps the woken vCPU's run-loop pause check from
+		 * spinning until it observes the NULL.
+		 */
+		atomic_set(&vcpu_vmi->pause_count, 0);
 		WRITE_ONCE(vcpu->vmi, NULL);
 		call_srcu(&kvm->srcu, &vcpu_vmi->rcu_head, free_vcpu_vmi);
 	}
