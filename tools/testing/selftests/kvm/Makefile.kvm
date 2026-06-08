@@ -237,6 +237,7 @@ TEST_GEN_PROGS_arm64 += arm64/vmi_fast_singlestep_test
 TEST_GEN_PROGS_arm64 += arm64/vmi_singlestep_host_leak_test
 TEST_GEN_PROGS_arm64 += arm64/vmi_singlestep_guest_leak_test
 TEST_GEN_PROGS_arm64 += arm64/vmi_singlestep_teardown_daif_test
+TEST_GEN_PROGS_arm64 += arm64/vmi_autostep_daif_test
 TEST_GEN_PROGS_arm64 += arm64/vmi_teardown_halt_test
 TEST_GEN_PROGS_arm64 += arm64/vmi_change_gfn_uaf_test
 TEST_GEN_PROGS_arm64 += arm64/vmi_breakpoint_workflow_test

@@ -2186,21 +2186,23 @@ int kvm_handle_guest_abort(struct kvm_vcpu *vcpu)
 						fault_ipa >> PAGE_SHIFT);
 			unsigned int subpage = (fault_ipa & (PAGE_SIZE - 1)) >> 12;
 
+			/*
+			 * 16K/4K page fusion: this 4K sub-page is a neighbor of
+			 * a protected page sharing the same stage-2 leaf, not the
+			 * access the agent wants to see. Retire it in the kernel
+			 * (kvm_vmi_autostep_retire: single-step a normal access,
+			 * or atomic-step an exclusive LDXR/STXR) with no MEM_ACCESS
+			 * ring round-trip, then fall through so user_mem_abort maps
+			 * the leaf on view 0; the arch debug handler restores the
+			 * alt view afterwards. An exclusive that cannot be
+			 * atomic-stepped returns false and is delivered below
+			 * instead of single-stepped (a step exception clears the
+			 * exclusive monitor and the atomic would livelock).
+			 */
 			if (attempted != KVM_VMI_ACCESS_X &&
-			    (autostep & (1u << subpage))) {
-				/*
-				 * 16K/4K page fusion: this 4K sub-page is a
-				 * neighbor of a protected page sharing the same
-				 * stage-2 leaf, not the access the agent wants
-				 * to see. Retire it in the kernel by single-
-				 * stepping on the default view - no MEM_ACCESS
-				 * ring round-trip - then fall through so
-				 * user_mem_abort maps the leaf on view 0 (as the
-				 * SINGLESTEP_FAST response path does). The arch
-				 * single-step handler restores the alt view
-				 * afterwards.
-				 */
-				kvm_vmi_begin_fast_singlestep(vcpu, 0);
+			    (autostep & (1u << subpage)) &&
+			    kvm_vmi_autostep_retire(vcpu)) {
+				/* retired in-kernel; fall through to map on view 0 */
 			} else {
 				int resp;
 

@@ -115,6 +115,18 @@ void kvm_debug_init_vhe(void)
 }
 
 /*
+ * True when a real hardware software-step (PSTATE.SS) is wanted. A VMI atomic
+ * step shares singlestep_active for its host-owned-debug / MDCR_EL2.TDE plumbing
+ * but must NOT arm PSTATE.SS: a step exception inside an LDXR..STXR sequence
+ * clears the local exclusive monitor, so the atomic could never complete. The
+ * atomic step uses a region-end HW breakpoint (MDSCR_EL1.MDE) instead.
+ */
+static bool kvm_vmi_hw_singlestep(struct kvm_vcpu *vcpu)
+{
+	return kvm_vmi_singlestep_active(vcpu) && !kvm_vmi_atomic_step_active(vcpu);
+}
+
+/*
  * Configures the 'external' MDSCR_EL1 value for the guest, i.e. when the host
  * has taken over MDSCR_EL1.
  *
@@ -141,10 +153,15 @@ static void setup_external_mdscr(struct kvm_vcpu *vcpu)
 							   MDSCR_EL1_KDE);
 
 	if ((vcpu->guest_debug & KVM_GUESTDBG_SINGLESTEP) ||
-	    kvm_vmi_singlestep_active(vcpu))
+	    kvm_vmi_hw_singlestep(vcpu))
 		mdscr |= MDSCR_EL1_SS;
 
-	if (vcpu->guest_debug & KVM_GUESTDBG_USE_HW)
+	/*
+	 * Enable breakpoint/watchpoint debug events for userspace HW debug and
+	 * for the VMI atomic-step region-end breakpoint.
+	 */
+	if ((vcpu->guest_debug & KVM_GUESTDBG_USE_HW) ||
+	    kvm_vmi_atomic_step_active(vcpu))
 		mdscr |= MDSCR_EL1_MDE | MDSCR_EL1_KDE;
 
 	vcpu->arch.external_mdscr_el1 = mdscr;
@@ -191,7 +208,7 @@ void kvm_vcpu_load_debug(struct kvm_vcpu *vcpu)
 		 * single-step the guest.
 		 */
 		if ((vcpu->guest_debug & KVM_GUESTDBG_SINGLESTEP) ||
-		    kvm_vmi_singlestep_active(vcpu)) {
+		    kvm_vmi_hw_singlestep(vcpu)) {
 			if (*vcpu_cpsr(vcpu) & DBG_SPSR_SS)
 				vcpu_clear_flag(vcpu, GUEST_SS_ACTIVE_PENDING);
 			else
@@ -231,7 +248,7 @@ void kvm_vcpu_put_debug(struct kvm_vcpu *vcpu)
 	}
 
 	if (likely(!(vcpu->guest_debug & KVM_GUESTDBG_SINGLESTEP) &&
-		   !kvm_vmi_singlestep_active(vcpu)))
+		   !kvm_vmi_hw_singlestep(vcpu)))
 		return;
 
 	/*
@@ -344,12 +361,18 @@ void kvm_vmi_apply_singlestep(struct kvm_vcpu *vcpu)
 	if (want)
 		vcpu->arch.debug_owner = VCPU_DEBUG_HOST_OWNED;
 
-	setup_external_mdscr(vcpu);	/* sets MDSCR_EL1.SS iff (want || udbg_ss) */
+	setup_external_mdscr(vcpu);	/* SS for a real step, MDE for an atomic step */
 
-	if (want) {
+	if (kvm_vmi_hw_singlestep(vcpu)) {
 		*vcpu_cpsr(vcpu) |= DBG_SPSR_SS;
 		kvm_vmi_mask_singlestep_daif(vcpu);
 	} else if (!(vcpu->guest_debug & KVM_GUESTDBG_SINGLESTEP)) {
+		/*
+		 * Not a real single-step (disarm, or an atomic step which uses a
+		 * region-end HW breakpoint instead): ensure PSTATE.SS is clear. The
+		 * atomic step's breakpoint lives in external_debug_state, armed by
+		 * kvm_vmi_arm_atomic_step_bp() and loaded by the hyp debug switch.
+		 */
 		*vcpu_cpsr(vcpu) &= ~DBG_SPSR_SS;
 	}
 
@@ -375,6 +398,36 @@ void kvm_vmi_apply_singlestep(struct kvm_vcpu *vcpu)
 void kvm_arch_vmi_restore_singlestep(struct kvm_vcpu *vcpu)
 {
 	kvm_vmi_unmask_singlestep_daif(vcpu);
+	/* Disarm any in-flight atomic-step region-end breakpoint too. */
+	kvm_vmi_disarm_atomic_step_bp(vcpu);
+}
+
+/*
+ * One-shot internal HW breakpoint for the VMI atomic step. It regains control at
+ * the end of an LDXR..STXR sequence run on the default view, so the exclusive
+ * completes atomically (no step exception clears the monitor). The breakpoint
+ * lives in external_debug_state[BRP 0], loaded by the hyp debug switch when VMI
+ * owns debug (singlestep_active keeps it host-owned); the guest's own breakpoint
+ * registers live in vcpu_debug_state and are not loaded then, and the atomic
+ * step is gated off when userspace owns HW debug (KVM_GUESTDBG_USE_HW), so BRP 0
+ * is free. DBGBCR selects an unlinked instruction-address match over guest
+ * EL1&EL0 (BAS=0b1111, type/BT=0, HMC=0, SSC=0); MDCR_EL2.TDE routes the
+ * exception to EL2 and MDSCR_EL1.MDE (setup_external_mdscr) enables it.
+ */
+#define VMI_ATOMIC_STEP_BRP	0
+#define VMI_ATOMIC_STEP_DBGBCR	((0xfUL << 5) | (0x3UL << 1) | 0x1UL)
+
+void kvm_vmi_arm_atomic_step_bp(struct kvm_vcpu *vcpu, u64 end_va)
+{
+	vcpu->arch.external_debug_state.dbg_bvr[VMI_ATOMIC_STEP_BRP] = end_va;
+	vcpu->arch.external_debug_state.dbg_bcr[VMI_ATOMIC_STEP_BRP] =
+		VMI_ATOMIC_STEP_DBGBCR;
+}
+
+void kvm_vmi_disarm_atomic_step_bp(struct kvm_vcpu *vcpu)
+{
+	vcpu->arch.external_debug_state.dbg_bcr[VMI_ATOMIC_STEP_BRP] = 0;
+	vcpu->arch.external_debug_state.dbg_bvr[VMI_ATOMIC_STEP_BRP] = 0;
 }
 #endif /* CONFIG_KVM_VMI */
 
