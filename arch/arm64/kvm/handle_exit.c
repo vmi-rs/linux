@@ -18,6 +18,7 @@
 #include <asm/kvm_emulate.h>
 #include <asm/kvm_mmu.h>
 #include <asm/kvm_nested.h>
+#include <asm/kvm_vmi.h>
 #include <asm/debug-monitors.h>
 #include <asm/stacktrace/nvhe.h>
 #include <asm/traps.h>
@@ -40,6 +41,16 @@ static int handle_hvc(struct kvm_vcpu *vcpu)
 	trace_kvm_hvc_arm64(*vcpu_pc(vcpu), vcpu_get_reg(vcpu, 0),
 			    kvm_vcpu_hvc_get_imm(vcpu));
 	vcpu->stat.hvc_exit_stat++;
+
+	/*
+	 * VMI hypercall monitoring runs before NV forwarding, so the agent
+	 * observes every guest HVC. On CONTINUE the HVC falls through to the
+	 * normal path (NV forward or SMCCC); on DENY/SET_REGS the agent
+	 * vetoes it and we skip both, returning to the guest (the HVC return
+	 * address is already past the instruction).
+	 */
+	if (kvm_vmi_hypercall(vcpu))
+		return 1;
 
 	/* Forward hvc instructions to the virtual EL2 if the guest has EL2. */
 	if (vcpu_has_nv(vcpu)) {
@@ -192,6 +203,30 @@ static int kvm_handle_guest_debug(struct kvm_vcpu *vcpu)
 {
 	struct kvm_run *run = vcpu->run;
 	u64 esr = kvm_vcpu_get_esr(vcpu);
+	u32 ec = ESR_ELx_EC(esr);
+
+	/* VMI breakpoint monitoring claims guest BRK, priority over KVM_GUESTDBG. */
+	if (ec == ESR_ELx_EC_BRK64 && kvm_vmi_bp_monitoring(vcpu->kvm))
+		return kvm_vmi_breakpoint(vcpu);
+
+	/* VMI singlestep claims the software-step exception it armed. */
+	if (ec == ESR_ELx_EC_SOFTSTP_LOW && kvm_vmi_singlestep_active(vcpu))
+		return kvm_vmi_singlestep(vcpu);
+
+	/* VMI atomic step claims the region-end HW breakpoint it armed. */
+	if (ec == ESR_ELx_EC_BREAKPT_LOW && kvm_vmi_complete_atomic_step(vcpu))
+		return 1;
+
+	/*
+	 * Non-BRK debug classes cannot originate from the guest while VMI
+	 * owns MDSCR (guest debug is neutralized via VCPU_DEBUG_HOST_OWNED,
+	 * see debug.c). The one benign case: enabling monitoring mid-run lets
+	 * neutralization (at vcpu_load) lag the immediate trap force-keep, so
+	 * a stale guest debug exception can trip this once. Harmless: PC is
+	 * not advanced and it falls through to the KVM_EXIT_DEBUG path.
+	 */
+	WARN_ON_ONCE(!vcpu->guest_debug && kvm_vmi_bp_monitoring(vcpu->kvm) &&
+		     ec != ESR_ELx_EC_BRK64 && ec != ESR_ELx_EC_SOFTSTP_LOW);
 
 	if (!vcpu->guest_debug && forward_debug_exception(vcpu))
 		return 1;
@@ -201,7 +236,7 @@ static int kvm_handle_guest_debug(struct kvm_vcpu *vcpu)
 	run->debug.arch.hsr_high = upper_32_bits(esr);
 	run->flags = KVM_DEBUG_ARCH_HSR_HIGH_VALID;
 
-	switch (ESR_ELx_EC(esr)) {
+	switch (ec) {
 	case ESR_ELx_EC_WATCHPT_LOW:
 		run->debug.arch.far = vcpu->arch.fault.far_el2;
 		break;

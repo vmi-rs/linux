@@ -17,6 +17,10 @@
 	, { KVM_VMI_EVENT_DEBUG,	"debug" }	\
 	, { KVM_VMI_EVENT_DESC_ACCESS,	"desc" }	\
 	, { KVM_VMI_EVENT_IO,		"io" }
+#elif defined(__aarch64__)
+#define kvm_vmi_event_types_arch			\
+	, { KVM_VMI_EVENT_SYSREG,	"sysreg" }	\
+	, { KVM_VMI_EVENT_BREAKPOINT,	"breakpoint" }
 #else
 #define kvm_vmi_event_types_arch
 #endif
@@ -271,6 +275,76 @@ TRACE_EVENT(kvm_vmi_change_gfn,
 
 	TP_printk("view %u gfn 0x%llx -> 0x%llx",
 		  __entry->view_id, __entry->old_gfn, __entry->new_gfn)
+);
+
+/*
+ * Trace leaf zap of a single GFN in a view's private stage-2.
+ */
+TRACE_EVENT(kvm_vmi_zap_view_gfn,
+	TP_PROTO(__u32 view_id, __u64 gfn),
+	TP_ARGS(view_id, gfn),
+
+	TP_STRUCT__entry(
+		__field(__u32,	view_id)
+		__field(__u64,	gfn)
+	),
+
+	TP_fast_assign(
+		__entry->view_id = view_id;
+		__entry->gfn = gfn;
+	),
+
+	TP_printk("view %u gfn 0x%llx", __entry->view_id, __entry->gfn)
+);
+
+/*
+ * Trace a view fault that installs a remapped (override) HPA for a GFN.
+ */
+TRACE_EVENT(kvm_vmi_view_remap_fault,
+	TP_PROTO(__u32 view_id, __u64 gfn, __u64 hpa),
+	TP_ARGS(view_id, gfn, hpa),
+
+	TP_STRUCT__entry(
+		__field(__u32,	view_id)
+		__field(__u64,	gfn)
+		__field(__u64,	hpa)
+	),
+
+	TP_fast_assign(
+		__entry->view_id = view_id;
+		__entry->gfn = gfn;
+		__entry->hpa = hpa;
+	),
+
+	TP_printk("view %u gfn 0x%llx -> hpa 0x%llx",
+		  __entry->view_id, __entry->gfn, __entry->hpa)
+);
+
+/*
+ * Trace a monitored guest write to an EL1 VM system register (K10). @reg is a
+ * KVM_VMI_SYSREG_* index; @denied is the agent's deferred-write verdict.
+ */
+TRACE_EVENT(kvm_vmi_sysreg_write,
+	TP_PROTO(int reg, __u64 old_value, __u64 new_value, bool denied),
+	TP_ARGS(reg, old_value, new_value, denied),
+
+	TP_STRUCT__entry(
+		__field(int,	reg)
+		__field(__u64,	old_value)
+		__field(__u64,	new_value)
+		__field(bool,	denied)
+	),
+
+	TP_fast_assign(
+		__entry->reg = reg;
+		__entry->old_value = old_value;
+		__entry->new_value = new_value;
+		__entry->denied = denied;
+	),
+
+	TP_printk("sysreg %d 0x%llx -> 0x%llx %s",
+		  __entry->reg, __entry->old_value, __entry->new_value,
+		  __entry->denied ? "DENIED" : "allowed")
 );
 
 #endif /* _TRACE_KVM_VMI_H */

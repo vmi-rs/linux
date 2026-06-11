@@ -55,6 +55,7 @@
 #define KVM_REQ_GUEST_HYP_IRQ_PENDING	KVM_ARCH_REQ(9)
 #define KVM_REQ_MAP_L1_VNCR_EL2		KVM_ARCH_REQ(10)
 #define KVM_REQ_VGIC_PROCESS_UPDATE	KVM_ARCH_REQ(11)
+#define KVM_REQ_VMI_UPDATE		KVM_ARCH_REQ(12)
 
 #define KVM_DIRTY_LOG_MANUAL_CAPS   (KVM_DIRTY_LOG_MANUAL_PROTECT_ENABLE | \
 				     KVM_DIRTY_LOG_INITIALLY_SET)
@@ -748,6 +749,12 @@ struct kvm_host_data {
 		u64 trfcr_el1;
 		/* Values of trap registers for the host before guest entry. */
 		u64 mdcr_el2;
+		/*
+		 * Host MDSCR_EL1, snapshotted before VMI single-step may write
+		 * the live, VHE-shared register, and restored on vcpu_put so the
+		 * host never resumes EL0 with MDSCR_EL1.SS set.
+		 */
+		u64 mdscr_el1;
 		u64 brbcr_el1;
 	} host_debug_state;
 
