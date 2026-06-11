@@ -11715,8 +11715,11 @@ static int vcpu_run(struct kvm_vcpu *vcpu)
 	vcpu->run->exit_reason = KVM_EXIT_UNKNOWN;
 
 	for (;;) {
-		if (kvm_vmi_vcpu_paused(vcpu))
+		if (kvm_vmi_vcpu_paused(vcpu)) {
+			kvm_vcpu_srcu_read_unlock(vcpu);
 			kvm_vmi_vcpu_pause_wait(vcpu);
+			kvm_vcpu_srcu_read_lock(vcpu);
+		}
 
 		/*
 		 * If another guest vCPU requests a PV TLB flush in the middle

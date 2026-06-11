@@ -62,11 +62,12 @@
 #define KVM_VMI_CREATE_VIEW       _IOWR(KVMIO, 0xf3, struct kvm_vmi_view)
 #define KVM_VMI_DESTROY_VIEW      _IOW(KVMIO,  0xf4, struct kvm_vmi_view)
 #define KVM_VMI_SWITCH_VIEW       _IOW(KVMIO,  0xf5, struct kvm_vmi_switch_view)
-#define KVM_VMI_GET_MEM_ACCESS    _IOWR(KVMIO, 0xf6, struct kvm_vmi_mem_access)
-#define KVM_VMI_SET_MEM_ACCESS    _IOW(KVMIO,  0xf7, struct kvm_vmi_mem_access)
-#define KVM_VMI_ALLOC_GFN         _IOWR(KVMIO, 0xf8, struct kvm_vmi_alloc_gfn)
-#define KVM_VMI_FREE_GFN          _IOW(KVMIO,  0xf9, struct kvm_vmi_free_gfn)
-#define KVM_VMI_CHANGE_GFN        _IOW(KVMIO,  0xfa, struct kvm_vmi_change_gfn)
+#define KVM_VMI_GET_MEM_INFO      _IOR(KVMIO,  0xf6, struct kvm_vmi_mem_info)
+#define KVM_VMI_GET_MEM_ACCESS    _IOWR(KVMIO, 0xf7, struct kvm_vmi_mem_access)
+#define KVM_VMI_SET_MEM_ACCESS    _IOW(KVMIO,  0xf8, struct kvm_vmi_mem_access)
+#define KVM_VMI_ALLOC_GFN         _IOWR(KVMIO, 0xf9, struct kvm_vmi_alloc_gfn)
+#define KVM_VMI_FREE_GFN          _IOW(KVMIO,  0xfa, struct kvm_vmi_free_gfn)
+#define KVM_VMI_CHANGE_GFN        _IOW(KVMIO,  0xfb, struct kvm_vmi_change_gfn)
 
 /* Ring event response flags (bitmask, combinable) */
 #define KVM_VMI_RESPONSE_CONTINUE          (0)  /* Default: proceed with normal handling */
@@ -154,6 +155,20 @@ struct kvm_vmi_switch_view {
 };
 
 /**
+ * struct kvm_vmi_mem_info - Guest RAM extent
+ * @max_gfn: out: exclusive upper-bound GFN of guest RAM, computed as the
+ *           maximum of base_gfn + npages over all memslots. Frames at or above
+ *           this bound (but below KVM_VMI_SHADOW_GFN_BASE) are not backed by
+ *           guest memory, so the agent rejects reads of them instead of
+ *           faulting the vmi_fd mmap.
+ * @pad: Reserved, set to zero.
+ */
+struct kvm_vmi_mem_info {
+	__u64 max_gfn;
+	__u64 pad;
+};
+
+/**
  * struct kvm_vmi_mem_access - Memory access permissions for a view
  * @view_id: Target view.
  * @nr: Number of GFNs (0 or 1 for single-GFN, >1 for batch).
@@ -173,7 +188,22 @@ struct kvm_vmi_mem_access {
 		struct {
 			__u64 gfn;
 			__u8  access;
-			__u8  pad[7];
+			__u8  pad;
+			/*
+			 * Sub-page auto-step mask (single-GFN mode):
+			 * bit i single-steps in-kernel instead of
+			 * delivering KVM_VMI_EVENT_MEM_ACCESS for the
+			 * 4K sub-page at offset i*4K in @gfn's host page.
+			 * On hosts whose page exceeds the guest granule
+			 * (e.g. 16K host / 4K guest) one stage-2 leaf fuses
+			 * several guest pages; this handles a breakpoint's
+			 * neighbour sub-pages in-kernel while its own
+			 * sub-page still delivers. 0 = deliver all
+			 * (default). Requires arch auto-step support, else
+			 * KVM_VMI_SET_MEM_ACCESS returns -EOPNOTSUPP.
+			 */
+			__u16 autostep_mask;
+			__u8  pad2[4];
 		};
 		struct {
 			__u64 gfns_uaddr;
@@ -222,6 +252,20 @@ struct kvm_vmi_event_singlestep {
 	__u64 gpa;
 };
 
+/*
+ * KVM_VMI_EVENT_HYPERCALL event data.
+ *
+ * @imm: the trapped hypercall instruction's immediate (HVC #imm on arm64).
+ *
+ * Hypercall arguments are not duplicated here: they ride along in the
+ * captured GP registers (x0..x7 on arm64; rax/rbx/... on x86).
+ * Zero on architectures whose hypercall instruction carries no immediate.
+ */
+struct kvm_vmi_event_hypercall {
+	__u32 imm;
+	__u32 pad;
+};
+
 /**
  * struct kvm_vmi_ring_header - Ring page header
  * @req_prod: Producer index (kernel increments after writing event)
@@ -259,6 +303,7 @@ struct kvm_vmi_ring_event {
 	union {
 		struct kvm_vmi_event_mem_access mem_access;
 		struct kvm_vmi_event_singlestep singlestep;
+		struct kvm_vmi_event_hypercall hypercall;
 		union kvm_vmi_arch_event_data arch;
 	};
 

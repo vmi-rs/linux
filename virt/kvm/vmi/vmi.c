@@ -179,12 +179,13 @@ int kvm_vmi_vcpu_init(struct kvm_vcpu *vcpu)
 	if (!vcpu_vmi)
 		return -ENOMEM;
 
+	spin_lock_init(&vcpu_vmi->view_lock);
 	vcpu_vmi->current_view_id = 0; /* Default to host view */
-
 	init_waitqueue_head(&vcpu_vmi->wq);
-	init_waitqueue_head(&vcpu_vmi->pause_wq);
-	atomic_set(&vcpu_vmi->pause_count, 0);
 	vcpu_vmi->teardown = false;
+	vcpu_vmi->session_teardown = false;
+	atomic_set(&vcpu_vmi->pause_count, 0);
+	init_waitqueue_head(&vcpu_vmi->pause_wq);
 
 	vcpu->vmi = vcpu_vmi;
 
@@ -204,6 +205,72 @@ void kvm_vmi_vcpu_destroy(struct kvm_vcpu *vcpu)
 
 	kfree(vcpu_vmi);
 	vcpu->vmi = NULL;
+}
+
+static int __kvm_vmi_vcpu_switch_view_locked(struct kvm_vcpu *vcpu, u32 view_id);
+
+/**
+ * kvm_vmi_begin_fast_singlestep - Arm a one-shot single-step in another view
+ * @vcpu: The vCPU to single-step.
+ * @target_view: View to run the single instruction in (0 = default/host view).
+ *
+ * Remembers the current view, arms a one-shot hardware single-step, and
+ * switches to @target_view. The vCPU executes one instruction there; the arch
+ * single-step handler then switches back to the remembered view and suppresses
+ * the single-step event. Used both by the KVM_VMI_RESPONSE_SINGLESTEP_FAST
+ * response and by arch fault handlers that retire a denied access in the kernel
+ * without a userspace round-trip.
+ *
+ * The whole arm sequence runs under view_lock so the snapshot of the current
+ * view (the restore target) and the switch to @target_view are atomic with
+ * respect to a concurrent VM-wide switch.
+ */
+void kvm_vmi_begin_fast_singlestep(struct kvm_vcpu *vcpu, u32 target_view)
+{
+	struct kvm_vcpu_vmi *vcpu_vmi = vcpu->vmi;
+
+	if (!vcpu_vmi)
+		return;
+
+	spin_lock(&vcpu_vmi->view_lock);
+	vcpu_vmi->fast_singlestep_active = true;
+	vcpu_vmi->fast_singlestep_restore_view = vcpu_vmi->current_view_id;
+	kvm_arch_vmi_set_singlestep(vcpu, true);
+	__kvm_vmi_vcpu_switch_view_locked(vcpu, target_view);
+	spin_unlock(&vcpu_vmi->view_lock);
+}
+
+/**
+ * kvm_vmi_complete_fast_singlestep - Finish an in-kernel fast single-step
+ * @vcpu: The vCPU whose single-step just completed.
+ *
+ * If a fast single-step is armed, switch back to the recorded restore view and
+ * disarm it. Runs under view_lock so the read of the restore target, the
+ * switch-back, and clearing the armed flag are atomic against a concurrent
+ * VM-wide switch, which thus either precedes this (and has redirected the
+ * restore target) or follows it (and sees the disarmed state) -- never landing
+ * mid-sequence to resurrect a refcount on a view being torn down.
+ *
+ * Return: true if a fast single-step was active and was completed here.
+ */
+bool kvm_vmi_complete_fast_singlestep(struct kvm_vcpu *vcpu)
+{
+	struct kvm_vcpu_vmi *vcpu_vmi = vcpu->vmi;
+	bool was_active;
+
+	if (!vcpu_vmi)
+		return false;
+
+	spin_lock(&vcpu_vmi->view_lock);
+	was_active = vcpu_vmi->fast_singlestep_active;
+	if (was_active) {
+		__kvm_vmi_vcpu_switch_view_locked(vcpu,
+					vcpu_vmi->fast_singlestep_restore_view);
+		vcpu_vmi->fast_singlestep_active = false;
+	}
+	spin_unlock(&vcpu_vmi->view_lock);
+
+	return was_active;
 }
 
 /**
@@ -246,17 +313,12 @@ static int kvm_vmi_apply_ring_response(struct kvm_vcpu *vcpu,
 	if ((resp & KVM_VMI_RESPONSE_SINGLESTEP_FAST) && vcpu_vmi) {
 		u32 target_view;
 
-		vcpu_vmi->fast_singlestep_active = true;
-		vcpu_vmi->fast_singlestep_restore_view =
-			vcpu_vmi->current_view_id;
-		kvm_arch_vmi_set_singlestep(vcpu, true);
-
 		if (resp & KVM_VMI_RESPONSE_SWITCH_VIEW)
 			target_view = READ_ONCE(event->view_id);
 		else
 			target_view = 0;
 
-		kvm_vmi_vcpu_switch_view(vcpu, target_view);
+		kvm_vmi_begin_fast_singlestep(vcpu, target_view);
 	} else if (resp & KVM_VMI_RESPONSE_SWITCH_VIEW) {
 		u32 view_id = READ_ONCE(event->view_id);
 
@@ -330,13 +392,14 @@ int kvm_vmi_deliver_via_ring(struct kvm_vcpu *vcpu,
 	eventfd_signal(vcpu_vmi->event_fd_ctx);
 
 	/*
-	 * Release vcpu->mutex and SRCU read lock before blocking.
-	 * This allows the agent to call standard KVM vCPU ioctls
-	 * (KVM_GET_FPU, KVM_GET_XSAVE, etc.) on the duplicated vCPU fd
-	 * while the vCPU is blocked, and allows synchronize_srcu() in
-	 * kvm_vmi_release() to complete.
+	 * Release vcpu->mutex and unload vCPU state before blocking so the
+	 * agent can call standard KVM vCPU ioctls on the duplicated vCPU fd
+	 * while the vCPU is parked. kvm_arch_vmi_block_begin()/_end() shed and
+	 * re-take any per-vCPU read-side lock the arch run loop holds (the SRCU
+	 * read lock on x86; nothing on arm64), so synchronize_srcu() in
+	 * kvm_vmi_release() can complete.
 	 */
-	kvm_vcpu_srcu_read_unlock(vcpu);
+	kvm_arch_vmi_block_begin(vcpu);
 	vcpu_put(vcpu);
 	mutex_unlock(&vcpu->mutex);
 
@@ -344,14 +407,20 @@ int kvm_vmi_deliver_via_ring(struct kvm_vcpu *vcpu,
 	 * Safe to access vcpu_vmi here: kvm_vmi_release() sets
 	 * teardown=true and wakes this waitqueue before call_srcu(),
 	 * so the wait completes while the struct is still alive.
+	 *
+	 * Check teardown FIRST. kvm_vmi_free_ring() sets teardown=true before it
+	 * __free_page()s the ring, so once teardown is observed @hdr points into
+	 * a freed page and must NOT be dereferenced; the short-circuit keeps this
+	 * wakeup off the freed page. (The producer "top section" above is kept off
+	 * it by vcpu->mutex, which free_ring takes.)
 	 */
 	wait_event(vcpu_vmi->wq,
-		READ_ONCE(hdr->req_cons) > prod ||
-		vcpu_vmi->teardown);
+		vcpu_vmi->teardown ||
+		READ_ONCE(hdr->req_cons) > prod);
 
 	mutex_lock(&vcpu->mutex);
 	vcpu_load(vcpu);
-	kvm_vcpu_srcu_read_lock(vcpu);
+	kvm_arch_vmi_block_end(vcpu);
 
 	/*
 	 * Re-read under SRCU - call_srcu() may have freed vcpu_vmi
@@ -368,6 +437,82 @@ int kvm_vmi_deliver_via_ring(struct kvm_vcpu *vcpu,
 	return kvm_vmi_apply_ring_response(vcpu, slot);
 }
 
+/*
+ * __kvm_vmi_vcpu_switch_view_locked - Core per-vCPU view switch.
+ *
+ * Does the refcount bookkeeping, the arch-specific stage-2/EPTP switch, and
+ * updates current_view. The caller must hold @vcpu->vmi->view_lock so this
+ * cannot interleave with a concurrent VM-wide KVM_VMI_SWITCH_VIEW; that
+ * serialization is what keeps the view refcounts consistent (see
+ * struct kvm_vcpu_vmi::view_lock).
+ *
+ * Return: 0 on success, negative errno on failure.
+ */
+static int __kvm_vmi_vcpu_switch_view_locked(struct kvm_vcpu *vcpu, u32 view_id)
+{
+	struct kvm_vmi *vmi = vcpu->kvm->vmi;
+	struct kvm_vcpu_vmi *vcpu_vmi = vcpu->vmi;
+	struct kvm_vmi_view_data *new_view, *old_view;
+	u32 old_view_id;
+	int idx;
+
+	lockdep_assert_held(&vcpu_vmi->view_lock);
+
+	old_view_id = vcpu_vmi->current_view_id;
+
+	/* Switching to same view is a no-op */
+	if (view_id == old_view_id)
+		return 0;
+
+	/*
+	 * Dereference views under kvm->srcu: destroy_view frees them via
+	 * call_srcu(&kvm->srcu). Lookup + the refcount handshake all run inside
+	 * this section.
+	 */
+	idx = srcu_read_lock(&vcpu->kvm->srcu);
+
+	if (view_id == 0) {
+		new_view = NULL;
+	} else {
+		new_view = xa_load(&vmi->views, view_id);
+		if (!new_view) {
+			srcu_read_unlock(&vcpu->kvm->srcu, idx);
+			return -ENOENT;
+		}
+	}
+
+	/* Update refcounts */
+	if (old_view_id != 0) {
+		old_view = xa_load(&vmi->views, old_view_id);
+		if (old_view)
+			atomic_dec(&old_view->vcpu_count);
+	}
+	if (new_view) {
+		atomic_inc(&new_view->vcpu_count);
+		/*
+		 * Pair with destroy_view's WRITE_ONCE(dying)+smp_mb()+read count.
+		 * If destroy committed to free new_view, observe ->dying here and
+		 * back off so current_view never ends up pointing at a freed view.
+		 */
+		smp_mb__after_atomic();
+		if (READ_ONCE(new_view->dying)) {
+			atomic_dec(&new_view->vcpu_count);
+			srcu_read_unlock(&vcpu->kvm->srcu, idx);
+			return -ENOENT;
+		}
+	}
+
+	srcu_read_unlock(&vcpu->kvm->srcu, idx);
+
+	/* Perform the arch-specific EPTP switch */
+	kvm_arch_vmi_switch_view(vcpu, new_view);
+
+	trace_kvm_vmi_view_switch(vcpu->vcpu_id, old_view_id, view_id);
+	vcpu_vmi->current_view_id = view_id;
+	rcu_assign_pointer(vcpu_vmi->current_view, new_view);
+	return 0;
+}
+
 /**
  * kvm_vmi_vcpu_switch_view - Switch a vCPU to an alternate memory view
  * @vcpu: The target vCPU.
@@ -377,44 +522,16 @@ int kvm_vmi_deliver_via_ring(struct kvm_vcpu *vcpu,
  */
 int kvm_vmi_vcpu_switch_view(struct kvm_vcpu *vcpu, u32 view_id)
 {
-	struct kvm_vmi *vmi = vcpu->kvm->vmi;
 	struct kvm_vcpu_vmi *vcpu_vmi = vcpu->vmi;
-	struct kvm_vmi_view_data *new_view, *old_view;
-	u32 old_view_id;
+	int ret;
 
-	if (!vmi || !vcpu_vmi)
+	if (!vcpu->kvm->vmi || !vcpu_vmi)
 		return -EINVAL;
 
-	old_view_id = vcpu_vmi->current_view_id;
-
-	/* Switching to same view is a no-op */
-	if (view_id == old_view_id)
-		return 0;
-
-	if (view_id == 0) {
-		new_view = NULL;
-	} else {
-		new_view = xa_load(&vmi->views, view_id);
-		if (!new_view)
-			return -ENOENT;
-	}
-
-	/* Update refcounts */
-	if (old_view_id != 0) {
-		old_view = xa_load(&vmi->views, old_view_id);
-		if (old_view)
-			atomic_dec(&old_view->vcpu_count);
-	}
-	if (new_view)
-		atomic_inc(&new_view->vcpu_count);
-
-	/* Perform the arch-specific EPTP switch */
-	kvm_arch_vmi_switch_view(vcpu, new_view);
-
-	trace_kvm_vmi_view_switch(vcpu->vcpu_id, old_view_id, view_id);
-	vcpu_vmi->current_view_id = view_id;
-	vcpu_vmi->current_view = new_view;
-	return 0;
+	spin_lock(&vcpu_vmi->view_lock);
+	ret = __kvm_vmi_vcpu_switch_view_locked(vcpu, view_id);
+	spin_unlock(&vcpu_vmi->view_lock);
+	return ret;
 }
 
 /**
@@ -435,27 +552,30 @@ bool kvm_vmi_vcpu_paused(struct kvm_vcpu *vcpu)
  * kvm_vmi_vcpu_pause_wait - Sleep until a paused vCPU is unpaused.
  * @vcpu: The vCPU to sleep.
  *
- * Called from vcpu_run() when kvm_vmi_vcpu_paused() returns true.
- * Releases vcpu->mutex, VMCS state, and SRCU read lock so the VMI
- * agent can call KVM ioctls (KVM_GET_REGS, etc.) on this vCPU while
- * it sleeps.  Re-acquires everything before returning.
+ * Called from the vCPU run loop when kvm_vmi_vcpu_paused() returns true.
+ * Releases vcpu->mutex and unloads vCPU state so the VMI agent can call
+ * KVM ioctls (register reads, etc.) on this vCPU while it sleeps, and
+ * re-acquires them before returning.  The caller owns any per-vCPU SRCU
+ * read lock held across the run loop (x86 drops and re-takes it around
+ * this call; arm64 holds none here), since that is arch-specific.
  */
 void kvm_vmi_vcpu_pause_wait(struct kvm_vcpu *vcpu)
 {
 	struct kvm_vcpu_vmi *vcpu_vmi = vcpu->vmi;
 
-	kvm_vcpu_srcu_read_unlock(vcpu);
 	vcpu_put(vcpu);
 	mutex_unlock(&vcpu->mutex);
 
 	/*
-	 * Safe to access vcpu_vmi here: kvm_vmi_release() sets
-	 * teardown=true and wakes this waitqueue before call_srcu(),
-	 * so the wait completes while the struct is still alive.
+	 * Escape on session_teardown, not the ring-scoped teardown flag: a
+	 * KVM_VMI_TEARDOWN_RING leaves teardown=true on a live session, so
+	 * keying off it would let this vCPU spin out of a later pause. Only
+	 * kvm_vmi_release() sets session_teardown, and it wakes this waitqueue
+	 * before call_srcu(), so the wait completes while the struct is alive.
 	 */
 	wait_event(vcpu_vmi->pause_wq,
 		atomic_read(&vcpu_vmi->pause_count) == 0 ||
-		vcpu_vmi->teardown);
+		vcpu_vmi->session_teardown);
 
 	/*
 	 * Don't touch vcpu_vmi past this point - call_srcu() may
@@ -463,349 +583,6 @@ void kvm_vmi_vcpu_pause_wait(struct kvm_vcpu *vcpu)
 	 */
 	mutex_lock(&vcpu->mutex);
 	vcpu_load(vcpu);
-	kvm_vcpu_srcu_read_lock(vcpu);
-}
-
-/**
- * kvm_vmi_control_event - Enable or disable VM-wide event monitoring
- * @kvm: The VM.
- * @ctrl: Event control parameters from userspace.
- *
- * Dispatches to arch-specific handler for arch events (CR, MSR, etc.),
- * then falls through to generic bit-toggle for generic events.
- *
- * Return: 0 on success, negative errno on failure.
- */
-static int kvm_vmi_control_event(struct kvm *kvm,
-				 struct kvm_vmi_control_event *ctrl)
-{
-	struct kvm_vmi *vmi = kvm->vmi;
-	u32 event = ctrl->event;
-	int r = 0;
-
-	if (!vmi)
-		return -EINVAL;
-
-	if (event >= KVM_VMI_NUM_EVENTS)
-		return -EINVAL;
-
-	mutex_lock(&vmi->lock);
-
-	/*
-	 * Try arch callback first for arch-specific event IDs.
-	 * Events with special parameters (e.g., CR index, MSR number)
-	 * are fully handled by the arch callback (returns 0 or error).
-	 * Events the arch doesn't handle specially return -EOPNOTSUPP,
-	 * falling through to generic bit-toggle handling below.
-	 */
-	if (event >= KVM_VMI_EVENT_ARCH_BASE) {
-		r = kvm_arch_vmi_control_event(kvm, ctrl);
-		if (r != -EOPNOTSUPP)
-			goto out_unlock;
-		r = 0;
-	}
-
-	/* Generic events: manage enabled_events bit directly */
-	if (ctrl->enable)
-		vmi->enabled_events |= BIT_ULL(event);
-	else
-		vmi->enabled_events &= ~BIT_ULL(event);
-	kvm_arch_vmi_update(kvm);
-
-out_unlock:
-	mutex_unlock(&vmi->lock);
-	return r;
-}
-
-/**
- * kvm_vmi_create_view - Create an alternate memory view
- * @kvm: The target VM.
- * @uview: View descriptor from userspace (view_id is output).
- *
- * Allocates a new alternate view with its own EPT root. The view starts
- * empty; entries are lazily populated from the host EPT on first access.
- *
- * Return: 0 on success, negative errno on failure.
- */
-static int kvm_vmi_create_view(struct kvm *kvm, struct kvm_vmi_view *uview)
-{
-	struct kvm_vmi *vmi = kvm->vmi;
-	struct kvm_vmi_view_data *view;
-	int ret;
-
-	if (!vmi)
-		return -EINVAL;
-
-	/* Reject PW flag in default_access when hardware doesn't support it */
-	if ((uview->default_access & KVM_VMI_ACCESS_PW) &&
-	    !kvm_arch_vmi_has_paging_write())
-		return -EOPNOTSUPP;
-
-	/* Reject W without R - EPT cannot encode this combination */
-	if ((uview->default_access & KVM_VMI_ACCESS_W) &&
-	    !(uview->default_access & KVM_VMI_ACCESS_R))
-		return -EINVAL;
-
-	view = kzalloc(sizeof(*view), GFP_KERNEL);
-	if (!view)
-		return -ENOMEM;
-
-	atomic_set(&view->vcpu_count, 0);
-	view->default_access = uview->default_access;
-	view->visible = true;
-	xa_init(&view->gfn_overrides);
-	xa_init(&view->access_overrides);
-
-	/* Allocate arch-specific EPT root */
-	ret = kvm_arch_vmi_create_view(kvm, view);
-	if (ret) {
-		xa_destroy(&view->gfn_overrides);
-		xa_destroy(&view->access_overrides);
-		kfree(view);
-		return ret;
-	}
-
-	/* Assign view ID and store in xarray */
-	mutex_lock(&vmi->lock);
-	view->id = vmi->next_view_id++;
-	ret = xa_insert(&vmi->views, view->id, view, GFP_KERNEL);
-	mutex_unlock(&vmi->lock);
-
-	if (ret) {
-		kvm_arch_vmi_destroy_view(kvm, view);
-		xa_destroy(&view->gfn_overrides);
-		xa_destroy(&view->access_overrides);
-		kfree(view);
-		return ret;
-	}
-
-	uview->view_id = view->id;
-	trace_kvm_vmi_view_create(view->id, view->default_access);
-	return 0;
-}
-
-/**
- * kvm_vmi_destroy_view - Destroy an alternate memory view
- * @kvm: The target VM.
- * @uview: View descriptor from userspace (view_id identifies the view).
- *
- * Frees a view and all its resources. Fails if any vCPU is currently
- * executing in the view.
- *
- * Return: 0 on success, negative errno on failure.
- */
-static int kvm_vmi_destroy_view(struct kvm *kvm, struct kvm_vmi_view *uview)
-{
-	struct kvm_vmi *vmi = kvm->vmi;
-	struct kvm_vmi_view_data *view;
-
-	if (!vmi)
-		return -EINVAL;
-
-	if (uview->view_id == 0)
-		return -EINVAL; /* Cannot destroy host view */
-
-	mutex_lock(&vmi->lock);
-	view = xa_load(&vmi->views, uview->view_id);
-	if (!view) {
-		mutex_unlock(&vmi->lock);
-		return -ENOENT;
-	}
-
-	/* Check no vCPUs are currently on this view */
-	if (atomic_read(&view->vcpu_count) > 0) {
-		mutex_unlock(&vmi->lock);
-		return -EBUSY;
-	}
-
-	xa_erase(&vmi->views, uview->view_id);
-	mutex_unlock(&vmi->lock);
-
-	trace_kvm_vmi_view_destroy(uview->view_id);
-
-	/* Free arch-specific resources (EPT pages) */
-	kvm_arch_vmi_destroy_view(kvm, view);
-
-	/* Free override xarrays */
-	xa_destroy(&view->gfn_overrides);
-	xa_destroy(&view->access_overrides);
-
-	kfree(view);
-	return 0;
-}
-
-static int kvm_vmi_validate_access(u8 access)
-{
-	/* Reject PW flag when hardware doesn't support EPT paging-write */
-	if ((access & KVM_VMI_ACCESS_PW) &&
-	    !kvm_arch_vmi_has_paging_write())
-		return -EOPNOTSUPP;
-
-	/* Reject W without R - EPT cannot encode this combination */
-	if ((access & KVM_VMI_ACCESS_W) && !(access & KVM_VMI_ACCESS_R))
-		return -EINVAL;
-
-	return 0;
-}
-
-static void kvm_vmi_set_gfn_access(struct kvm *kvm,
-				    struct kvm_vmi_view_data *view,
-				    u32 view_id, u64 gfn, u8 access)
-{
-	trace_kvm_vmi_set_mem_access(view_id, gfn, access);
-
-	xa_store(&view->access_overrides, gfn,
-		 xa_mk_value(access), GFP_KERNEL);
-
-	if (kvm_arch_vmi_view_has_root(view))
-		kvm_arch_vmi_invalidate_gfn(kvm, view, gfn);
-}
-
-static int kvm_vmi_set_mem_access_batch(struct kvm *kvm,
-					struct kvm_vmi_view_data *view,
-					struct kvm_vmi_mem_access *ma)
-{
-	u64 *gfns;
-	u8 *accesses;
-	u32 i;
-	int ret;
-
-	if (!ma->gfns_uaddr || !ma->accesses_uaddr)
-		return -EFAULT;
-
-	gfns = vmemdup_array_user((u64 __user *)ma->gfns_uaddr,
-				  ma->nr, sizeof(*gfns));
-	if (IS_ERR(gfns))
-		return PTR_ERR(gfns);
-
-	accesses = vmemdup_array_user((u8 __user *)ma->accesses_uaddr,
-				      ma->nr, sizeof(*accesses));
-	if (IS_ERR(accesses)) {
-		kvfree(gfns);
-		return PTR_ERR(accesses);
-	}
-
-	for (i = 0; i < ma->nr; i++) {
-		ret = kvm_vmi_validate_access(accesses[i]);
-		if (ret)
-			goto out;
-
-		kvm_vmi_set_gfn_access(kvm, view, ma->view_id,
-				       gfns[i], accesses[i]);
-	}
-
-	ret = 0;
-out:
-	kvfree(accesses);
-	kvfree(gfns);
-	return ret;
-}
-
-static int kvm_vmi_set_mem_access(struct kvm *kvm, struct kvm_vmi_mem_access *ma)
-{
-	struct kvm_vmi *vmi = kvm->vmi;
-	struct kvm_vmi_view_data *view;
-	int ret;
-
-	if (!vmi)
-		return -EINVAL;
-
-	if (ma->view_id == 0)
-		return -EINVAL; /* Cannot modify host view permissions */
-
-	view = xa_load(&vmi->views, ma->view_id);
-	if (!view)
-		return -ENOENT;
-
-	if (ma->nr <= 1) {
-		ret = kvm_vmi_validate_access(ma->access);
-		if (ret)
-			return ret;
-
-		kvm_vmi_set_gfn_access(kvm, view, ma->view_id,
-				       ma->gfn, ma->access);
-	} else {
-		ret = kvm_vmi_set_mem_access_batch(kvm, view, ma);
-		if (ret)
-			return ret;
-	}
-
-	kvm_flush_remote_tlbs(kvm);
-
-	return 0;
-}
-
-static u8 kvm_vmi_get_gfn_access(struct kvm_vmi_view_data *view, u64 gfn)
-{
-	void *entry;
-
-	if (!view)
-		return KVM_VMI_ACCESS_RWX;
-
-	entry = xa_load(&view->access_overrides, gfn);
-	if (entry)
-		return (u8)xa_to_value(entry);
-	return view->default_access;
-}
-
-static int kvm_vmi_get_mem_access_batch(struct kvm *kvm,
-					struct kvm_vmi_view_data *view,
-					struct kvm_vmi_mem_access *ma)
-{
-	u8 __user *accesses_out = (u8 __user *)ma->accesses_uaddr;
-	u64 *gfns;
-	u8 *accesses;
-	u32 i;
-	int ret;
-
-	if (!ma->gfns_uaddr || !accesses_out)
-		return -EFAULT;
-
-	gfns = vmemdup_array_user((u64 __user *)ma->gfns_uaddr,
-				  ma->nr, sizeof(*gfns));
-	if (IS_ERR(gfns))
-		return PTR_ERR(gfns);
-
-	accesses = kvmalloc_array(ma->nr, sizeof(*accesses), GFP_KERNEL);
-	if (!accesses) {
-		ret = -ENOMEM;
-		goto out_gfns;
-	}
-
-	for (i = 0; i < ma->nr; i++)
-		accesses[i] = kvm_vmi_get_gfn_access(view, gfns[i]);
-
-	if (copy_to_user(accesses_out, accesses, ma->nr * sizeof(*accesses)))
-		ret = -EFAULT;
-	else
-		ret = 0;
-
-	kvfree(accesses);
-out_gfns:
-	kvfree(gfns);
-	return ret;
-}
-
-static int kvm_vmi_get_mem_access(struct kvm *kvm, struct kvm_vmi_mem_access *ma)
-{
-	struct kvm_vmi *vmi = kvm->vmi;
-	struct kvm_vmi_view_data *view = NULL;
-
-	if (!vmi)
-		return -EINVAL;
-
-	if (ma->view_id != 0) {
-		view = xa_load(&vmi->views, ma->view_id);
-		if (!view)
-			return -ENOENT;
-	}
-
-	if (ma->nr <= 1) {
-		ma->access = kvm_vmi_get_gfn_access(view, ma->gfn);
-		return 0;
-	}
-
-	return kvm_vmi_get_mem_access_batch(kvm, view, ma);
 }
 
 /**
@@ -821,17 +598,29 @@ static int kvm_vmi_get_mem_access(struct kvm *kvm, struct kvm_vmi_mem_access *ma
  * Remapped GFNs (via change_gfn) are skipped since they intentionally
  * point to different physical pages.
  *
- * Called with kvm->mmu_lock held by the mmu_notifier framework.
+ * Invoked from the shared kvm_mmu_unmap_gfn_range() handler under
+ * kvm->mmu_lock. The srcu rationale for the kvm_vmi_get() read is at the
+ * lock below.
  */
 void kvm_vmi_propagate_change(struct kvm *kvm, gfn_t start, gfn_t end)
 {
-	struct kvm_vmi *vmi = kvm_vmi_get(kvm);
+	struct kvm_vmi *vmi;
 	struct kvm_vmi_view_data *view;
 	unsigned long index;
 	gfn_t gfn;
+	int srcu_idx;
 
+	/*
+	 * kvm_vmi_get() srcu_dereferences kvm->vmi, which mmu_lock alone does
+	 * not protect against the synchronize_srcu()-gated free in
+	 * kvm_vmi_release(). Some callers (e.g. the guest_memfd invalidate
+	 * path) reach here under mmu_lock only, so take kvm->srcu locally; it
+	 * is non-blocking under mmu_lock and nests harmlessly otherwise.
+	 */
+	srcu_idx = srcu_read_lock(&kvm->srcu);
+	vmi = kvm_vmi_get(kvm);
 	if (!vmi)
-		return;
+		goto out;
 
 	/* TODO: batched range zap instead of per-GFN walks for large ranges */
 	xa_for_each(&vmi->views, index, view) {
@@ -845,171 +634,13 @@ void kvm_vmi_propagate_change(struct kvm *kvm, gfn_t start, gfn_t end)
 			kvm_arch_vmi_invalidate_gfn_locked(kvm, view, gfn);
 		}
 	}
+out:
+	srcu_read_unlock(&kvm->srcu, srcu_idx);
 }
 
-/**
- * kvm_vmi_change_gfn - Remap a GFN in an alternate view
- * @kvm: The target VM.
- * @change: Change descriptor with view_id, old_gfn, new_gfn.
- *
- * Maps old_gfn to the physical page backing new_gfn in this view.
- * When new_gfn is KVM_VMI_INVALID_GFN, reverts to the host mapping.
- *
- * This is the core mechanism for shadow page breakpoints:
- *   1. Allocate shadow GFN, copy original page
- *   2. Patch shadow page (e.g., insert INT3)
- *   3. change_gfn(view, original_gfn, shadow_gfn)
- *   4. Guest on this view now sees shadow page at original_gfn
- *
- * Return: 0 on success, negative errno on failure.
+/*
+ * vmi_fd ioctl handlers
  */
-static int kvm_vmi_change_gfn(struct kvm *kvm, struct kvm_vmi_change_gfn *change)
-{
-	struct page *refcounted_page = NULL;
-	struct kvm_vmi *vmi = kvm->vmi;
-	struct kvm_vmi_view_data *view;
-	struct kvm_memory_slot *slot;
-	struct page *shadow;
-	bool writable;
-	kvm_pfn_t pfn;
-	hpa_t new_hpa;
-
-	if (!vmi)
-		return -EINVAL;
-
-	if (change->view_id == 0)
-		return -EINVAL; /* Cannot remap in host view */
-
-	view = xa_load(&vmi->views, change->view_id);
-	if (!view)
-		return -ENOENT;
-
-	trace_kvm_vmi_change_gfn(change->view_id, change->old_gfn,
-				 change->new_gfn);
-
-	if (change->new_gfn == KVM_VMI_INVALID_GFN) {
-		/* Revert: remove remapping, restore host mapping */
-		xa_erase(&view->gfn_overrides, change->old_gfn);
-
-		if (kvm_arch_vmi_view_has_root(view))
-			kvm_arch_vmi_invalidate_gfn_revert(kvm, view,
-							   change->old_gfn);
-		kvm_flush_remote_tlbs(kvm);
-		return 0;
-	}
-
-	/*
-	 * Resolve new_gfn to HPA. If new_gfn is a VMI-allocated shadow
-	 * page, use it directly. Otherwise resolve via host memslots.
-	 */
-	if (change->new_gfn >= KVM_VMI_SHADOW_GFN_BASE) {
-		shadow = xa_load(&vmi->shadow_pages, change->new_gfn);
-		if (!shadow)
-			return -ENOENT;
-		new_hpa = page_to_phys(shadow);
-	} else {
-		slot = gfn_to_memslot(kvm, change->new_gfn);
-		if (!slot)
-			return -EFAULT;
-
-		pfn = __kvm_faultin_pfn(slot, change->new_gfn, 0,
-					&writable, &refcounted_page);
-		if (is_error_noslot_pfn(pfn))
-			return -EFAULT;
-		new_hpa = (hpa_t)pfn << PAGE_SHIFT;
-	}
-
-	/* Store the remapping: old_gfn -> new_hpa */
-	xa_store(&view->gfn_overrides, change->old_gfn,
-		 (void *)(unsigned long)new_hpa, GFP_KERNEL);
-
-	/* Zap old mapping so next fault installs with remap PFN */
-	if (kvm_arch_vmi_view_has_root(view))
-		kvm_arch_vmi_invalidate_gfn(kvm, view, change->old_gfn);
-
-	if (refcounted_page)
-		put_page(refcounted_page);
-	kvm_flush_remote_tlbs(kvm);
-
-	return 0;
-}
-
-static int kvm_vmi_alloc_gfn(struct kvm *kvm, struct kvm_vmi_alloc_gfn *alloc)
-{
-	struct kvm_vmi *vmi = kvm->vmi;
-	struct page *page;
-	u64 shadow_gfn;
-	int ret;
-
-	if (!vmi)
-		return -EINVAL;
-
-	page = alloc_page(GFP_KERNEL_ACCOUNT | __GFP_ZERO);
-	if (!page)
-		return -ENOMEM;
-
-	mutex_lock(&vmi->lock);
-	shadow_gfn = vmi->next_shadow_gfn++;
-	ret = xa_err(xa_store(&vmi->shadow_pages, shadow_gfn, page, GFP_KERNEL));
-	mutex_unlock(&vmi->lock);
-
-	if (ret) {
-		__free_page(page);
-		return ret;
-	}
-
-	alloc->gfn = shadow_gfn;
-	return 0;
-}
-
-static int kvm_vmi_free_gfn(struct kvm *kvm, struct file *file,
-			    struct kvm_vmi_free_gfn *free_req)
-{
-	struct kvm_vmi *vmi = kvm->vmi;
-	struct kvm_vmi_view_data *view;
-	struct page *page;
-	unsigned long view_idx;
-	hpa_t shadow_hpa;
-
-	if (!vmi)
-		return -EINVAL;
-
-	if (free_req->gfn < KVM_VMI_SHADOW_GFN_BASE)
-		return -EINVAL;
-
-	mutex_lock(&vmi->lock);
-
-	page = xa_load(&vmi->shadow_pages, free_req->gfn);
-	if (!page) {
-		mutex_unlock(&vmi->lock);
-		return -ENOENT;
-	}
-
-	shadow_hpa = page_to_phys(page);
-
-	/* Check if any view's gfn_overrides references this page */
-	xa_for_each(&vmi->views, view_idx, view) {
-		void *entry;
-		unsigned long gfn;
-
-		xa_for_each(&view->gfn_overrides, gfn, entry) {
-			if ((hpa_t)(unsigned long)entry == shadow_hpa) {
-				mutex_unlock(&vmi->lock);
-				return -EBUSY;
-			}
-		}
-	}
-
-	xa_erase(&vmi->shadow_pages, free_req->gfn);
-	mutex_unlock(&vmi->lock);
-
-	/* Forcibly unmap from any agent userspace mappings */
-	unmap_mapping_range(file->f_mapping,
-			    (loff_t)free_req->gfn << PAGE_SHIFT, PAGE_SIZE, 1);
-
-	__free_page(page);
-	return 0;
-}
 
 /*
  * Per-vCPU ring fd file operations
@@ -1225,6 +856,25 @@ static void kvm_vmi_free_ring(struct kvm_vcpu *vcpu)
 	if (!vcpu_vmi)
 		return;
 
+	/*
+	 * Precondition: the caller has paused the VM, so this vCPU is parked in
+	 * kvm_vmi_vcpu_pause_wait() with vcpu->mutex droppable. That lets the
+	 * mutex_lock() below acquire promptly instead of deadlocking against an
+	 * arm64 WFI-halted vCPU that would otherwise hold the mutex.
+	 */
+	WARN_ON_ONCE(!kvm_vmi_vcpu_paused(vcpu));
+
+	/*
+	 * Take vcpu->mutex to exclude the kvm_vmi_deliver_via_ring() producer
+	 * top section that writes the ring page in HOST mode -- pausing the VM
+	 * does not wait for it. KVM_REQ_OUTSIDE_GUEST_MODE only forces vCPUs
+	 * out of GUEST mode, but that section runs post-vmexit with vcpu->mode
+	 * already OUTSIDE_GUEST_MODE, so kvm_make_all_cpus_request() skips it.
+	 * The mutex is the barrier that waits for that writer before we free
+	 * the page. (Other ring accessors check the teardown flag set below.)
+	 */
+	mutex_lock(&vcpu->mutex);
+
 	vcpu_vmi->teardown = true;
 	wake_up(&vcpu_vmi->wq);
 	wake_up(&vcpu_vmi->pause_wq);
@@ -1249,6 +899,8 @@ static void kvm_vmi_free_ring(struct kvm_vcpu *vcpu)
 	}
 	vcpu_vmi->ring = NULL;
 	vcpu_vmi->ring_file = NULL;
+
+	mutex_unlock(&vcpu->mutex);
 }
 
 /**
@@ -1272,13 +924,18 @@ static int kvm_vmi_teardown_ring(struct kvm *kvm, u32 vcpu_id)
 	if (!vcpu->vmi || !vcpu->vmi->ring_page)
 		return -ENOENT;
 
+	/*
+	 * Pause the VM so every vCPU parks in the run-loop pause check with
+	 * vcpu->mutex dropped before kvm_vmi_free_ring() takes it. A WFI-halted
+	 * vCPU holds vcpu->mutex across KVM_RUN and a bare kick can't drop it
+	 * on arm64, so free_ring would otherwise deadlock. close(vmi_fd) is
+	 * safe only because release() pauses first; this ioctl does not.
+	 */
+	kvm_vmi_pause_vm(kvm);
 	kvm_vmi_free_ring(vcpu);
+	kvm_vmi_unpause_vm(kvm);
 	return 0;
 }
-
-/*
- * vmi_fd ioctl handlers
- */
 
 /**
  * kvm_vmi_ack_event - Acknowledge a ring event for a vCPU
@@ -1301,13 +958,32 @@ static int kvm_vmi_ack_event(struct kvm *kvm, struct kvm_vmi_vcpu *ack)
 		return -EINVAL;
 
 	vcpu_vmi = vcpu->vmi;
-	if (!vcpu_vmi || !vcpu_vmi->ring)
+	if (!vcpu_vmi)
 		return -EINVAL;
 
 	/*
-	 * Advance the consumer index. The agent has already written
-	 * the response to the ring slot; this makes it visible to
-	 * the blocked vCPU thread.
+	 * Serialize against kvm_vmi_free_ring(), which __free_page()s the ring
+	 * and NULLs ->ring under vcpu->mutex. kvm_vmi_ioctl() is .unlocked_ioctl,
+	 * so a concurrent KVM_VMI_TEARDOWN_RING on this same vmi_fd can free the
+	 * ring between a lock-free !ring check and the req_cons write below ->
+	 * use-after-free on the freed ring page. The ack caller is an agent
+	 * thread, not a vCPU, so kvm_vmi_pause_vm() in the teardown path does not
+	 * park it; only this mutex excludes the freer. Taking it cannot deadlock:
+	 * the ack path runs in process context holding no other lock (vcpu->mutex
+	 * is outermost), and the vCPU thread drops vcpu->mutex in
+	 * kvm_vmi_deliver_via_ring() before blocking on the very ack this advances.
+	 */
+	mutex_lock(&vcpu->mutex);
+
+	/* Re-check under the lock: free_ring may have torn the ring down. */
+	if (vcpu_vmi->teardown || !vcpu_vmi->ring) {
+		mutex_unlock(&vcpu->mutex);
+		return -EINVAL;
+	}
+
+	/*
+	 * Advance the consumer index. The agent has already written the response
+	 * to the ring slot; this makes it visible to the blocked vCPU thread.
 	 */
 	smp_wmb();
 	WRITE_ONCE(vcpu_vmi->ring->req_cons, vcpu_vmi->ring->req_cons + 1);
@@ -1315,94 +991,97 @@ static int kvm_vmi_ack_event(struct kvm *kvm, struct kvm_vmi_vcpu *ack)
 	/* Wake the blocked vCPU */
 	wake_up(&vcpu_vmi->wq);
 
+	mutex_unlock(&vcpu->mutex);
 	return 0;
 }
 
 /**
- * kvm_vmi_switch_view - Switch all vCPUs to a view (ioctl wrapper)
- * @kvm: The target VM.
- * @sv: Switch view descriptor from userspace.
+ * kvm_vmi_control_event - Enable or disable VM-wide event monitoring
+ * @kvm: The VM.
+ * @ctrl: Event control parameters from userspace.
+ *
+ * Dispatches to arch-specific handler for arch events (CR, MSR, etc.),
+ * then falls through to generic bit-toggle for generic events.
  *
  * Return: 0 on success, negative errno on failure.
  */
-static int kvm_vmi_switch_view(struct kvm *kvm,
-			       struct kvm_vmi_switch_view *sv)
+static int kvm_vmi_control_event(struct kvm *kvm,
+				 struct kvm_vmi_control_event *ctrl)
 {
-	struct kvm_vmi *vmi = kvm->vmi;
-	struct kvm_vmi_view_data *new_view, *old_view;
-	struct kvm_vcpu *vcpu;
-	unsigned long i;
-
-	if (!vmi)
-		return -EINVAL;
-
-	if (sv->view_id == 0) {
-		new_view = NULL;
-	} else {
-		new_view = xa_load(&vmi->views, sv->view_id);
-		if (!new_view)
-			return -ENOENT;
-	}
+	struct kvm_vmi *vmi;
+	u32 event = ctrl->event;
+	int r = 0;
+	int srcu_idx;
 
 	/*
-	 * Switch every vCPU to the target view. Update in-memory state
-	 * first, then kick all vCPUs via kvm_arch_vmi_update() so they
-	 * pick up the new EPTP in apply_vmcs_state().
+	 * Take kvm->srcu before vmi->lock (same order as kvm_vmi_change_gfn())
+	 * so the kvm_vmi_get() here and the nested one in the arch
+	 * kvm_arch_vmi_control_event() hook both deref kvm->vmi under SRCU,
+	 * not bare under vmi->lock. control_event never blocks, so holding
+	 * SRCU across the whole call is fine.
 	 */
-	kvm_for_each_vcpu(i, vcpu, kvm) {
-		struct kvm_vcpu_vmi *vcpu_vmi = vcpu->vmi;
-		u32 old_view_id;
+	srcu_idx = srcu_read_lock(&kvm->srcu);
+	vmi = kvm_vmi_get(kvm);
 
-		if (!vcpu_vmi)
-			continue;
-
-		old_view_id = vcpu_vmi->current_view_id;
-		if (sv->view_id == old_view_id)
-			continue;
-
-		/* Update refcounts */
-		if (old_view_id != 0) {
-			old_view = xa_load(&vmi->views, old_view_id);
-			if (old_view)
-				atomic_dec(&old_view->vcpu_count);
-		}
-		if (new_view)
-			atomic_inc(&new_view->vcpu_count);
-
-		vcpu_vmi->current_view_id = sv->view_id;
-		vcpu_vmi->current_view = new_view;
-
-		/*
-		 * When switching back to view 0, ask the arch layer
-		 * to reload the host page table root on next entry.
-		 */
-		if (sv->view_id == 0 && old_view_id != 0)
-			kvm_arch_vmi_reset_view(vcpu);
+	if (!vmi) {
+		r = -EINVAL;
+		goto out_srcu;
 	}
 
-	/* Schedule VMCS sync + kick on all vCPUs */
+	if (event >= KVM_VMI_NUM_EVENTS) {
+		r = -EINVAL;
+		goto out_srcu;
+	}
+
+	mutex_lock(&vmi->lock);
+
+	/*
+	 * Try arch callback first for arch-specific event IDs.
+	 * Events with special parameters (e.g., CR index, MSR number)
+	 * are fully handled by the arch callback (returns 0 or error).
+	 * Events the arch doesn't handle specially return -EOPNOTSUPP,
+	 * falling through to generic bit-toggle handling below.
+	 */
+	if (event >= KVM_VMI_EVENT_ARCH_BASE) {
+		r = kvm_arch_vmi_control_event(kvm, ctrl);
+		if (r != -EOPNOTSUPP)
+			goto out_unlock;
+		r = 0;
+	}
+
+	/* Generic events: manage enabled_events bit directly */
+	if (ctrl->enable)
+		vmi->enabled_events |= BIT_ULL(event);
+	else
+		vmi->enabled_events &= ~BIT_ULL(event);
 	kvm_arch_vmi_update(kvm);
 
-	return 0;
+out_unlock:
+	mutex_unlock(&vmi->lock);
+out_srcu:
+	srcu_read_unlock(&kvm->srcu, srcu_idx);
+	return r;
 }
 
 /*
- * VM-wide pause: increment pause_count on all vCPUs, force them out
- * of guest mode and off waitqueues.
+ * The single VMI teardown-quiesce primitive: park every vCPU off its
+ * vcpu->mutex so a non-run-loop teardown thread can take that mutex. All
+ * teardown paths route through this (release, teardown_ring, free_ring's
+ * precondition). A bare kvm_vcpu_kick() does not drop the mutex on an arm64
+ * WFI-halted vCPU, so both requests below are needed.
  *
- * Three vCPU states are handled:
+ * Increments pause_count on all vCPUs, then handles three vCPU states:
  *  - In guest mode: KVM_REQ_OUTSIDE_GUEST_MODE forces a VM-exit and
  *    waits for acknowledgement (Dekker barrier pattern).
  *  - Halted/sleeping (HLT, kvm_vcpu_block): KVM_REQ_UNBLOCK wakes
  *    them (KVM_REQ_OUTSIDE_GUEST_MODE has KVM_REQUEST_NO_WAKEUP).
  *  - Not in KVM_RUN: vcpu->mutex is already free.
  *
- * After return, vCPUs will reach the pause check at the top of
- * vcpu_run() and release vcpu->mutex.  KVM_GET_REGS from the VMI
- * agent naturally serializes on vcpu->mutex, so no explicit barrier
- * is needed here.
+ * After return, vCPUs reach the pause check at the top of vcpu_run() and
+ * release vcpu->mutex. KVM_GET_REGS from the VMI agent serializes on
+ * vcpu->mutex, so no explicit barrier is needed here.
  */
-static int kvm_vmi_pause_vm(struct kvm *kvm)
+int kvm_vmi_pause_vm(struct kvm *kvm)
 {
 	struct kvm_vcpu *vcpu;
 	unsigned long i;
@@ -1436,7 +1115,7 @@ static int kvm_vmi_pause_vm(struct kvm *kvm)
 	return 0;
 }
 
-static int kvm_vmi_unpause_vm(struct kvm *kvm)
+int kvm_vmi_unpause_vm(struct kvm *kvm)
 {
 	struct kvm_vcpu *vcpu;
 	unsigned long i;
@@ -1496,6 +1175,760 @@ static int kvm_vmi_inject_event_ioctl(struct kvm *kvm,
 	return r;
 }
 
+/* Drop all non-shadow target pins held by a view and free the tracking xarray. */
+static void kvm_vmi_drop_override_pins(struct kvm_vmi_view_data *view)
+{
+	struct page *page;
+	unsigned long idx;
+
+	xa_for_each(&view->gfn_override_pages, idx, page)
+		put_page(page);
+	xa_destroy(&view->gfn_override_pages);
+}
+
+/**
+ * kvm_vmi_create_view - Create an alternate memory view
+ * @kvm: The target VM.
+ * @uview: View descriptor from userspace (view_id is output).
+ *
+ * Allocates a new alternate view with its own EPT root. The view starts
+ * empty; entries are lazily populated from the host EPT on first access.
+ *
+ * Return: 0 on success, negative errno on failure.
+ */
+static int kvm_vmi_create_view(struct kvm *kvm, struct kvm_vmi_view *uview)
+{
+	struct kvm_vmi *vmi = kvm->vmi;
+	struct kvm_vmi_view_data *view;
+	int ret;
+
+	if (!vmi)
+		return -EINVAL;
+
+	/* Reject PW flag in default_access when hardware doesn't support it */
+	if ((uview->default_access & KVM_VMI_ACCESS_PW) &&
+	    !kvm_arch_vmi_has_paging_write())
+		return -EOPNOTSUPP;
+
+	/* Reject W without R - EPT cannot encode this combination */
+	if ((uview->default_access & KVM_VMI_ACCESS_W) &&
+	    !(uview->default_access & KVM_VMI_ACCESS_R))
+		return -EINVAL;
+
+	view = kzalloc(sizeof(*view), GFP_KERNEL);
+	if (!view)
+		return -ENOMEM;
+
+	atomic_set(&view->vcpu_count, 0);
+	view->default_access = uview->default_access;
+	view->visible = true;
+	xa_init(&view->access_overrides);
+	xa_init(&view->gfn_overrides);
+	xa_init(&view->gfn_override_pages);
+
+	/* Allocate arch-specific EPT root */
+	ret = kvm_arch_vmi_create_view(kvm, view);
+	if (ret) {
+		kvm_vmi_drop_override_pins(view);
+		xa_destroy(&view->gfn_overrides);
+		xa_destroy(&view->access_overrides);
+		kfree(view);
+		return ret;
+	}
+
+	/* Assign view ID and store in xarray */
+	mutex_lock(&vmi->lock);
+	view->id = vmi->next_view_id++;
+	ret = xa_insert(&vmi->views, view->id, view, GFP_KERNEL);
+	mutex_unlock(&vmi->lock);
+
+	if (ret) {
+		kvm_arch_vmi_destroy_view(kvm, view);
+		kvm_vmi_drop_override_pins(view);
+		xa_destroy(&view->gfn_overrides);
+		xa_destroy(&view->access_overrides);
+		kfree(view);
+		return ret;
+	}
+
+	uview->view_id = view->id;
+	trace_kvm_vmi_view_create(view->id, view->default_access);
+	return 0;
+}
+
+/*
+ * Deferred free of a destroyed view, queued via call_srcu(&kvm->srcu) once the
+ * arch stage-2 root has been torn down synchronously. The embedded xarrays are
+ * walked by the lock-free fault-path readers under kvm->srcu (kvm_vmi_view_*),
+ * so their teardown must outlive any in-flight reader - hence it runs here,
+ * after the SRCU grace period, not at destroy_view time. Mirrors __free_bus()
+ * (virt/kvm/kvm_main.c) and free_vcpu_vmi() above.
+ */
+static void free_view(struct rcu_head *rcu)
+{
+	struct kvm_vmi_view_data *view =
+		container_of(rcu, struct kvm_vmi_view_data, rcu_head);
+
+	kvm_vmi_drop_override_pins(view);
+	xa_destroy(&view->gfn_overrides);
+	xa_destroy(&view->access_overrides);
+	kfree(view);
+}
+
+/**
+ * kvm_vmi_destroy_view - Destroy an alternate memory view
+ * @kvm: The target VM.
+ * @uview: View descriptor from userspace (view_id identifies the view).
+ *
+ * Frees a view and all its resources. Fails if any vCPU is currently
+ * executing in the view.
+ *
+ * Return: 0 on success, negative errno on failure.
+ */
+static int kvm_vmi_destroy_view(struct kvm *kvm, struct kvm_vmi_view *uview)
+{
+	struct kvm_vmi *vmi = kvm->vmi;
+	struct kvm_vmi_view_data *view;
+
+	if (!vmi)
+		return -EINVAL;
+
+	if (uview->view_id == 0)
+		return -EINVAL; /* Cannot destroy host view */
+
+	mutex_lock(&vmi->lock);
+	view = xa_load(&vmi->views, uview->view_id);
+	if (!view) {
+		mutex_unlock(&vmi->lock);
+		return -ENOENT;
+	}
+
+	/* Check no vCPUs are currently on this view */
+	if (atomic_read(&view->vcpu_count) > 0) {
+		mutex_unlock(&vmi->lock);
+		return -EBUSY;
+	}
+
+	/*
+	 * Publish ->dying, then re-read vcpu_count. The vCPU-thread switch
+	 * (__kvm_vmi_vcpu_switch_view_locked) cannot take vmi->lock, so it
+	 * serializes against us with a symmetric store-load barrier:
+	 *   switch:  atomic_inc(count); smp_mb__after_atomic(); read ->dying
+	 *   destroy: WRITE_ONCE(->dying,1); smp_mb(); read count
+	 * The two full barriers forbid the "both miss" outcome, so at most one
+	 * side proceeds: if a switch's inc is visible here we back off (-EBUSY,
+	 * clearing ->dying); otherwise the switch observes ->dying and backs off
+	 * its inc. A freed view is therefore never left referenced by a vCPU's
+	 * current_view.
+	 */
+	WRITE_ONCE(view->dying, true);
+	smp_mb();
+	if (atomic_read(&view->vcpu_count) > 0) {
+		WRITE_ONCE(view->dying, false);
+		mutex_unlock(&vmi->lock);
+		return -EBUSY;
+	}
+
+	xa_erase(&vmi->views, uview->view_id);
+	mutex_unlock(&vmi->lock);
+
+	trace_kvm_vmi_view_destroy(uview->view_id);
+
+	/*
+	 * Free arch-specific resources (EPT/stage-2 root) synchronously. Safe:
+	 * vcpu_count==0 and the arch drain forces vCPUs OUTSIDE_GUEST_MODE, and
+	 * no SRCU reader dereferences view->arch.{mmu,tdp_root}.
+	 */
+	kvm_arch_vmi_destroy_view(kvm, view);
+
+	/* Defer the struct + embedded-xarray free past in-flight SRCU readers. */
+	call_srcu(&kvm->srcu, &view->rcu_head, free_view);
+	return 0;
+}
+
+/**
+ * kvm_vmi_switch_view - Switch all vCPUs to a view (ioctl wrapper)
+ * @kvm: The target VM.
+ * @sv: Switch view descriptor from userspace.
+ *
+ * Return: 0 on success, negative errno on failure.
+ */
+static int kvm_vmi_switch_view(struct kvm *kvm,
+			       struct kvm_vmi_switch_view *sv)
+{
+	struct kvm_vmi *vmi = kvm->vmi;
+	struct kvm_vmi_view_data *new_view, *old_view;
+	struct kvm_vcpu *vcpu;
+	unsigned long i;
+
+	if (!vmi)
+		return -EINVAL;
+
+	/*
+	 * Hold vmi->lock across the view lookup and the per-vCPU refcount
+	 * updates below. kvm_vmi_destroy_view() erases the view under vmi->lock
+	 * and frees it (and its arch stage-2 root) right after, once
+	 * vcpu_count == 0 -- which is exactly the xa_load()->atomic_inc() window
+	 * here. Without the lock this otherwise lock-free lookup + refcount bump
+	 * races destroy_view and increments a freed view. The per-vCPU view_lock
+	 * taken inside the loop only serializes a vCPU's own view switches, not
+	 * KVM_VMI_DESTROY_VIEW. Lock order is vmi->lock (mutex) -> view_lock
+	 * (spinlock), consistent with the rest of the file; no view_lock holder
+	 * takes vmi->lock, so no inversion is introduced. See change_gfn
+	 * (7bc2164c) for the sibling fix.
+	 */
+	mutex_lock(&vmi->lock);
+
+	if (sv->view_id == 0) {
+		new_view = NULL;
+	} else {
+		new_view = xa_load(&vmi->views, sv->view_id);
+		if (!new_view) {
+			mutex_unlock(&vmi->lock);
+			return -ENOENT;
+		}
+	}
+
+	/*
+	 * Switch every vCPU to the target view. Update in-memory state
+	 * first, then kick all vCPUs via kvm_arch_vmi_update() so they
+	 * pick up the new EPTP in apply_vmcs_state().
+	 */
+	kvm_for_each_vcpu(i, vcpu, kvm) {
+		struct kvm_vcpu_vmi *vcpu_vmi = vcpu->vmi;
+		u32 old_view_id;
+
+		if (!vcpu_vmi)
+			continue;
+
+		/*
+		 * Serialize this VM-wide mutation against the vCPU's own view
+		 * switches (fast-singlestep completion and ring-response
+		 * switches run on the vCPU thread). Without it the refcount
+		 * update and the restore-target redirect below race those
+		 * paths, and a fast-singlestep completing in the window can
+		 * resurrect a refcount on the view we are switching away from.
+		 */
+		spin_lock(&vcpu_vmi->view_lock);
+
+		old_view_id = vcpu_vmi->current_view_id;
+		if (sv->view_id == old_view_id) {
+			spin_unlock(&vcpu_vmi->view_lock);
+			continue;
+		}
+
+		/* Update refcounts */
+		if (old_view_id != 0) {
+			old_view = xa_load(&vmi->views, old_view_id);
+			if (old_view)
+				atomic_dec(&old_view->vcpu_count);
+		}
+		if (new_view)
+			atomic_inc(&new_view->vcpu_count);
+
+		vcpu_vmi->current_view_id = sv->view_id;
+		rcu_assign_pointer(vcpu_vmi->current_view, new_view);
+
+		/*
+		 * A vCPU mid in-kernel fast-singlestep has snapshotted the view
+		 * to return to when the step completes. An explicit VM-wide
+		 * switch supersedes that intent: redirect the pending restore to
+		 * the new view so the completing step does not resurrect the
+		 * vCPU onto the view the agent just switched away from. Without
+		 * this, a teardown switch to view 0 is silently undone by the
+		 * restore, leaving the vCPU on the old (alternate) view after
+		 * breakpoint monitoring has been disabled, so the next planted
+		 * BRK is delivered to the guest instead of the agent and the
+		 * old view cannot be destroyed (its vcpu_count never drops).
+		 * The view_lock above makes this redirect atomic with the
+		 * completion's read of the restore target.
+		 */
+		if (vcpu_vmi->fast_singlestep_active)
+			vcpu_vmi->fast_singlestep_restore_view = sv->view_id;
+
+		/*
+		 * When switching back to view 0, ask the arch layer
+		 * to reload the host page table root on next entry.
+		 */
+		if (sv->view_id == 0 && old_view_id != 0)
+			kvm_arch_vmi_reset_view(vcpu);
+
+		spin_unlock(&vcpu_vmi->view_lock);
+	}
+
+	/*
+	 * The refcounts are now committed: any vCPU that switched onto new_view
+	 * has bumped its vcpu_count, so destroy_view() can no longer free it.
+	 * Drop vmi->lock before the kick (kvm_arch_vmi_update touches no view).
+	 */
+	mutex_unlock(&vmi->lock);
+
+	/* Schedule VMCS sync + kick on all vCPUs */
+	kvm_arch_vmi_update(kvm);
+
+	return 0;
+}
+
+/*
+ * KVM_VMI_GET_MEM_INFO: report the guest RAM extent.
+ *
+ * Returns the exclusive upper-bound GFN of guest RAM, the maximum of
+ * base_gfn + npages over all memslots. The agent rejects reads of frames at or
+ * above this bound (which the VMM did not back with RAM) instead of faulting
+ * the vmi_fd mmap. KVM has no memslot-enumeration ioctl, so the agent cannot
+ * otherwise learn the layout the VMM programmed.
+ */
+static int kvm_vmi_get_mem_info(struct kvm *kvm, struct kvm_vmi_mem_info *info)
+{
+	struct kvm_memory_slot *memslot;
+	struct kvm_memslots *slots;
+	gfn_t max_gfn = 0;
+	int bkt, idx;
+
+	idx = srcu_read_lock(&kvm->srcu);
+	slots = kvm_memslots(kvm);
+	kvm_for_each_memslot(memslot, bkt, slots) {
+		gfn_t end = memslot->base_gfn + memslot->npages;
+
+		if (end > max_gfn)
+			max_gfn = end;
+	}
+	srcu_read_unlock(&kvm->srcu, idx);
+
+	info->max_gfn = max_gfn;
+	info->pad = 0;
+	return 0;
+}
+
+static u8 kvm_vmi_get_gfn_access(struct kvm_vmi_view_data *view, u64 gfn)
+{
+	void *entry;
+
+	if (!view)
+		return KVM_VMI_ACCESS_RWX;
+
+	entry = xa_load(&view->access_overrides, gfn);
+	if (entry)
+		return (u8)xa_to_value(entry);
+	return view->default_access;
+}
+
+static int kvm_vmi_get_mem_access_batch(struct kvm *kvm,
+					struct kvm_vmi_view_data *view,
+					struct kvm_vmi_mem_access *ma)
+{
+	u8 __user *accesses_out = (u8 __user *)ma->accesses_uaddr;
+	u64 *gfns;
+	u8 *accesses;
+	u32 i;
+	int ret;
+
+	if (!ma->gfns_uaddr || !accesses_out)
+		return -EFAULT;
+
+	gfns = vmemdup_array_user((u64 __user *)ma->gfns_uaddr,
+				  ma->nr, sizeof(*gfns));
+	if (IS_ERR(gfns))
+		return PTR_ERR(gfns);
+
+	accesses = kvmalloc_array(ma->nr, sizeof(*accesses), GFP_KERNEL);
+	if (!accesses) {
+		ret = -ENOMEM;
+		goto out_gfns;
+	}
+
+	for (i = 0; i < ma->nr; i++)
+		accesses[i] = kvm_vmi_get_gfn_access(view, gfns[i]);
+
+	if (copy_to_user(accesses_out, accesses, ma->nr * sizeof(*accesses)))
+		ret = -EFAULT;
+	else
+		ret = 0;
+
+	kvfree(accesses);
+out_gfns:
+	kvfree(gfns);
+	return ret;
+}
+
+static int kvm_vmi_get_mem_access(struct kvm *kvm, struct kvm_vmi_mem_access *ma)
+{
+	struct kvm_vmi *vmi = kvm->vmi;
+	struct kvm_vmi_view_data *view = NULL;
+	int ret;
+
+	if (!vmi)
+		return -EINVAL;
+
+	/* vmi->lock keeps the view alive vs kvm_vmi_destroy_view() (see change_gfn). */
+	mutex_lock(&vmi->lock);
+
+	if (ma->view_id != 0) {
+		view = xa_load(&vmi->views, ma->view_id);
+		if (!view) {
+			ret = -ENOENT;
+			goto out;
+		}
+	}
+
+	if (ma->nr <= 1) {
+		ma->access = kvm_vmi_get_gfn_access(view, ma->gfn);
+		ret = 0;
+		goto out;
+	}
+
+	ret = kvm_vmi_get_mem_access_batch(kvm, view, ma);
+
+out:
+	mutex_unlock(&vmi->lock);
+	return ret;
+}
+
+static int kvm_vmi_validate_access(u8 access)
+{
+	/* Reject PW flag when hardware doesn't support EPT paging-write */
+	if ((access & KVM_VMI_ACCESS_PW) &&
+	    !kvm_arch_vmi_has_paging_write())
+		return -EOPNOTSUPP;
+
+	/* Reject W without R - EPT cannot encode this combination */
+	if ((access & KVM_VMI_ACCESS_W) && !(access & KVM_VMI_ACCESS_R))
+		return -EINVAL;
+
+	return 0;
+}
+
+static void kvm_vmi_set_gfn_access(struct kvm *kvm,
+				    struct kvm_vmi_view_data *view,
+				    u32 view_id, u64 gfn, u8 access,
+				    u16 autostep_mask)
+{
+	/*
+	 * Pack the sub-page auto-step mask above the access byte in the same
+	 * xarray value entry. Readers that only want the access mask the low
+	 * byte (xa_to_value cast to u8), so this is invisible to them and to
+	 * arches that never set a mask. See struct kvm_vmi_mem_access.
+	 */
+	unsigned long val = access | ((unsigned long)autostep_mask << 8);
+
+	trace_kvm_vmi_set_mem_access(view_id, gfn, access);
+
+	xa_store(&view->access_overrides, gfn,
+		 xa_mk_value(val), GFP_KERNEL);
+
+	if (kvm_arch_vmi_view_has_root(view))
+		kvm_arch_vmi_invalidate_gfn(kvm, view, gfn);
+}
+
+static int kvm_vmi_set_mem_access_batch(struct kvm *kvm,
+					struct kvm_vmi_view_data *view,
+					struct kvm_vmi_mem_access *ma)
+{
+	u64 *gfns;
+	u8 *accesses;
+	u32 i;
+	int ret;
+
+	if (!ma->gfns_uaddr || !ma->accesses_uaddr)
+		return -EFAULT;
+
+	gfns = vmemdup_array_user((u64 __user *)ma->gfns_uaddr,
+				  ma->nr, sizeof(*gfns));
+	if (IS_ERR(gfns))
+		return PTR_ERR(gfns);
+
+	accesses = vmemdup_array_user((u8 __user *)ma->accesses_uaddr,
+				      ma->nr, sizeof(*accesses));
+	if (IS_ERR(accesses)) {
+		kvfree(gfns);
+		return PTR_ERR(accesses);
+	}
+
+	for (i = 0; i < ma->nr; i++) {
+		ret = kvm_vmi_validate_access(accesses[i]);
+		if (ret)
+			goto out;
+
+		kvm_vmi_set_gfn_access(kvm, view, ma->view_id,
+				       gfns[i], accesses[i], 0);
+	}
+
+	ret = 0;
+out:
+	kvfree(accesses);
+	kvfree(gfns);
+	return ret;
+}
+
+static int kvm_vmi_set_mem_access(struct kvm *kvm, struct kvm_vmi_mem_access *ma)
+{
+	struct kvm_vmi *vmi = kvm->vmi;
+	struct kvm_vmi_view_data *view;
+	int ret;
+
+	if (!vmi)
+		return -EINVAL;
+
+	if (ma->view_id == 0)
+		return -EINVAL; /* Cannot modify host view permissions */
+
+	/* vmi->lock keeps the view alive vs kvm_vmi_destroy_view() (see change_gfn). */
+	mutex_lock(&vmi->lock);
+
+	view = xa_load(&vmi->views, ma->view_id);
+	if (!view) {
+		ret = -ENOENT;
+		goto out;
+	}
+
+	if (ma->nr <= 1) {
+		ret = kvm_vmi_validate_access(ma->access);
+		if (ret)
+			goto out;
+
+		/* In-kernel sub-page auto-step is arch-gated (see autostep_mask). */
+		if (ma->autostep_mask && !kvm_arch_vmi_has_auto_step()) {
+			ret = -EOPNOTSUPP;
+			goto out;
+		}
+
+		kvm_vmi_set_gfn_access(kvm, view, ma->view_id,
+				       ma->gfn, ma->access, ma->autostep_mask);
+	} else {
+		ret = kvm_vmi_set_mem_access_batch(kvm, view, ma);
+		if (ret)
+			goto out;
+	}
+
+	kvm_flush_remote_tlbs(kvm);
+	ret = 0;
+
+out:
+	mutex_unlock(&vmi->lock);
+	return ret;
+}
+
+static int kvm_vmi_alloc_gfn(struct kvm *kvm, struct kvm_vmi_alloc_gfn *alloc)
+{
+	struct kvm_vmi *vmi = kvm->vmi;
+	struct page *page;
+	u64 shadow_gfn;
+	int ret;
+
+	if (!vmi)
+		return -EINVAL;
+
+	page = alloc_page(GFP_KERNEL_ACCOUNT | __GFP_ZERO);
+	if (!page)
+		return -ENOMEM;
+
+	mutex_lock(&vmi->lock);
+	shadow_gfn = vmi->next_shadow_gfn++;
+	ret = xa_err(xa_store(&vmi->shadow_pages, shadow_gfn, page, GFP_KERNEL));
+	mutex_unlock(&vmi->lock);
+
+	if (ret) {
+		__free_page(page);
+		return ret;
+	}
+
+	alloc->gfn = shadow_gfn;
+	return 0;
+}
+
+static int kvm_vmi_free_gfn(struct kvm *kvm, struct file *file,
+			    struct kvm_vmi_free_gfn *free_req)
+{
+	struct kvm_vmi *vmi = kvm->vmi;
+	struct kvm_vmi_view_data *view;
+	struct page *page;
+	unsigned long view_idx;
+	hpa_t shadow_hpa;
+
+	if (!vmi)
+		return -EINVAL;
+
+	if (free_req->gfn < KVM_VMI_SHADOW_GFN_BASE)
+		return -EINVAL;
+
+	mutex_lock(&vmi->lock);
+
+	page = xa_load(&vmi->shadow_pages, free_req->gfn);
+	if (!page) {
+		mutex_unlock(&vmi->lock);
+		return -ENOENT;
+	}
+
+	shadow_hpa = page_to_phys(page);
+
+	/* Check if any view's gfn_overrides references this page */
+	xa_for_each(&vmi->views, view_idx, view) {
+		void *entry;
+		unsigned long gfn;
+
+		xa_for_each(&view->gfn_overrides, gfn, entry) {
+			if ((hpa_t)(unsigned long)entry == shadow_hpa) {
+				mutex_unlock(&vmi->lock);
+				return -EBUSY;
+			}
+		}
+	}
+
+	xa_erase(&vmi->shadow_pages, free_req->gfn);
+	mutex_unlock(&vmi->lock);
+
+	/* Forcibly unmap from any agent userspace mappings */
+	unmap_mapping_range(file->f_mapping,
+			    (loff_t)free_req->gfn << PAGE_SHIFT, PAGE_SIZE, 1);
+
+	__free_page(page);
+	return 0;
+}
+
+/**
+ * kvm_vmi_change_gfn - Remap a GFN in an alternate view
+ * @kvm: The target VM.
+ * @change: Change descriptor with view_id, old_gfn, new_gfn.
+ *
+ * Maps old_gfn to the physical page backing new_gfn in this view.
+ * When new_gfn is KVM_VMI_INVALID_GFN, reverts to the host mapping.
+ *
+ * This is the core mechanism for shadow page breakpoints:
+ *   1. Allocate shadow GFN, copy original page
+ *   2. Patch shadow page (e.g., insert INT3)
+ *   3. change_gfn(view, original_gfn, shadow_gfn)
+ *   4. Guest on this view now sees shadow page at original_gfn
+ *
+ * Return: 0 on success, negative errno on failure.
+ */
+static int kvm_vmi_change_gfn(struct kvm *kvm, struct kvm_vmi_change_gfn *change)
+{
+	struct page *refcounted_page = NULL;
+	struct kvm_vmi *vmi = kvm->vmi;
+	struct kvm_vmi_view_data *view;
+	struct kvm_memory_slot *slot;
+	struct page *shadow;
+	struct page *prev;
+	bool writable;
+	kvm_pfn_t pfn;
+	hpa_t new_hpa;
+	int srcu_idx;
+	int err;
+
+	if (!vmi)
+		return -EINVAL;
+
+	if (change->view_id == 0)
+		return -EINVAL; /* Cannot remap in host view */
+
+	/*
+	 * Hold vmi->lock for the whole view lifetime and kvm->srcu for the
+	 * memslot lookup/faultin below. kvm_vmi_destroy_view() erases the view
+	 * under vmi->lock and frees it (and its arch stage-2 root) right after,
+	 * so without the lock this otherwise lock-free xa_load() + dereference
+	 * races the free -> use-after-free in the arch invalidate path (proven
+	 * by vmi_change_gfn_uaf_test; KASAN slab-use-after-free in
+	 * __unmap_stage2_range). gfn_to_memslot()/__kvm_faultin_pfn() require
+	 * the SRCU read side so the memslots array cannot be swapped under us.
+	 */
+	srcu_idx = srcu_read_lock(&kvm->srcu);
+	mutex_lock(&vmi->lock);
+
+	view = xa_load(&vmi->views, change->view_id);
+	if (!view) {
+		err = -ENOENT;
+		goto out;
+	}
+
+	trace_kvm_vmi_change_gfn(change->view_id, change->old_gfn,
+				 change->new_gfn);
+
+	if (change->new_gfn == KVM_VMI_INVALID_GFN) {
+		/* Revert: remove remapping, restore host mapping */
+		prev = xa_erase(&view->gfn_override_pages, change->old_gfn);
+		xa_erase(&view->gfn_overrides, change->old_gfn);
+		if (prev)
+			put_page(prev);
+
+		if (kvm_arch_vmi_view_has_root(view))
+			kvm_arch_vmi_invalidate_gfn_revert(kvm, view,
+							   change->old_gfn);
+		kvm_flush_remote_tlbs(kvm);
+		err = 0;
+		goto out;
+	}
+
+	/*
+	 * Resolve new_gfn to HPA. If new_gfn is a VMI-allocated shadow
+	 * page, use it directly. Otherwise resolve via host memslots.
+	 */
+	if (change->new_gfn >= KVM_VMI_SHADOW_GFN_BASE) {
+		shadow = xa_load(&vmi->shadow_pages, change->new_gfn);
+		if (!shadow) {
+			err = -ENOENT;
+			goto out;
+		}
+		new_hpa = page_to_phys(shadow);
+	} else {
+		slot = gfn_to_memslot(kvm, change->new_gfn);
+		if (!slot) {
+			err = -EFAULT;
+			goto out;
+		}
+
+		pfn = __kvm_faultin_pfn(slot, change->new_gfn, 0,
+					&writable, &refcounted_page);
+		if (is_error_noslot_pfn(pfn)) {
+			err = -EFAULT;
+			goto out;
+		}
+		new_hpa = (hpa_t)pfn << PAGE_SHIFT;
+	}
+
+	/* Drop any prior non-shadow pin before overwriting this GFN. */
+	prev = xa_erase(&view->gfn_override_pages, change->old_gfn);
+	if (prev)
+		put_page(prev);
+
+	/* Store the remapping: old_gfn -> new_hpa */
+	xa_store(&view->gfn_overrides, change->old_gfn,
+		 (void *)(unsigned long)new_hpa, GFP_KERNEL);
+
+	/*
+	 * Pin a non-shadow target for the override's lifetime by retaining the
+	 * faultin ref (recorded in gfn_override_pages). The mmu_notifier skips
+	 * remapped GFNs, so without this the stored HPA could go stale on
+	 * migration/swap. Shadow targets (refcounted_page == NULL) are already
+	 * pinned kernel pages.
+	 */
+	if (refcounted_page) {
+		err = xa_err(xa_store(&view->gfn_override_pages,
+				      change->old_gfn, refcounted_page,
+				      GFP_KERNEL));
+		if (err) {
+			xa_erase(&view->gfn_overrides, change->old_gfn);
+			put_page(refcounted_page);
+			refcounted_page = NULL;
+			goto out;
+		}
+		refcounted_page = NULL;	/* ref transferred to the xarray */
+	}
+
+	/* Zap old mapping so next fault installs with remap PFN */
+	if (kvm_arch_vmi_view_has_root(view))
+		kvm_arch_vmi_invalidate_gfn(kvm, view, change->old_gfn);
+
+	kvm_flush_remote_tlbs(kvm);
+	err = 0;
+
+out:
+	mutex_unlock(&vmi->lock);
+	srcu_read_unlock(&kvm->srcu, srcu_idx);
+	if (refcounted_page)
+		put_page(refcounted_page);
+	return err;
+}
+
 static void free_vcpu_vmi(struct rcu_head *head)
 {
 	kfree(container_of(head, struct kvm_vcpu_vmi, rcu_head));
@@ -1513,26 +1946,54 @@ static void free_vcpu_vmi(struct rcu_head *head)
 static int kvm_vmi_release(struct inode *inode, struct file *file)
 {
 	struct kvm *kvm = file->private_data;
-	struct kvm_vmi *vmi = kvm_vmi_get(kvm);
 	struct kvm_vcpu *vcpu;
 	struct kvm_vmi_view_data *view;
+	struct kvm_vmi *vmi;
 	struct page *page;
 	unsigned long i, index;
+	int srcu_idx;
 
 	trace_kvm_vmi_session(false);
+
+	/*
+	 * kvm_vmi_get() must run under kvm->srcu (or kvm->lock); take srcu just
+	 * for the deref. The VMI session is torn down only here, on the last
+	 * vmi_fd put, so the returned pointer stays valid for the rest of this
+	 * function without holding srcu -- and we must not hold it across the
+	 * synchronize_srcu() below.
+	 */
+	srcu_idx = srcu_read_lock(&kvm->srcu);
+	vmi = kvm_vmi_get(kvm);
+	srcu_read_unlock(&kvm->srcu, srcu_idx);
 
 	if (!vmi)
 		goto out;
 
-	/* Signal all vCPUs to teardown and wake any blocked ones */
+	/*
+	 * Pause every vCPU so it parks with vcpu->mutex dropped before the
+	 * mutex_lock()s below (single-step restore here, free_ring later) take
+	 * it. A WFI-halted or in-guest vCPU holds vcpu->mutex across KVM_RUN,
+	 * and a bare kick can't drop it on arm64, so those would deadlock and
+	 * wedge close(vmi_fd) in 'D'. The pause escape keys on
+	 * session_teardown, which the loop below sets only after free_ring
+	 * returns, so every vCPU stays parked through the whole teardown.
+	 */
+	kvm_vmi_pause_vm(kvm);
+
+	/*
+	 * Restore any guest CPU state an in-flight single-step left masked, while
+	 * the per-session VMI state is still alive and the vCPU is parked (mutex
+	 * dropped). This must run before kvm_vmi_free_ring() NULLs vcpu->vmi below:
+	 * otherwise the restore is left to a later apply that can no longer reach
+	 * the per-session saved value, leaving the guest with interrupts masked (a
+	 * silent hang). The arch hook is a no-op where single-step masks no state.
+	 */
 	kvm_for_each_vcpu(i, vcpu, kvm) {
 		if (!vcpu->vmi)
 			continue;
-		vcpu->vmi->teardown = true;
-		atomic_set(&vcpu->vmi->pause_count, 0);
-		wake_up(&vcpu->vmi->wq);
-		wake_up(&vcpu->vmi->pause_wq);
-		kvm_vcpu_kick(vcpu);
+		mutex_lock(&vcpu->mutex);
+		kvm_arch_vmi_restore_singlestep(vcpu);
+		mutex_unlock(&vcpu->mutex);
 	}
 
 	/* Clear VM-wide event monitoring state */
@@ -1559,7 +2020,7 @@ static int kvm_vmi_release(struct inode *inode, struct file *file)
 			if (old_view)
 				atomic_dec(&old_view->vcpu_count);
 			vcpu_vmi->current_view_id = 0;
-			WRITE_ONCE(vcpu_vmi->current_view, NULL);
+			rcu_assign_pointer(vcpu_vmi->current_view, NULL);
 			/*
 			 * The vCPU was on an alternate view. Ask the
 			 * arch layer to reload the host page table
@@ -1573,12 +2034,13 @@ static int kvm_vmi_release(struct inode *inode, struct file *file)
 	kvm_arch_vmi_update(kvm);
 
 	/*
-	 * Wait for any in-flight page faults to complete.  Page faults
-	 * hold mmu_lock for read while accessing current_view and the
-	 * page table root.  After this write-lock cycle completes, all
-	 * such faults have finished, and new ones will see
-	 * current_view=NULL (written above) and fall through to the
-	 * primary root.
+	 * Drain in-flight stage-2 fault handlers that are walking the page
+	 * table *root* under mmu_lock (read), so a fault cannot install a leaf
+	 * into a view root the arch destroy below tears down. (The view *struct*
+	 * + the current_view deref are not covered by this cycle - the first
+	 * fault reader runs before mmu_lock - they are covered by kvm->srcu +
+	 * call_srcu(free_view); current_view=NULL was published above, so new
+	 * faults fall through to the primary root.)
 	 */
 	write_lock(&kvm->mmu_lock);
 	write_unlock(&kvm->mmu_lock);
@@ -1590,15 +2052,19 @@ static int kvm_vmi_release(struct inode *inode, struct file *file)
 	}
 	xa_destroy(&vmi->shadow_pages);
 
-	/* Destroy all non-zero views */
+	/*
+	 * Destroy all non-zero views. release runs with all vCPUs paused, so
+	 * there are no in-flight view readers and ->dying is not needed (no
+	 * concurrent switch); the arch stage-2 root drain stays synchronous and
+	 * the struct/xarray free is deferred past any SRCU grace period via
+	 * call_srcu(free_view), mirroring kvm_vmi_destroy_view().
+	 */
 	xa_for_each(&vmi->views, index, view) {
 		if (index == 0)
 			continue;
 		xa_erase(&vmi->views, index);
 		kvm_arch_vmi_destroy_view(kvm, view);
-		xa_destroy(&view->gfn_overrides);
-		xa_destroy(&view->access_overrides);
-		kfree(view);
+		call_srcu(&kvm->srcu, &view->rcu_head, free_view);
 	}
 
 	/*
@@ -1614,6 +2080,16 @@ static int kvm_vmi_release(struct inode *inode, struct file *file)
 		if (!vcpu_vmi)
 			continue;
 		kvm_vmi_free_ring(vcpu);
+		/*
+		 * Now release the parked vCPU: free_ring() ran while it was
+		 * still parked. Set session_teardown and clear pause_count, and
+		 * wake; the vCPU sees pause_count==0 and exits the pause check.
+		 * Order pause_count=0 before NULLing vcpu->vmi so the woken
+		 * run-loop pause check does not spin awaiting the NULL.
+		 */
+		vcpu_vmi->session_teardown = true;
+		atomic_set(&vcpu_vmi->pause_count, 0);
+		wake_up(&vcpu_vmi->pause_wq);
 		WRITE_ONCE(vcpu->vmi, NULL);
 		call_srcu(&kvm->srcu, &vcpu_vmi->rcu_head, free_vcpu_vmi);
 	}
@@ -1665,6 +2141,13 @@ static long kvm_vmi_ioctl(struct file *file, unsigned int ioctl,
 			return -EFAULT;
 		return kvm_vmi_teardown_ring(kvm, vcpu_id);
 	}
+	case KVM_VMI_ACK_EVENT: {
+		struct kvm_vmi_vcpu ack;
+
+		if (copy_from_user(&ack, argp, sizeof(ack)))
+			return -EFAULT;
+		return kvm_vmi_ack_event(kvm, &ack);
+	}
 	case KVM_VMI_CONTROL_EVENT: {
 		struct kvm_vmi_control_event ctrl;
 
@@ -1672,12 +2155,30 @@ static long kvm_vmi_ioctl(struct file *file, unsigned int ioctl,
 			return -EFAULT;
 		return kvm_vmi_control_event(kvm, &ctrl);
 	}
-	case KVM_VMI_ACK_EVENT: {
-		struct kvm_vmi_vcpu ack;
+	case KVM_VMI_PAUSE_VM:
+		return kvm_vmi_pause_vm(kvm);
+	case KVM_VMI_UNPAUSE_VM:
+		return kvm_vmi_unpause_vm(kvm);
+	case KVM_VMI_PAUSE_VCPU: {
+		struct kvm_vmi_vcpu v;
 
-		if (copy_from_user(&ack, argp, sizeof(ack)))
+		if (copy_from_user(&v, argp, sizeof(v)))
 			return -EFAULT;
-		return kvm_vmi_ack_event(kvm, &ack);
+		return kvm_vmi_pause_vcpu_ioctl(kvm, v.vcpu_id);
+	}
+	case KVM_VMI_UNPAUSE_VCPU: {
+		struct kvm_vmi_vcpu v;
+
+		if (copy_from_user(&v, argp, sizeof(v)))
+			return -EFAULT;
+		return kvm_vmi_unpause_vcpu_ioctl(kvm, v.vcpu_id);
+	}
+	case KVM_VMI_INJECT_EVENT: {
+		struct kvm_vmi_inject_event inject;
+
+		if (copy_from_user(&inject, argp, sizeof(inject)))
+			return -EFAULT;
+		return kvm_vmi_inject_event_ioctl(kvm, &inject);
 	}
 	case KVM_VMI_CREATE_VIEW: {
 		struct kvm_vmi_view view;
@@ -1705,6 +2206,17 @@ static long kvm_vmi_ioctl(struct file *file, unsigned int ioctl,
 		if (copy_from_user(&sv, argp, sizeof(sv)))
 			return -EFAULT;
 		return kvm_vmi_switch_view(kvm, &sv);
+	}
+	case KVM_VMI_GET_MEM_INFO: {
+		struct kvm_vmi_mem_info info = {};
+		int r;
+
+		r = kvm_vmi_get_mem_info(kvm, &info);
+		if (r)
+			return r;
+		if (copy_to_user(argp, &info, sizeof(info)))
+			return -EFAULT;
+		return 0;
 	}
 	case KVM_VMI_GET_MEM_ACCESS: {
 		struct kvm_vmi_mem_access ma;
@@ -1751,31 +2263,6 @@ static long kvm_vmi_ioctl(struct file *file, unsigned int ioctl,
 			return -EFAULT;
 		return kvm_vmi_change_gfn(kvm, &change);
 	}
-	case KVM_VMI_PAUSE_VM:
-		return kvm_vmi_pause_vm(kvm);
-	case KVM_VMI_UNPAUSE_VM:
-		return kvm_vmi_unpause_vm(kvm);
-	case KVM_VMI_PAUSE_VCPU: {
-		struct kvm_vmi_vcpu v;
-
-		if (copy_from_user(&v, argp, sizeof(v)))
-			return -EFAULT;
-		return kvm_vmi_pause_vcpu_ioctl(kvm, v.vcpu_id);
-	}
-	case KVM_VMI_UNPAUSE_VCPU: {
-		struct kvm_vmi_vcpu v;
-
-		if (copy_from_user(&v, argp, sizeof(v)))
-			return -EFAULT;
-		return kvm_vmi_unpause_vcpu_ioctl(kvm, v.vcpu_id);
-	}
-	case KVM_VMI_INJECT_EVENT: {
-		struct kvm_vmi_inject_event inject;
-
-		if (copy_from_user(&inject, argp, sizeof(inject)))
-			return -EFAULT;
-		return kvm_vmi_inject_event_ioctl(kvm, &inject);
-	}
 	default:
 		return -ENOTTY;
 	}
@@ -1788,6 +2275,8 @@ static vm_fault_t kvm_vmi_guest_fault(struct vm_fault *vmf)
 	unsigned long hva;
 	struct page *page;
 	vm_fault_t ret;
+	bool same_mm;
+	int srcu_idx;
 	int r;
 
 	/* Check if this is a VMI-allocated shadow page */
@@ -1799,7 +2288,10 @@ static vm_fault_t kvm_vmi_guest_fault(struct vm_fault *vmf)
 				      page_to_pfn(page));
 	}
 
+	/* gfn_to_hva() walks the memslots; hold kvm->srcu across the lookup. */
+	srcu_idx = srcu_read_lock(&kvm->srcu);
 	hva = gfn_to_hva(kvm, gfn);
+	srcu_read_unlock(&kvm->srcu, srcu_idx);
 	if (kvm_is_error_hva(hva))
 		return VM_FAULT_SIGBUS;
 
@@ -1812,11 +2304,36 @@ static vm_fault_t kvm_vmi_guest_fault(struct vm_fault *vmf)
 	 * on fault (swapbacked), but classified as MM_ANONPAGES on
 	 * unmap (folio_test_anon), causing "Bad rss-counter state"
 	 * warnings on process exit. PFN mappings bypass RSS accounting.
+	 *
+	 * get_user_pages_remote() with locked==NULL requires mmap_lock held but
+	 * does not drop it. The page-fault path that invokes this .fault handler
+	 * already holds the faulting VMA's mm (vmf->vma->vm_mm) mmap_lock for
+	 * read. So when GUP below would walk that very mm -- i.e. kvm->mm ==
+	 * vmf->vma->vm_mm, the single-process case where one task both created
+	 * the VM and mmap'd its own guest memory (the selftests) -- re-taking it
+	 * here would be a recursive read_lock (deadlock-prone if a writer queues).
+	 * Only acquire it when GUP walks a different mm than the fault path holds
+	 * -- the normal reactor case, where a separate agent process maps and
+	 * faults the guest's memory.
+	 *
+	 * Key the test on vmf->vma->vm_mm (the mm whose mmap_lock the fault path
+	 * actually holds), NOT current->mm (the faulting *task*). They coincide
+	 * for every path that can reach here today: a VM_PFNMAP VMA is faulted
+	 * only by a direct CPU access in the task's own address space, because GUP
+	 * rejects VM_PFNMAP in check_vma_flags() before ever calling .fault, so no
+	 * foreign-current remote faulter (process_vm_readv, /proc/pid/mem, ptrace)
+	 * reaches this handler. But vmf->vma->vm_mm is the only correct expression
+	 * of "is the lock already held": should the VMA's flags or vm_ops ever
+	 * change to admit a remote faulter, current->mm would mis-detect the held
+	 * lock and reintroduce the recursive read_lock.
 	 */
-	mmap_read_lock(kvm->mm);
+	same_mm = kvm->mm == vmf->vma->vm_mm;
+	if (!same_mm)
+		mmap_read_lock(kvm->mm);
 	r = get_user_pages_remote(kvm->mm, hva, 1,
 				  FOLL_WRITE, &page, NULL);
-	mmap_read_unlock(kvm->mm);
+	if (!same_mm)
+		mmap_read_unlock(kvm->mm);
 	if (r < 0)
 		return VM_FAULT_SIGBUS;
 

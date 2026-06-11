@@ -7,6 +7,7 @@
 
 #include <linux/types.h>
 #include <linux/mutex.h>
+#include <linux/spinlock.h>
 #include <linux/xarray.h>
 #include <linux/atomic.h>
 #include <linux/wait.h>
@@ -23,18 +24,27 @@ struct eventfd_ctx;
  * @vcpu_count: Number of vCPUs currently executing in this view.
  * @default_access: Default R/W/X permissions for lazily-populated entries.
  * @visible: VMFUNC visibility (for future EPTP list, currently unused).
+ * @dying: Set under vmi->lock before xa_erase to back off the lock-free view
+ *	switch from incrementing vcpu_count on a view committed to free.
  * @access_overrides: Xarray mapping GFN -> u8 access permissions.
  * @gfn_overrides: Xarray mapping GFN -> HPA for change_gfn remappings.
+ * @gfn_override_pages: Xarray mapping GFN -> struct page* pinning non-shadow
+ *	change_gfn remap targets; dropped on revert/destroy.
  * @arch: Architecture-specific view data.
+ * @rcu_head: Deferred free via call_srcu(&kvm->srcu): the struct must outlive
+ *	an SRCU grace period for lock-free fault-path readers.
  */
 struct kvm_vmi_view_data {
 	u32 id;
 	atomic_t vcpu_count;
 	u8 default_access;
 	bool visible;
+	bool dying;
 	struct xarray access_overrides;
 	struct xarray gfn_overrides;
+	struct xarray gfn_override_pages;
 	struct kvm_arch_vmi_view arch;
+	struct rcu_head rcu_head;	/* deferred free via call_srcu */
 };
 
 /**
@@ -63,13 +73,17 @@ struct kvm_vmi {
 
 /**
  * struct kvm_vcpu_vmi - Per-vCPU VMI state
+ * @view_lock: Serializes this vCPU's view-state transitions against the VM-wide
+ *	KVM_VMI_SWITCH_VIEW ioctl, so a fast-singlestep completion cannot
+ *	resurrect a refcount on a switched-away view (destroy_view -EBUSY).
  * @current_view_id: ID of the memory view this vCPU is currently on.
  * @current_view: Pointer to current alternate view (NULL when on view 0).
  * @arch: Architecture-specific per-vCPU VMI state.
  */
 struct kvm_vcpu_vmi {
+	spinlock_t view_lock;
 	u32 current_view_id;
-	struct kvm_vmi_view_data *current_view; /* NULL when on view 0 */
+	struct kvm_vmi_view_data __rcu *current_view; /* NULL when on view 0 */
 
 	/* Ring state */
 	struct page *ring_page;
@@ -81,12 +95,14 @@ struct kvm_vcpu_vmi {
 	wait_queue_head_t *ack_wqh;	/* ack_fd's waitqueue head */
 	wait_queue_head_t wq;
 
-	/* Fast singlestep: step one instruction then switch back to original view */
+	/* Fast singlestep: step one insn, then switch back to original view */
 	bool fast_singlestep_active;
 	u32  fast_singlestep_restore_view;
 
 	/* Lifecycle / teardown */
-	bool teardown;
+	bool teardown;		/* ring deliver-fence: ring page freed */
+	bool session_teardown;	/* set only by kvm_vmi_release(); ring-scoped
+				 * @teardown must not drive the pause escape */
 	atomic_t pause_count;
 	wait_queue_head_t pause_wq;
 
@@ -104,6 +120,8 @@ bool kvm_vmi_has_cap(void);
 /* Session lifecycle */
 int kvm_create_vmi(struct kvm *kvm);
 void kvm_vmi_destroy(struct kvm *kvm);
+int kvm_vmi_pause_vm(struct kvm *kvm);
+int kvm_vmi_unpause_vm(struct kvm *kvm);
 
 /* vCPU lifecycle */
 int kvm_vmi_vcpu_init(struct kvm_vcpu *vcpu);
@@ -116,6 +134,10 @@ int kvm_vmi_deliver_via_ring(struct kvm_vcpu *vcpu,
 /* View management */
 int kvm_vmi_vcpu_switch_view(struct kvm_vcpu *vcpu, u32 view_id);
 void kvm_vmi_propagate_change(struct kvm *kvm, gfn_t start, gfn_t end);
+
+/* Fast single-step (in-kernel) */
+void kvm_vmi_begin_fast_singlestep(struct kvm_vcpu *vcpu, u32 target_view);
+bool kvm_vmi_complete_fast_singlestep(struct kvm_vcpu *vcpu);
 
 /* Pause support (called from vcpu_run) */
 bool kvm_vmi_vcpu_paused(struct kvm_vcpu *vcpu);
@@ -132,6 +154,7 @@ int kvm_vmi_inject_event(struct kvm_vcpu *vcpu,
 /* Arch callbacks (generic -> arch contract) */
 bool kvm_arch_vmi_supported(void);
 bool kvm_arch_vmi_has_paging_write(void);
+bool kvm_arch_vmi_has_auto_step(void);
 
 void kvm_arch_vmi_session_init(struct kvm_vmi *vmi);
 void kvm_arch_vmi_session_cleanup(struct kvm_vmi *vmi);
@@ -143,6 +166,12 @@ int kvm_arch_vmi_control_event(struct kvm *kvm,
 void kvm_arch_vmi_update(struct kvm *kvm);
 
 void kvm_arch_vmi_set_singlestep(struct kvm_vcpu *vcpu, bool enable);
+void kvm_arch_vmi_restore_singlestep(struct kvm_vcpu *vcpu);
+
+/* Shed/re-take per-vCPU read locks the arch holds, around a VMI op that
+ * blocks the vCPU thread. */
+void kvm_arch_vmi_block_begin(struct kvm_vcpu *vcpu);
+void kvm_arch_vmi_block_end(struct kvm_vcpu *vcpu);
 
 int kvm_arch_vmi_create_view(struct kvm *kvm, struct kvm_vmi_view_data *view);
 void kvm_arch_vmi_destroy_view(struct kvm *kvm, struct kvm_vmi_view_data *view);

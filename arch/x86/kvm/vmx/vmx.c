@@ -5462,6 +5462,15 @@ void vmx_vmi_destroy_view(struct kvm *kvm, struct kvm_vmi_view_data *view)
 	if (!root)
 		return;
 
+	/*
+	 * Drain users of this view's hardware root -- a different invariant
+	 * from the VM-wide vCPU pause in kvm_vmi_pause_vm(): here we only need
+	 * that no vCPU executes on this view's EPTP and no in-flight fault
+	 * walker still holds it.
+	 * x86 reloads EPTP eagerly on switch, so unlike arm64 no
+	 * KVM_REQ_OUTSIDE_GUEST_MODE is needed here -- the mmu_lock write cycle
+	 * alone drains any in-flight fault reader before we free the root.
+	 */
 	write_lock(&kvm->mmu_lock);
 	/*
 	 * NULL tdp_root inside the write lock so that any concurrent

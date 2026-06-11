@@ -536,6 +536,16 @@ bool kvm_arch_vmi_has_paging_write(void)
 	return kvm_x86_call(vmi_has_ept_paging_write)();
 }
 
+/*
+ * x86 EPT uses 4K leaves matching the guest granule, so a view's per-GFN
+ * protection never spills onto neighbor guest pages -- there is no fusion to
+ * absorb. The autostep_mask is unnecessary; report unsupported.
+ */
+bool kvm_arch_vmi_has_auto_step(void)
+{
+	return false;
+}
+
 void kvm_arch_vmi_session_init(struct kvm_vmi *vmi)
 {
 	xa_init(&vmi->arch.msr_monitor);
@@ -562,6 +572,24 @@ void kvm_arch_vmi_session_reset(struct kvm_vmi *vmi)
 	memset(vmi->arch.cr_monitor, 0, sizeof(vmi->arch.cr_monitor));
 	xa_for_each(&vmi->arch.msr_monitor, index, entry)
 		xa_erase(&vmi->arch.msr_monitor, index);
+}
+
+/*
+ * Reset arch-specific per-vCPU VMI state during session teardown.
+ *
+ * Called from the release path (not the vCPU thread), so this must NOT
+ * touch VMCS state directly. Only clears in-memory flags; the vCPU
+ * thread will pick up the changes via KVM_REQ_VMI_UPDATE on its
+ * next entry (if it runs again).
+ */
+void kvm_arch_vmi_reset_vcpu_state(struct kvm_vcpu *vcpu)
+{
+	struct kvm_vcpu_vmi *vcpu_vmi = vcpu->vmi;
+
+	if (vcpu_vmi) {
+		vcpu_vmi->arch.singlestep_active = false;
+		vcpu_vmi->fast_singlestep_active = false;
+	}
 }
 
 /*
@@ -657,21 +685,26 @@ void kvm_arch_vmi_set_singlestep(struct kvm_vcpu *vcpu, bool enable)
 }
 
 /*
- * Reset arch-specific per-vCPU VMI state during session teardown.
- *
- * Called from the release path (not the vCPU thread), so this must NOT
- * touch VMCS state directly. Only clears in-memory flags; the vCPU
- * thread will pick up the changes via KVM_REQ_VMI_UPDATE on its
- * next entry (if it runs again).
+ * No-op on x86: VMI single-step does not mask guest interrupts, so there is no
+ * per-session CPU state to restore synchronously on teardown. See the arm64
+ * implementation and kvm_vmi_release().
  */
-void kvm_arch_vmi_reset_vcpu_state(struct kvm_vcpu *vcpu)
+void kvm_arch_vmi_restore_singlestep(struct kvm_vcpu *vcpu)
 {
-	struct kvm_vcpu_vmi *vcpu_vmi = vcpu->vmi;
+}
 
-	if (vcpu_vmi) {
-		vcpu_vmi->arch.singlestep_active = false;
-		vcpu_vmi->fast_singlestep_active = false;
-	}
+/*
+ * x86 holds the per-vCPU SRCU read lock across the entire run loop, so it
+ * must be dropped before the VMI ring delivery blocks and re-taken after.
+ */
+void kvm_arch_vmi_block_begin(struct kvm_vcpu *vcpu)
+{
+	kvm_vcpu_srcu_read_unlock(vcpu);
+}
+
+void kvm_arch_vmi_block_end(struct kvm_vcpu *vcpu)
+{
+	kvm_vcpu_srcu_read_lock(vcpu);
 }
 
 int kvm_arch_vmi_create_view(struct kvm *kvm, struct kvm_vmi_view_data *view)
@@ -802,7 +835,6 @@ EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_vmi_desc_intercept);
  */
 int kvm_vmi_singlestep(struct kvm_vcpu *vcpu)
 {
-	struct kvm_vcpu_vmi *vcpu_vmi = vcpu->vmi;
 	struct kvm_vmi_ring_event ring_event = {};
 	struct x86_exception exception;
 	gva_t rip;
@@ -814,14 +846,11 @@ int kvm_vmi_singlestep(struct kvm_vcpu *vcpu)
 	/*
 	 * Fast singlestep: the guest executed one instruction in the
 	 * target view. Switch back to the original view and suppress
-	 * the singlestep event.
+	 * the singlestep event. Runs under the per-vCPU view_lock so the
+	 * switch-back cannot race a concurrent VM-wide KVM_VMI_SWITCH_VIEW.
 	 */
-	if (vcpu_vmi->fast_singlestep_active) {
-		kvm_vmi_vcpu_switch_view(vcpu,
-					 vcpu_vmi->fast_singlestep_restore_view);
-		vcpu_vmi->fast_singlestep_active = false;
+	if (kvm_vmi_complete_fast_singlestep(vcpu))
 		return 1;
-	}
 
 	/* Deliver singlestep event if monitoring is enabled */
 	if (!kvm_vmi_event_enabled(vcpu, KVM_VMI_EVENT_SINGLESTEP))
@@ -1165,7 +1194,9 @@ int kvm_vmi_check_mem_access(struct kvm_vcpu *vcpu, gpa_t gpa,
 			     unsigned long exit_qual)
 {
 	struct kvm_vcpu_vmi *vcpu_vmi = vcpu->vmi;
-	struct kvm_vmi_view_data *view = vcpu_vmi->current_view;
+	/* Fault path: the vCPU run loop holds kvm->srcu across VM-exit. */
+	struct kvm_vmi_view_data *view =
+		srcu_dereference(vcpu_vmi->current_view, &vcpu->kvm->srcu);
 	gfn_t gfn = gpa >> PAGE_SHIFT;
 	u8 access, required;
 
@@ -1242,7 +1273,8 @@ void kvm_vmi_setup_page_fault(struct kvm_vcpu *vcpu,
 	if (!vcpu_vmi || vcpu_vmi->current_view_id == 0)
 		return;
 
-	view = READ_ONCE(vcpu_vmi->current_view);
+	/* Fault path: the vCPU run loop holds kvm->srcu across VM-exit. */
+	view = srcu_dereference(vcpu_vmi->current_view, &vcpu->kvm->srcu);
 	if (!view)
 		return;
 

@@ -178,6 +178,24 @@ static void inject_undef64(struct kvm_vcpu *vcpu)
 	vcpu_write_sys_reg(vcpu, esr, exception_esr_elx(vcpu));
 }
 
+/*
+ * Deliver an AArch64 software-breakpoint (BRK) exception to the guest, as if it
+ * had taken the BRK directly: pend a synchronous exception and set its ESR to a
+ * BRK64 carrying the given immediate (imm). enter_exception64 captures PC into
+ * ELR and routes to the guest's EL1 (or virtual EL2 under NV) synchronous
+ * vector via exception_target_el; it never writes the target ESR_ELx, so the
+ * value set here stands. PC is left untouched (do not kvm_incr_pc). Used by VMI
+ * breakpoint monitoring for the REINJECT response.
+ */
+void kvm_inject_brk64(struct kvm_vcpu *vcpu, u16 imm)
+{
+	u64 esr = (ESR_ELx_EC_BRK64 << ESR_ELx_EC_SHIFT) | ESR_ELx_IL |
+		  (imm & ESR_ELx_BRK64_ISS_COMMENT_MASK);
+
+	pend_sync_exception(vcpu);
+	vcpu_write_sys_reg(vcpu, esr, exception_esr_elx(vcpu));
+}
+
 #define DFSR_FSC_EXTABT_LPAE	0x10
 #define DFSR_FSC_EXTABT_nLPAE	0x08
 #define DFSR_LPAE		BIT(9)
@@ -250,6 +268,60 @@ int kvm_inject_sea(struct kvm_vcpu *vcpu, bool iabt, u64 addr)
 		return kvm_inject_nested_sea(vcpu, iabt, addr);
 
 	__kvm_inject_sea(vcpu, iabt, addr);
+	return 1;
+}
+
+/*
+ * kvm_inject_dabt_with_fsc - inject a synchronous abort with a caller-chosen FSC
+ * @vcpu:  target vCPU (must be parked; caller holds vcpu->mutex)
+ * @iabt:  true = instruction abort, false = data abort
+ * @addr:  faulting VA, written to FAR_EL1
+ * @fsc:   fault status code (ESR_ELx_FSC_*), e.g. ESR_ELx_FSC_FAULT
+ * @write: data-abort WnR (ignored for instruction aborts)
+ *
+ * Unlike kvm_inject_sea() (always an external abort), this lets a VMI agent
+ * synthesize translation/permission/access faults (the arm64 analog of x86
+ * #PF injection). SCTLR2.EASE only reroutes *external* aborts to the SError
+ * vector, so that is gated on the FSC being external.
+ *
+ * Returns 1 (an exception was pended), matching the kvm_inject_* convention.
+ */
+int kvm_inject_dabt_with_fsc(struct kvm_vcpu *vcpu, bool iabt,
+			     u64 addr, u8 fsc, bool write)
+{
+	unsigned long cpsr = *vcpu_cpsr(vcpu);
+	bool is_aarch32 = vcpu_mode_is_32bit(vcpu);
+	bool is_ext = (fsc == ESR_ELx_FSC_EXTABT) || esr_fsc_is_sea_ttw(fsc);
+	u64 esr = 0;
+
+	if (is_ext && effective_sctlr2_ease(vcpu))
+		pend_serror_exception(vcpu);
+	else
+		pend_sync_exception(vcpu);
+
+	if (kvm_vcpu_trap_il_is32bit(vcpu))
+		esr |= ESR_ELx_IL;
+
+	/*
+	 * Same EC idiom as inject_abt64(): pick IABT_{LOW,CUR} from the guest
+	 * mode, then OR in DABT for a data abort (DABT_x == IABT_x | 0x4).
+	 */
+	if (is_aarch32 || (cpsr & PSR_MODE_MASK) == PSR_MODE_EL0t)
+		esr |= (ESR_ELx_EC_IABT_LOW << ESR_ELx_EC_SHIFT);
+	else
+		esr |= (ESR_ELx_EC_IABT_CUR << ESR_ELx_EC_SHIFT);
+
+	if (!iabt)
+		esr |= ESR_ELx_EC_DABT_LOW << ESR_ELx_EC_SHIFT;
+
+	esr |= (fsc & ESR_ELx_FSC);
+
+	if (!iabt && write)
+		esr |= ESR_ELx_WNR;
+
+	vcpu_write_sys_reg(vcpu, addr, exception_far_elx(vcpu));
+	vcpu_write_sys_reg(vcpu, esr, exception_esr_elx(vcpu));
+
 	return 1;
 }
 
