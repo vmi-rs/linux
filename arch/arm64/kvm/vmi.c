@@ -87,8 +87,10 @@ void kvm_arch_vmi_reset_vcpu_state(struct kvm_vcpu *vcpu)
 {
 	struct kvm_vcpu_vmi *vcpu_vmi = vcpu->vmi;
 
-	if (vcpu_vmi)
+	if (vcpu_vmi) {
 		vcpu_vmi->arch.singlestep_active = false;
+		vcpu_vmi->fast_singlestep_active = false;
+	}
 }
 
 /**
@@ -837,6 +839,21 @@ int kvm_vmi_singlestep(struct kvm_vcpu *vcpu)
 	gpa_t gpa;
 
 	kvm_arch_vmi_set_singlestep(vcpu, false);
+
+	/*
+	 * Fast singlestep: the guest executed one instruction in the target
+	 * view. Switch back to the view the vCPU was on when the event fired
+	 * and suppress the singlestep event. Checked before the event-enabled
+	 * gate below, since a fast step is armed by the SINGLESTEP_FAST
+	 * response flag (not by enabling the SINGLESTEP event), so the view
+	 * must be restored regardless of whether SINGLESTEP delivery is
+	 * enabled. The switch-back requests KVM_REQ_VMI_UPDATE (as does the
+	 * disarm above), so kvm_vmi_apply_state reconciles the final view +
+	 * single-step state on the next entry. The completion runs under the
+	 * per-vCPU view_lock so it cannot race a concurrent VM-wide switch.
+	 */
+	if (kvm_vmi_complete_fast_singlestep(vcpu))
+		return 1;
 
 	if (!kvm_vmi_event_enabled(vcpu, KVM_VMI_EVENT_SINGLESTEP))
 		return 1;
