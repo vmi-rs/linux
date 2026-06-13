@@ -231,6 +231,18 @@ void kvm_vmi_apply_state(struct kvm_vcpu *vcpu)
 		*vcpu_hcr(vcpu) |= HCR_TVM;
 	else if (vcpu_has_cache_enabled(vcpu))
 		*vcpu_hcr(vcpu) &= ~HCR_TVM;
+
+	/* VMI breakpoint OR singlestep keeps the debug-exception trap (TDE) on. */
+	if (kvm_vmi_bp_monitoring(vcpu->kvm))
+		vcpu->arch.mdcr_el2 |= MDCR_EL2_TDE;
+	else if (!vcpu->guest_debug)
+		vcpu->arch.mdcr_el2 &= ~MDCR_EL2_TDE;
+
+	if (has_vhe()) {
+		preempt_disable();
+		write_sysreg(vcpu->arch.mdcr_el2, mdcr_el2);
+		preempt_enable();
+	}
 }
 
 int kvm_arch_vmi_create_view(struct kvm *kvm, struct kvm_vmi_view_data *view)
@@ -588,6 +600,32 @@ bool kvm_vmi_sysreg_monitoring(struct kvm *kvm)
 	return active;
 }
 
+/*
+ * True if guest BRK (software breakpoint) monitoring is active on @kvm. Read
+ * from the debug fast paths (kvm_arm_setup_mdcr_el2, kvm_vcpu_load_debug,
+ * kvm_vmi_apply_state) to decide whether to force-keep MDCR_EL2.TDE and
+ * host-owned debug.
+ */
+bool kvm_vmi_bp_monitoring(struct kvm *kvm)
+{
+	struct kvm_vmi *vmi;
+	bool active;
+	int srcu_idx;
+
+	/*
+	 * Called from the arm64 debug fast paths (vcpu_load / exit handling),
+	 * which on arm64 hold neither kvm->srcu nor kvm->lock -- unlike x86,
+	 * whose run loop keeps kvm->srcu across guest execution. kvm_vmi_get()
+	 * requires one of them, so take srcu around the deref + read here.
+	 */
+	srcu_idx = srcu_read_lock(&kvm->srcu);
+	vmi = kvm_vmi_get(kvm);
+	active = vmi && (vmi->enabled_events & BIT_ULL(KVM_VMI_EVENT_BREAKPOINT));
+	srcu_read_unlock(&kvm->srcu, srcu_idx);
+
+	return active;
+}
+
 /**
  * kvm_vmi_sysreg_write - Deliver a SYSREG event for a monitored VM-reg write.
  * @vcpu:    The vCPU performing the write (trapped in access_vm_reg).
@@ -685,6 +723,73 @@ int kvm_vmi_hypercall(struct kvm_vcpu *vcpu)
 
 	return (ret > 0 && (ret & (KVM_VMI_RESPONSE_DENY |
 				   KVM_VMI_RESPONSE_SET_REGS))) ? 1 : 0;
+}
+
+/*
+ * Translate the guest PC (EL1&0 stage-1 VA) to an IPA via AT S1E1R, the arm64
+ * analog of x86's kvm_mmu_gva_to_gpa_fetch. __kvm_at_s1e01 writes PAR_EL1 as a
+ * side effect, so save and restore the guest's PAR_EL1. View-independent
+ * (stage-1 only). Returns INVALID_GPA on translation fault.
+ */
+static gpa_t kvm_vmi_pc_to_ipa(struct kvm_vcpu *vcpu, u64 pc)
+{
+	u64 saved_par = vcpu_read_sys_reg(vcpu, PAR_EL1);
+	gpa_t ipa = INVALID_GPA;
+	u64 par;
+
+	__kvm_at_s1e01(vcpu, OP_AT_S1E1R, pc);
+	par = vcpu_read_sys_reg(vcpu, PAR_EL1);
+	if (!(par & SYS_PAR_EL1_F))
+		/*
+		 * PAR_EL1.PA is a 4K-granular field (bits[51:12]); the output
+		 * address's low 12 bits equal the input VA's bits[11:0],
+		 * regardless of the host (16K) or guest translation granule.
+		 * Use a fixed 12-bit offset, NOT the host PAGE_MASK.
+		 */
+		ipa = (par & SYS_PAR_EL1_PA) | (pc & GENMASK_ULL(11, 0));
+
+	vcpu_write_sys_reg(vcpu, saved_par, PAR_EL1);
+	return ipa;
+}
+
+/*
+ * Guest BRK trapped to EL2 (MDCR_EL2.TDE). Deliver a BREAKPOINT event with the
+ * BRK's IPA + comment, then apply the agent's response. The kernel NEVER
+ * advances PC: CONTINUE re-enters on the BRK (re-traps), SET_REGS lets the
+ * agent advance PC (applied generically), REINJECT delivers the BRK to the
+ * guest EL1. Always returns 1 (re-enter the guest).
+ */
+int kvm_vmi_breakpoint(struct kvm_vcpu *vcpu)
+{
+	struct kvm_vmi_ring_event ring_event = {};
+	u64 esr = kvm_vcpu_get_esr(vcpu);
+	u64 pc = *vcpu_pc(vcpu);
+	gpa_t ipa;
+	int ret;
+
+	if (!kvm_vmi_event_enabled(vcpu, KVM_VMI_EVENT_BREAKPOINT))
+		return 1;
+
+	ipa = kvm_vmi_pc_to_ipa(vcpu, pc);
+
+	ring_event.type = KVM_VMI_EVENT_BREAKPOINT;
+	ring_event.vcpu_id = vcpu->vcpu_id;
+	ring_event.insn_len = 4;
+	ring_event.arch.breakpoint.ipa = ipa;
+	ring_event.arch.breakpoint.imm = esr_brk_comment(esr);
+
+	trace_kvm_vmi_event_deliver(vcpu->vcpu_id, KVM_VMI_EVENT_BREAKPOINT, ipa);
+	ret = kvm_vmi_deliver_via_ring(vcpu, &ring_event);
+
+	/*
+	 * REINJECT handled here (esr is in scope and is the BRK's). SET_REGS
+	 * GPR/PC restore is applied generically by the core. CONTINUE: no PC
+	 * change -> the BRK re-traps. The kernel never advances PC itself.
+	 */
+	if (ret > 0 && (ret & KVM_VMI_RESPONSE_REINJECT))
+		kvm_inject_brk64(vcpu, esr_brk_comment(esr));
+
+	return 1;
 }
 
 /**
