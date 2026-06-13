@@ -6522,7 +6522,7 @@ the capability to be present.
 --------------------
 
 :Capability: KVM_CAP_VMI
-:Architectures: x86
+:Architectures: x86, arm64
 :Type: vm ioctl
 :Parameters: none
 :Returns: a vmi_fd file descriptor on success, <0 on error
@@ -9355,16 +9355,17 @@ take care to differentiate between these cases.
 8.47 KVM_CAP_VMI
 -----------------
 
-:Architectures: x86
+:Architectures: x86, arm64
 
 The presence of this capability indicates that the ``KVM_CREATE_VMI`` ioctl
-is available on the VM fd. VMI requires ``CONFIG_KVM_VMI=y`` and EPT
-(Intel VT-x).
+is available on the VM fd. VMI requires ``CONFIG_KVM_VMI=y``. On x86 it
+additionally requires EPT (Intel VT-x); on arm64 it is available unless
+protected KVM (pKVM) is enabled.
 
 Additional VMI sub-capabilities advertise specific VMI features:
 ``KVM_CAP_VMI_RING``, ``KVM_CAP_VMI_GUEST_MMAP``, ``KVM_CAP_VMI_PAUSE``,
-``KVM_CAP_VMI_INJECT``, ``KVM_CAP_VMI_ALLOC_GFN`` and ``KVM_CAP_VMI_EPT_PW``
-(EPT paging-write monitoring).
+``KVM_CAP_VMI_INJECT`` and ``KVM_CAP_VMI_ALLOC_GFN`` are reported on both x86
+and arm64; ``KVM_CAP_VMI_EPT_PW`` (EPT paging-write monitoring) is x86 only.
 These capabilities are advertise-only and are not re-checked at ioctl
 dispatch. See ``Documentation/virt/kvm/vmi.rst`` for the full VMI API
 reference including all capabilities.

@@ -21,11 +21,13 @@ per-view page permissions, remapping guest frames - and the agent decides what
 to monitor and how to respond. There are no introspection-specific policies in
 the uAPI.
 
-VMI is implemented on **x86** (Intel VMX, using EPT for alternate views). The
-control plane - the ``vmi_fd`` and all of its ioctls, the per-vCPU event ring,
-guest-memory mmap, pause, and shadow-frame allocation - and the set of
-interceptable events, the per-event data, the captured register snapshot, and
-the event-injection model are documented below.
+VMI is implemented on both **x86** (Intel VMX, using EPT for alternate views)
+and **arm64** (using a private stage-2 translation per view). The control plane
+- the ``vmi_fd`` and all of its ioctls, the per-vCPU event ring, guest-memory
+mmap, pause, and shadow-frame allocation - is architecture independent and
+behaves identically on both. The set of interceptable events, the per-event
+data, the captured register snapshot, and the event-injection model are
+architecture specific and are documented per architecture below.
 
 All VMI operations go through a ``vmi_fd`` obtained via ``KVM_CREATE_VMI`` on
 the VM fd. Events are delivered through per-vCPU shared ring buffers with
@@ -96,7 +98,7 @@ Two cross-process gates make this work (both only present when
    |                     KVM kernel                         |
    |  - Event generation (VM-exit interception)             |
    |  - Ring-based event delivery (per-vCPU)                |
-   |  - Alternate views (EPT)                               |
+   |  - Alternate views (EPT on x86, stage-2 on arm64)      |
    |  - Guest-frame remapping (shadow pages)                |
    |  - Guest memory mapping (fault-based)                  |
    +-------------------------------------------------------+
@@ -122,41 +124,51 @@ with ``-EOPNOTSUPP`` (see the per-ioctl descriptions).
 
 .. list-table::
    :header-rows: 1
-   :widths: 32 8 60
+   :widths: 28 8 8 56
 
    * - Capability
      - Value
+     - Arch
      - Description
    * - ``KVM_CAP_VMI``
      - 500
-     - VMI subsystem available. Requires ``CONFIG_KVM_VMI=y`` and EPT
-       (``enable_ept``).
+     - x86, arm64
+     - VMI subsystem available. Requires ``CONFIG_KVM_VMI=y``. On x86 this
+       requires EPT (``enable_ept``); on arm64 it is available unless protected
+       KVM (pKVM) is enabled.
    * - ``KVM_CAP_VMI_RING``
      - 501
+     - x86, arm64
      - Ring-based event delivery (per-vCPU shared rings + eventfd).
    * - ``KVM_CAP_VMI_GUEST_MMAP``
      - 502
+     - x86, arm64
      - Guest physical memory mapping via ``vmi_fd`` mmap.
    * - ``KVM_CAP_VMI_PAUSE``
      - 503
+     - x86, arm64
      - VM-wide and per-vCPU pause support with refcounting.
    * - ``KVM_CAP_VMI_INJECT``
      - 504
-     - Event injection (exception/interrupt/NMI).
+     - x86, arm64
+     - Event injection (exception/interrupt/NMI on x86; SError/abort on arm64).
    * - ``KVM_CAP_VMI_ALLOC_GFN``
      - 505
+     - x86, arm64
      - Shadow-frame allocation for guest-frame remapping workflows.
    * - ``KVM_CAP_VMI_EPT_PW``
      - 506
-     - EPT paging-write (A/D-bit) monitoring. Requires CPU support for the
-       tertiary execution control.
+     - x86 only
+     - EPT paging-write (A/D-bit) monitoring. **x86 only** - arm64 does not
+       report this capability and has no equivalent. On x86 it additionally
+       depends on CPU support for the tertiary execution control.
 
 ``KVM_CAP_VMI``, ``_RING``, ``_GUEST_MMAP``, ``_PAUSE``, ``_INJECT`` and
 ``_ALLOC_GFN`` all report the same underlying support value on a given host.
-``KVM_CAP_VMI_EPT_PW`` is reported independently.
+``KVM_CAP_VMI_EPT_PW`` is reported independently and only on x86.
 
-Configuration: ``CONFIG_KVM_VMI`` depends on ``KVM_INTEL && X86_64`` (no SVM/AMD
-support).
+Configuration: ``CONFIG_KVM_VMI`` depends on ``KVM_INTEL && X86_64`` on x86 (no
+SVM/AMD support) and on ``KVM`` on arm64 (no nested-virtualization requirement).
 
 4. Session lifecycle
 ====================
@@ -165,7 +177,7 @@ support).
 ------------------
 
 :Capability: KVM_CAP_VMI
-:Architectures: x86
+:Architectures: x86, arm64
 :Type: vm ioctl (``_IO(KVMIO, 0xe9)``, no argument)
 :Parameters: none
 :Returns: a ``vmi_fd`` file descriptor on success, < 0 on error
@@ -199,9 +211,9 @@ no VMI state leaks if the agent crashes. The teardown, in order:
 2. Any guest CPU state masked by an in-flight single-step is restored.
 3. VM-wide event monitoring is disabled and arch monitoring state is reset.
 4. Every vCPU is switched back to view 0 (the host view).
-5. In-flight EPT fault handlers are drained.
+5. In-flight stage-2/EPT fault handlers are drained.
 6. All shadow frames are freed.
-7. All alternate views are destroyed (their EPT roots freed).
+7. All alternate views are destroyed (their EPT/stage-2 roots freed).
 8. Per-vCPU rings are torn down; any vCPU blocked on a pending event is woken
    and resumes with the default action (CONTINUE).
 9. Per-vCPU and VM-wide VMI state is detached and freed after an SRCU grace
@@ -441,6 +453,17 @@ agent calls standard KVM ioctls on a duplicated vCPU fd while the vCPU is parked
 
 ``SET_REGS`` on x86 writes back only the GP registers, ``rip`` and ``rflags``.
 
+**arm64** ``struct kvm_vmi_regs``:
+
+- ``regs[31]`` (x0-x30), ``sp_el0``, ``sp_el1``, ``pc``, ``pstate``
+- Translation/control: ``ttbr0_el1``, ``ttbr1_el1``, ``tcr_el1``,
+  ``sctlr_el1``, ``mair_el1``, ``vbar_el1``, ``contextidr_el1``
+- Exception/thread context: ``elr_el1``, ``spsr_el1``, ``esr_el1``,
+  ``far_el1``, ``tpidr_el0``, ``tpidr_el1``, ``tpidrro_el0``
+
+``SET_REGS`` on arm64 writes back only ``regs[0..30]``, ``sp_el0``, ``pc`` and
+``pstate``.
+
 5.7 Ring event slot
 -------------------
 
@@ -469,7 +492,8 @@ agent calls standard KVM ioctls on a duplicated vCPU fd while the vCPU is parked
 
 ``insn_len`` carries the faulting instruction length where applicable. On x86 it
 is set for CR/MSR/CPUID/BREAKPOINT/DESC_ACCESS/IO/HYPERCALL and is 0 for
-MEM_ACCESS/SINGLESTEP/DEBUG.
+MEM_ACCESS/SINGLESTEP/DEBUG. On arm64 it is 4 for SYSREG/BREAKPOINT/HYPERCALL
+and 0 for MEM_ACCESS.
 
 6. Event monitoring
 ===================
@@ -503,47 +527,58 @@ frame whose per-view permissions deny the access (section 7). Configure it with
 6.2 Event IDs
 -------------
 
-Generic event IDs (0-2) are defined in ``<linux/kvm_vmi_events.h>``.
-Architecture-specific event IDs start at ``KVM_VMI_EVENT_ARCH_BASE`` (8) and are
-defined in ``<asm/kvm_vmi.h>``.
+Generic event IDs (0-2) are shared by all architectures. Architecture-specific
+event IDs start at ``KVM_VMI_EVENT_ARCH_BASE`` (8) and **differ per
+architecture** - the same numeric id means different events on x86 and arm64.
 
 .. list-table::
    :header-rows: 1
-   :widths: 12 28 60
+   :widths: 10 30 30 30
 
    * - ID
-     - Event
+     - x86 event
+     - arm64 event
      - Notes
    * - 0
+     - ``MEM_ACCESS``
      - ``MEM_ACCESS``
      - generic (per-view access violation)
    * - 1
      - ``SINGLESTEP``
+     - ``SINGLESTEP``
      - generic
    * - 2
      - ``HYPERCALL``
-     - generic (``VMCALL``/``VMMCALL``)
+     - ``HYPERCALL``
+     - generic (VMCALL/VMMCALL vs HVC)
    * - 8
      - ``CR``
-     - control register write
+     - ``SYSREG``
+     - arch-specific
    * - 9
      - ``MSR``
-     - MSR write
+     - ``BREAKPOINT`` (BRK)
+     - arch-specific
    * - 10
      - ``CPUID``
-     - CPUID instruction
+     - --
+     - x86 only
    * - 11
      - ``BREAKPOINT`` (INT3)
-     - software breakpoint
+     - --
+     - x86 only
    * - 12
      - ``DEBUG``
-     - debug exception
+     - --
+     - x86 only
    * - 13
      - ``DESC_ACCESS``
-     - descriptor-table access
+     - --
+     - x86 only
    * - 14
      - ``IO``
-     - I/O instruction
+     - --
+     - x86 only
 
 6.3 Generic events
 ------------------
