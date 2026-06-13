@@ -39,6 +39,7 @@ LIBKVM_arm64 += lib/arm64/processor.c
 LIBKVM_arm64 += lib/arm64/spinlock.c
 LIBKVM_arm64 += lib/arm64/ucall.c
 LIBKVM_arm64 += lib/arm64/vgic.c
+LIBKVM_arm64 += lib/arm64/vmi_util.c
 
 LIBKVM_s390 += lib/s390/diag318_test_handler.c
 LIBKVM_s390 += lib/s390/processor.c
@@ -209,6 +210,8 @@ TEST_GEN_PROGS_arm64 += arm64/vgic_lpi_stress
 TEST_GEN_PROGS_arm64 += arm64/vpmu_counter_access
 TEST_GEN_PROGS_arm64 += arm64/no-vgic-v3
 TEST_GEN_PROGS_arm64 += arm64/kvm-uuid
+TEST_GEN_PROGS_arm64 += arm64/vmi_basic_test
+TEST_GEN_PROGS_arm64 += arm64/vmi_lifecycle_test
 TEST_GEN_PROGS_arm64 += access_tracking_perf_test
 TEST_GEN_PROGS_arm64 += arch_timer
 TEST_GEN_PROGS_arm64 += coalesced_io_test
