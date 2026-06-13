@@ -182,6 +182,23 @@ static void inject_undef64(struct kvm_vcpu *vcpu)
 	kvm_inject_sync(vcpu, esr);
 }
 
+/*
+ * Deliver an AArch64 software-breakpoint (BRK) exception to the guest, as if it
+ * had taken the BRK directly: pend a synchronous exception and set its ESR to a
+ * BRK64 carrying the given immediate (imm). enter_exception64 captures PC into
+ * ELR and routes to the guest's EL1 (or virtual EL2 under NV) synchronous
+ * vector via exception_target_el; it never writes the target ESR_ELx, so the
+ * value set here stands. PC is left untouched (do not kvm_incr_pc). Used by VMI
+ * breakpoint monitoring for the REINJECT response.
+ */
+void kvm_inject_brk64(struct kvm_vcpu *vcpu, u16 imm)
+{
+	u64 esr = (ESR_ELx_EC_BRK64 << ESR_ELx_EC_SHIFT) | ESR_ELx_IL |
+		  (imm & ESR_ELx_BRK64_ISS_COMMENT_MASK);
+
+	kvm_inject_sync(vcpu, esr);
+}
+
 #define DFSR_FSC_EXTABT_LPAE	0x10
 #define DFSR_FSC_EXTABT_nLPAE	0x08
 #define DFSR_LPAE		BIT(9)

@@ -414,8 +414,9 @@ depends on the event (and the architecture) - see the per-event sections.
        arm64.
    * - ``KVM_VMI_RESPONSE_REINJECT``
      - 1 << 4
-     - Deliver the intercepted exception to the guest instead of consuming it:
-       ``#BP`` for breakpoints, ``#DB`` (with the original DR6) for debug.
+     - Deliver the intercepted exception to the guest instead of consuming it.
+       x86: ``#BP`` for breakpoints, ``#DB`` (with the original DR6) for debug.
+       arm64: re-injects ``BRK`` to EL1 for the breakpoint event.
    * - ``KVM_VMI_RESPONSE_SINGLESTEP``
      - 1 << 5
      - Single-step the next instruction (MTF). One-shot. If
@@ -854,6 +855,27 @@ The write is deferred: ``DENY`` skips it (the register keeps ``old_value``) and
 advances PC. ``new_value`` is observe-only - direct sysreg write-back is not
 supported, so ``SET_REGS`` is treated like ``DENY`` for the sysreg write itself
 (GP/PC/PSTATE write-back still applies).
+
+KVM_VMI_EVENT_BREAKPOINT (9)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+:Trigger: guest ``BRK`` (AArch64 software breakpoint), trapped to EL2
+:Data: ``struct kvm_vmi_event_breakpoint`` (arm64 layout)
+:Responses: REINJECT, SET_REGS, SINGLESTEP, SINGLESTEP_FAST, SWITCH_VIEW
+
+::
+
+    struct kvm_vmi_event_breakpoint {
+        __u64 ipa;   /* IPA of the BRK instruction (~0 if untranslatable) */
+        __u32 imm;   /* BRK comment, ESR_ELx.ISS[15:0] */
+        __u32 pad;
+    };
+
+This is a different event from the x86 breakpoint (different id and payload).
+The kernel never advances PC itself: a bare ``CONTINUE`` re-traps on the
+``BRK``. ``REINJECT`` delivers the ``BRK`` to guest EL1 (preserving ``imm``).
+To step past it, set a new PC via ``SET_REGS`` or use ``SINGLESTEP_FAST``.
+
 7. Alternate memory views
 =========================
 
@@ -1031,7 +1053,7 @@ workflow:
        ioctl(vmi_fd, KVM_VMI_ALLOC_GFN, &alloc);   /* alloc.gfn = shadow GFN */
 
 2. mmap the shadow frame and the original frame via ``vmi_fd`` (section 8), copy
-   the original content, and patch the shadow (e.g. write ``INT3``).
+   the original content, and patch the shadow (e.g. write ``INT3``/``BRK``).
 
 3. Remap in the alternate view::
 
