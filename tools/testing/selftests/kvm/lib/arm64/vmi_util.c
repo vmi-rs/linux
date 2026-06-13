@@ -188,6 +188,16 @@ void vmi_switch_view(int vmi_fd, uint32_t view_id)
 		    view_id, ret, errno);
 }
 
+/* Error-tolerant variant for race tests: returns the raw ioctl result. */
+int __vmi_switch_view_err(int vmi_fd, uint32_t view_id)
+{
+	struct kvm_vmi_switch_view sv = {
+		.view_id = view_id,
+	};
+
+	return ioctl(vmi_fd, KVM_VMI_SWITCH_VIEW, &sv);
+}
+
 void vmi_set_mem_access(int vmi_fd, uint32_t view_id, uint64_t gfn,
 			uint8_t access)
 {

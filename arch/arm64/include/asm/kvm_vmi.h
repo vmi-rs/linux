@@ -12,15 +12,24 @@
 struct kvm;
 struct kvm_vcpu;
 struct kvm_vmi_view_data;
+struct kvm_s2_mmu;
 
 /**
  * struct kvm_arch_vmi_view - arm64-specific alternate view data
+ * @mmu: the view's private stage-2 translation (independent kvm_pgtable +
+ *       per-view VMID). Allocated eagerly (empty) at create_view; entries
+ *       populate lazily on fault. @mmu->pgt != NULL is the has-root gate.
+ *       A pointer (not embedded by value) because asm/kvm_vmi.h is reached
+ *       through the uapi include chain while asm/kvm_host.h is still being
+ *       built up, so struct kvm_s2_mmu is incomplete here.
  *
- * A view is backed by its own stage-2 translation (a private
- * struct kvm_s2_mmu with a per-view VMID). Populated in the alternate
- * memory views commit; empty until then.
+ * A view is a plain single stage-2: it is NOT a nested shadow stage-2 even
+ * though kvm_is_nested_s2_mmu() classifies any non-canonical mmu as "nested".
+ * It stays plain because kvm_init_stage2_mmu() leaves mmu->nested_stage2_enabled
+ * false; never set that true on a view.
  */
 struct kvm_arch_vmi_view {
+	struct kvm_s2_mmu *mmu;
 };
 
 /**

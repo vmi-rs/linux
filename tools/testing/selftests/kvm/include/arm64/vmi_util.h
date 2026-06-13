@@ -57,6 +57,7 @@ uint32_t vmi_create_view(int vmi_fd, uint8_t default_access);
 void vmi_destroy_view(int vmi_fd, uint32_t view_id);
 int vmi_destroy_view_err(int vmi_fd, uint32_t view_id);
 void vmi_switch_view(int vmi_fd, uint32_t view_id);
+int __vmi_switch_view_err(int vmi_fd, uint32_t view_id);
 void vmi_set_mem_access(int vmi_fd, uint32_t view_id, uint64_t gfn,
 			uint8_t access);
 void vmi_change_gfn(int vmi_fd, uint32_t view_id, uint64_t old_gfn,
