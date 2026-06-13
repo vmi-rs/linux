@@ -419,9 +419,9 @@ depends on the event (and the architecture) - see the per-event sections.
        arm64: re-injects ``BRK`` to EL1 for the breakpoint event.
    * - ``KVM_VMI_RESPONSE_SINGLESTEP``
      - 1 << 5
-     - Single-step the next instruction (MTF). One-shot. If
-       ``KVM_VMI_EVENT_SINGLESTEP`` is enabled, a singlestep event fires after
-       the instruction.
+     - Single-step the next instruction (MTF on x86; ``MDSCR_EL1.SS`` /
+       ``PSTATE.SS`` on arm64). One-shot. If ``KVM_VMI_EVENT_SINGLESTEP`` is
+       enabled, a singlestep event fires after the instruction.
    * - ``KVM_VMI_RESPONSE_SINGLESTEP_FAST``
      - 1 << 6
      - Atomic single-step + view switch. Steps one instruction in a target view
@@ -628,7 +628,7 @@ KVM_VMI_EVENT_SINGLESTEP (1)
 ::
 
     struct kvm_vmi_event_singlestep {
-        __u64 gpa;   /* guest-physical of the instruction */
+        __u64 gpa;   /* guest-physical of the instruction (IPA on arm64) */
     };
 
 A step is armed only by ``KVM_VMI_RESPONSE_SINGLESTEP`` /

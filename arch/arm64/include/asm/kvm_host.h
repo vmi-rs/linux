@@ -773,6 +773,12 @@ struct kvm_host_data {
 		u64 trfcr_el1;
 		/* Values of trap registers for the host before guest entry. */
 		u64 mdcr_el2;
+		/*
+		 * Host MDSCR_EL1, snapshotted before VMI single-step may write
+		 * the live, VHE-shared register, and restored on vcpu_put so the
+		 * host never resumes EL0 with MDSCR_EL1.SS set.
+		 */
+		u64 mdscr_el1;
 		u64 brbcr_el1;
 	} host_debug_state;
 

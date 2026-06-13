@@ -51,8 +51,11 @@ struct kvm_vmi_ring_event *vmi_wait_event(struct vmi_test_ring *r);
 struct kvm_vmi_ring_event *vmi_wait_event_timeout(struct vmi_test_ring *r,
 						  int timeout_ms);
 void vmi_ack_event(struct vmi_test_ring *r, uint32_t vcpu_id);
+/* Error-tolerant variant for race tests: returns the raw ioctl result. */
+int __vmi_ack_event_err(int vmi_fd, uint32_t vcpu_id);
 void vmi_control_event(int vmi_fd, uint32_t event, int enable);
 int vmi_control_event_err(int vmi_fd, uint32_t event, int enable);
+
 /*
  * Enable/disable monitoring of one VM system register (KVM_VMI_SYSREG_*),
  * with optional onchangeonly + bitmask filtering. Asserts the ioctl succeeds.
@@ -82,6 +85,7 @@ void vmi_unpause_vcpu(int vmi_fd, uint32_t vcpu_id);
  */
 int vmi_inject_event(int vmi_fd, struct kvm_vmi_inject_event *inject);
 void vmi_teardown_ring(struct vmi_test_ring *r);
+int vmi_teardown_ring_ioctl(int vmi_fd, uint32_t vcpu_id);
 void *vmi_vcpu_thread_fn(void *arg);
 int vmi_test_setup(struct kvm_vm **vm, struct kvm_vcpu **vcpu,
 		   void (*guest_fn)(void), struct vmi_test_ring *ring);
