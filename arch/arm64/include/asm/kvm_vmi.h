@@ -48,6 +48,18 @@ struct kvm_arch_vmi_view {
  * Populated by the system-register monitoring commit; empty until then.
  */
 struct kvm_arch_vmi {
+	/*
+	 * Monitored EL1 VM system registers, indexed by KVM_VMI_SYSREG_*.
+	 * @count is the number of @sysreg_monitor[] entries with .enabled set;
+	 * a nonzero count force-keeps HCR_EL2.TVM (see kvm_toggle_cache and
+	 * kvm_vmi_apply_state).
+	 */
+	struct {
+		bool enabled;
+		u8   onchangeonly;
+		u64  bitmask;
+	} sysreg_monitor[KVM_VMI_NR_SYSREG_MONITORS];
+	unsigned int sysreg_monitor_count;
 };
 
 /**
@@ -70,6 +82,19 @@ struct kvm_arch_vcpu_vmi {
 void kvm_vmi_apply_state(struct kvm_vcpu *vcpu);
 int kvm_vmi_hypercall(struct kvm_vcpu *vcpu);
 /*
+ * System-register write monitoring. kvm_vmi_sysreg_monitoring() is
+ * read from the fast paths (kvm_toggle_cache, kvm_vmi_apply_state) to decide
+ * whether to force-keep HCR_EL2.TVM. kvm_vmi_sysreg_index() maps an
+ * enum vcpu_sysreg to its KVM_VMI_SYSREG_* index (-1 if not monitorable).
+ * kvm_vmi_sysreg_write() filters, delivers the event, blocks on the ring,
+ * and returns true if the agent denied the write (caller skips it).
+ */
+bool kvm_vmi_sysreg_monitoring(struct kvm *kvm);
+int  kvm_vmi_sysreg_index(int reg);
+bool kvm_vmi_sysreg_write(struct kvm_vcpu *vcpu, int idx, u64 old_val,
+			  u64 new_val);
+
+/*
  * Per-GFN access enforcement for alternate views, reached from the arm64
  * stage-2 fault path (arch/arm64/kvm/mmu.c).
  */
@@ -85,6 +110,10 @@ bool kvm_vmi_view_force_pte_gfn(struct kvm_vcpu *vcpu, gfn_t gfn);
 
 static inline void kvm_vmi_apply_state(struct kvm_vcpu *vcpu) {}
 static inline int kvm_vmi_hypercall(struct kvm_vcpu *vcpu) { return 0; }
+static inline bool kvm_vmi_sysreg_monitoring(struct kvm *kvm) { return false; }
+static inline int  kvm_vmi_sysreg_index(int reg) { return -1; }
+static inline bool kvm_vmi_sysreg_write(struct kvm_vcpu *vcpu, int idx,
+					u64 old_val, u64 new_val) { return false; }
 static inline void kvm_vmi_clamp_view_prot(struct kvm_vcpu *vcpu, gfn_t gfn,
 					   enum kvm_pgtable_prot *prot) {}
 static inline bool kvm_vmi_view_denies(struct kvm_vcpu *vcpu, gfn_t gfn,
