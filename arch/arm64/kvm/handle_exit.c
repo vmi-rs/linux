@@ -18,6 +18,7 @@
 #include <asm/kvm_emulate.h>
 #include <asm/kvm_mmu.h>
 #include <asm/kvm_nested.h>
+#include <asm/kvm_vmi.h>
 #include <asm/debug-monitors.h>
 #include <asm/stacktrace/nvhe.h>
 #include <asm/traps.h>
@@ -40,6 +41,16 @@ static int handle_hvc(struct kvm_vcpu *vcpu)
 	trace_kvm_hvc_arm64(*vcpu_pc(vcpu), vcpu_get_reg(vcpu, 0),
 			    kvm_vcpu_hvc_get_imm(vcpu));
 	vcpu->stat.hvc_exit_stat++;
+
+	/*
+	 * VMI hypercall monitoring runs before NV forwarding, so the agent
+	 * observes every guest HVC. On CONTINUE the HVC falls through to the
+	 * normal path (NV forward or SMCCC); on DENY/SET_REGS the agent
+	 * vetoes it and we skip both, returning to the guest (the HVC return
+	 * address is already past the instruction).
+	 */
+	if (kvm_vmi_hypercall(vcpu))
+		return 1;
 
 	/* Forward hvc instructions to the virtual EL2 if the guest has EL2. */
 	if (vcpu_has_nv(vcpu)) {
