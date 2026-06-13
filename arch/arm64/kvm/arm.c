@@ -20,6 +20,7 @@
 #include <linux/irqbypass.h>
 #include <linux/sched/stat.h>
 #include <linux/psci.h>
+#include <linux/kvm_vmi.h>
 #include <trace/events/kvm.h>
 
 #define CREATE_TRACE_POINTS
@@ -39,6 +40,7 @@
 #include <asm/kvm_nested.h>
 #include <asm/kvm_pkvm.h>
 #include <asm/kvm_ptrauth.h>
+#include <asm/kvm_vmi.h>
 #include <asm/sections.h>
 #include <asm/stacktrace/nvhe.h>
 
@@ -304,6 +306,10 @@ void kvm_arch_destroy_vm(struct kvm *kvm)
 	kvm_destroy_mpidr_data(kvm);
 
 	kfree(kvm->arch.sysreg_masks);
+
+#ifdef CONFIG_KVM_VMI
+	kvm_vmi_destroy(kvm);
+#endif
 	kvm_destroy_vcpus(kvm);
 
 	kvm_unshare_hyp(kvm, kvm + 1);
@@ -379,6 +385,11 @@ int kvm_vm_ioctl_check_extension(struct kvm *kvm, long ext)
 	case KVM_CAP_ARM_SEA_TO_USER:
 		r = 1;
 		break;
+#ifdef CONFIG_KVM_VMI
+	case KVM_CAP_VMI:
+		r = kvm_vmi_has_cap();
+		break;
+#endif
 	case KVM_CAP_SET_GUEST_DEBUG2:
 		return KVM_GUESTDBG_VALID_MASK;
 	case KVM_CAP_ARM_SET_DEVICE_ADDR:
@@ -546,8 +557,18 @@ int kvm_arch_vcpu_create(struct kvm_vcpu *vcpu)
 	}
 
 	err = kvm_share_hyp(vcpu, vcpu + 1);
-	if (err)
+	if (err) {
 		kvm_vgic_vcpu_destroy(vcpu);
+		return err;
+	}
+
+#ifdef CONFIG_KVM_VMI
+	err = kvm_vmi_vcpu_init(vcpu);
+	if (err) {
+		kvm_unshare_hyp(vcpu, vcpu + 1);
+		kvm_vgic_vcpu_destroy(vcpu);
+	}
+#endif
 
 	return err;
 }
@@ -565,6 +586,9 @@ void kvm_arch_vcpu_destroy(struct kvm_vcpu *vcpu)
 	kvm_timer_vcpu_terminate(vcpu);
 	kvm_pmu_vcpu_destroy(vcpu);
 	kvm_vgic_vcpu_destroy(vcpu);
+#ifdef CONFIG_KVM_VMI
+	kvm_vmi_vcpu_destroy(vcpu);
+#endif
 	kvm_arm_vcpu_destroy(vcpu);
 }
 
@@ -1124,6 +1148,9 @@ static int check_vcpu_requests(struct kvm_vcpu *vcpu)
 
 		if (kvm_dirty_ring_check_request(vcpu))
 			return 0;
+
+		if (kvm_check_request(KVM_REQ_VMI_UPDATE, vcpu))
+			kvm_vmi_apply_state(vcpu);
 
 		check_nested_vcpu_requests(vcpu);
 	}
@@ -2008,6 +2035,10 @@ int kvm_arch_vm_ioctl(struct file *filp, unsigned int ioctl, unsigned long arg)
 			return -EFAULT;
 		return kvm_vm_ioctl_get_reg_writable_masks(kvm, &range);
 	}
+#ifdef CONFIG_KVM_VMI
+	case KVM_CREATE_VMI:
+		return kvm_create_vmi(kvm);
+#endif
 	default:
 		return -EINVAL;
 	}

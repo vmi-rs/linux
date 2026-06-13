@@ -42,6 +42,22 @@ menuconfig KVM
 
 	  If unsure, say N.
 
+config KVM_VMI
+	bool "Virtual Machine Introspection (VMI) support"
+	depends on KVM
+	help
+	  Provides support for KVM Virtual Machine Introspection (VMI),
+	  allowing external agents to monitor and control guest VM execution
+	  through alternate memory views, event interception, and memory
+	  access control.
+
+	  VMI enables security tools to inspect guest state, intercept
+	  system register writes, set per-page memory permissions, and
+	  create alternate memory views with GFN remapping. Functional VMI
+	  works on a plain guest and does not require nested virtualization.
+
+	  If unsure, say N.
+
 config NVHE_EL2_DEBUG
 	bool "Debug mode for non-VHE EL2 object"
 	depends on KVM
