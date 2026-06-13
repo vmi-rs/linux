@@ -145,46 +145,153 @@ void kvm_arch_vmi_block_end(struct kvm_vcpu *vcpu)
 
 void kvm_vmi_apply_state(struct kvm_vcpu *vcpu)
 {
+	struct kvm_vcpu_vmi *vcpu_vmi = vcpu->vmi;
+	struct kvm_s2_mmu *mmu = &vcpu->kvm->arch.mmu;
+
+	/*
+	 * Materialize the active memory view into the hardware stage-2, the
+	 * authoritative sync point driven by KVM_REQ_VMI_UPDATE. The VM-wide
+	 * KVM_VMI_SWITCH_VIEW ioctl only updates the generic current_view and
+	 * kicks, so derive the target mmu from current_view here (as x86's
+	 * apply reads current_view to program the EPTP). arm64 loads stage-2
+	 * only at vcpu_load, not per guest entry, so reprogram
+	 * VTTBR_EL2/VTCR_EL2 now. Update the view's VMID first (kvm_get_vttbr
+	 * reads mmu->vmid.id); distinct per-view VMIDs avoid a switch TLB
+	 * flush.
+	 *
+	 * Hold the per-vCPU view_lock: a VM-wide switch takes the same lock to
+	 * drop this view's vcpu_count and NULL current_view, so holding it
+	 * keeps the current_view read and __load_stage2 atomic against that
+	 * switch.
+	 * Otherwise kvm_vmi_destroy_view() could kfree the view in between and
+	 * we would load a freed stage-2 root (random guest reset). Under the
+	 * lock we either load the view while vcpu_count is still raised (a
+	 * concurrent destroy returns -EBUSY) or observe current_view_id == 0.
+	 */
+	if (vcpu_vmi)
+		spin_lock(&vcpu_vmi->view_lock);
+
+	if (vcpu_vmi && vcpu_vmi->current_view_id != 0) {
+		/* Read under view_lock (held above), not kvm->srcu. */
+		struct kvm_vmi_view_data *view =
+			rcu_dereference_protected(vcpu_vmi->current_view,
+				lockdep_is_held(&vcpu_vmi->view_lock));
+
+		if (view && view->arch.mmu)
+			mmu = view->arch.mmu;
+	}
+
+	vcpu->arch.hw_mmu = mmu;
+	kvm_arm_vmid_update(&mmu->vmid);
+	__load_stage2(mmu, mmu->arch);
+
+	if (vcpu_vmi)
+		spin_unlock(&vcpu_vmi->view_lock);
+
 }
 
 int kvm_arch_vmi_create_view(struct kvm *kvm, struct kvm_vmi_view_data *view)
 {
-	return -EOPNOTSUPP;
+	int ret;
+
+	view->arch.mmu = kzalloc(sizeof(*view->arch.mmu), GFP_KERNEL_ACCOUNT);
+	if (!view->arch.mmu)
+		return -ENOMEM;
+
+	ret = kvm_init_stage2_mmu(kvm, view->arch.mmu, kvm_get_pa_bits(kvm));
+	if (ret) {
+		kfree(view->arch.mmu);
+		view->arch.mmu = NULL;
+	}
+
+	return ret;
 }
 
 void kvm_arch_vmi_destroy_view(struct kvm *kvm, struct kvm_vmi_view_data *view)
 {
+	/*
+	 * Drain users of this view's hardware root before freeing it. The
+	 * generic caller has already erased the view from vmi->views (no
+	 * vCPU can switch to it now) and verified vcpu_count == 0 (every vCPU
+	 * has switched away in software). But arm64 loads the stage-2 into
+	 * VTTBR_EL2 lazily in kvm_vmi_apply_state() via KVM_REQ_VMI_UPDATE, so
+	 * a kicked vCPU may still be running on its old hardware VTTBR, and an
+	 * in-flight stage-2 abort walker may still hold this view's tables
+	 * under mmu_lock. Freeing now would let the guest run on a freed
+	 * stage-2 (a silent firmware reset) or fault the walker. So force every
+	 * vCPU out of guest mode, then cycle mmu_lock to drain any in-flight
+	 * fault. x86 omits the force-out (it reloads EPTP eagerly); the
+	 * mmu_lock cycle mirrors x86's vmx_vmi_destroy_view().
+	 */
+	kvm_make_all_cpus_request(kvm, KVM_REQ_OUTSIDE_GUEST_MODE);
+	write_lock(&kvm->mmu_lock);
+	write_unlock(&kvm->mmu_lock);
+
+	kvm_free_stage2_pgd(view->arch.mmu);
+	kfree(view->arch.mmu);
+	view->arch.mmu = NULL;
 }
 
 void kvm_arch_vmi_switch_view(struct kvm_vcpu *vcpu,
 			      struct kvm_vmi_view_data *view)
 {
+	/* view == NULL means the host view (view 0). */
+	vcpu->arch.hw_mmu = view ? view->arch.mmu : &vcpu->kvm->arch.mmu;
+	kvm_make_request(KVM_REQ_VMI_UPDATE, vcpu);
 }
 
 void kvm_arch_vmi_reset_view(struct kvm_vcpu *vcpu)
 {
+	vcpu->arch.hw_mmu = &vcpu->kvm->arch.mmu;
+	kvm_make_request(KVM_REQ_VMI_UPDATE, vcpu);
 }
 
 bool kvm_arch_vmi_view_has_root(struct kvm_vmi_view_data *view)
 {
-	return false;
+	return view->arch.mmu && view->arch.mmu->pgt;
+}
+
+/*
+ * Drop the leaf stage-2 mapping for @gfn in a view's private stage-2, so the
+ * next access re-faults and is re-installed with the view's current per-GFN
+ * permissions. kvm_stage2_unmap_range() asserts the mmu write lock is held and
+ * does not self-lock, so @locked tells us whether the caller already holds it
+ * (only the mmu_notifier path does).
+ */
+static void kvm_vmi_zap_view_gfn(struct kvm *kvm,
+				 struct kvm_vmi_view_data *view, gfn_t gfn,
+				 bool locked)
+{
+	struct kvm_s2_mmu *mmu = view->arch.mmu;
+
+	if (!mmu || !mmu->pgt)
+		return;
+	trace_kvm_vmi_zap_view_gfn(view->id, gfn);
+	if (!locked)
+		write_lock(&kvm->mmu_lock);
+	kvm_stage2_unmap_range(mmu, gfn_to_gpa(gfn), PAGE_SIZE, false);
+	if (!locked)
+		write_unlock(&kvm->mmu_lock);
 }
 
 void kvm_arch_vmi_invalidate_gfn(struct kvm *kvm,
 				 struct kvm_vmi_view_data *view, gfn_t gfn)
 {
+	kvm_vmi_zap_view_gfn(kvm, view, gfn, false);
 }
 
 void kvm_arch_vmi_invalidate_gfn_locked(struct kvm *kvm,
 					struct kvm_vmi_view_data *view,
 					gfn_t gfn)
 {
+	kvm_vmi_zap_view_gfn(kvm, view, gfn, true);
 }
 
 void kvm_arch_vmi_invalidate_gfn_revert(struct kvm *kvm,
 					struct kvm_vmi_view_data *view,
 					gfn_t gfn)
 {
+	kvm_vmi_zap_view_gfn(kvm, view, gfn, false);
 }
 
 /*
