@@ -136,6 +136,13 @@ int vmi_control_event_err(int vmi_fd, uint32_t event, int enable)
 	return ioctl(vmi_fd, KVM_VMI_CONTROL_EVENT, &ctl);
 }
 
+int vmi_inject_event(int vmi_fd, struct kvm_vmi_inject_event *inject)
+{
+	int ret = ioctl(vmi_fd, KVM_VMI_INJECT_EVENT, inject);
+
+	return ret < 0 ? -errno : ret;
+}
+
 /*
  * View management helpers via vmi_fd.
  */

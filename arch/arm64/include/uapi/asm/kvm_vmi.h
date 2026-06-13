@@ -29,13 +29,35 @@
  */
 #define KVM_VMI_NUM_EVENTS		KVM_VMI_ARCH_EVENT(0)
 
+/* kvm_vmi_inject_event.type */
+#define KVM_VMI_INJECT_SERROR	0	/* asynchronous virtual SError */
+#define KVM_VMI_INJECT_ABORT	1	/* synchronous abort to EL1 */
+
 /*
  * Exception-injection descriptor for the KVM_VMI_INJECT_EVENT ioctl.
- * @vcpu_id is read by the generic ioctl to locate the target vCPU; the
- * remaining fields are added by the event-injection commit.
+ * @vcpu_id is read by the generic ioctl to locate the target vCPU.
+ * SERROR fields (@esr, @has_esr) and ABORT fields (@addr, @iabt, @fsc,
+ * @write) apply per @type.
+ *
+ * @type    KVM_VMI_INJECT_SERROR or KVM_VMI_INJECT_ABORT.
+ * @addr    faulting VA; written to FAR_EL1 (FAR_EL2 for NV guests targeting EL2).
+ * @esr     ISS/syndrome bits, valid iff @has_esr (requires RAS).
+ * @iabt    1 = instruction abort, 0 = data abort.
+ * @has_esr @esr is valid.
+ * @fsc     fault status code (ESR_ELx_FSC_*; e.g. translation FAULT).
+ * @write   data abort WnR: write fault (1) vs read fault (0).
+ * @pad     must be zero.
  */
 struct kvm_vmi_inject_event {
 	__u32 vcpu_id;
+	__u32 type;
+	__u64 addr;
+	__u64 esr;
+	__u8  iabt;
+	__u8  has_esr;
+	__u8  fsc;
+	__u8  write;
+	__u8  pad[4];
 };
 
 /*

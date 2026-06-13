@@ -67,6 +67,11 @@ void vmi_pause_vm(int vmi_fd);
 void vmi_unpause_vm(int vmi_fd);
 void vmi_pause_vcpu(int vmi_fd, uint32_t vcpu_id);
 void vmi_unpause_vcpu(int vmi_fd, uint32_t vcpu_id);
+/*
+ * Issue KVM_VMI_INJECT_EVENT. Returns 0 on success, or -errno on failure
+ * (so callers can assert specific validation errors, e.g. == -EINVAL).
+ */
+int vmi_inject_event(int vmi_fd, struct kvm_vmi_inject_event *inject);
 void vmi_teardown_ring(struct vmi_test_ring *r);
 void *vmi_vcpu_thread_fn(void *arg);
 int vmi_test_setup(struct kvm_vm **vm, struct kvm_vcpu **vcpu,

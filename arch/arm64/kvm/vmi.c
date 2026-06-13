@@ -319,10 +319,60 @@ void kvm_vmi_handle_event_response(struct kvm_vcpu *vcpu, u32 event_type,
 	}
 }
 
+/* kvm_inject_* return 1 when an exception was pended; normalize to 0. */
+static int vmi_inject_normalize(int r)
+{
+	return r < 0 ? r : 0;
+}
+
+/* Accept only fault FSCs a guest abort handler can sensibly process. */
+static bool vmi_inject_fsc_ok(u8 fsc)
+{
+	fsc &= ESR_ELx_FSC;
+
+	return esr_fsc_is_translation_fault(fsc) ||
+	       esr_fsc_is_permission_fault(fsc) ||
+	       esr_fsc_is_access_flag_fault(fsc) ||
+	       fsc == ESR_ELx_FSC_EXTABT ||
+	       esr_fsc_is_sea_ttw(fsc);
+}
+
 int kvm_vmi_inject_event(struct kvm_vcpu *vcpu,
 			 struct kvm_vmi_inject_event *inject)
 {
-	return -EOPNOTSUPP;
+	if (inject->pad[0] || inject->pad[1] || inject->pad[2] || inject->pad[3])
+		return -EINVAL;
+
+	switch (inject->type) {
+	case KVM_VMI_INJECT_SERROR:
+		/* SError carries no abort fields. */
+		if (inject->iabt || inject->fsc || inject->write || inject->addr)
+			return -EINVAL;
+		if (inject->has_esr) {
+			/* Mirror __kvm_arm_vcpu_set_events RAS gating. */
+			if (!cpus_have_final_cap(ARM64_HAS_RAS_EXTN))
+				return -EINVAL;
+			if (inject->esr & ~ESR_ELx_ISS_MASK)
+				return -EINVAL;
+			return vmi_inject_normalize(
+				kvm_inject_serror_esr(vcpu, inject->esr));
+		}
+		return vmi_inject_normalize(kvm_inject_serror(vcpu));
+
+	case KVM_VMI_INJECT_ABORT:
+		if (inject->has_esr || inject->esr)
+			return -EINVAL;
+		if (inject->iabt && inject->write)	/* WnR is data-abort only */
+			return -EINVAL;
+		if (!vmi_inject_fsc_ok(inject->fsc))
+			return -EINVAL;
+		return vmi_inject_normalize(
+			kvm_inject_dabt_with_fsc(vcpu, inject->iabt,
+						 inject->addr, inject->fsc,
+						 inject->write));
+	default:
+		return -EINVAL;
+	}
 }
 
 void kvm_arch_vmi_restore_singlestep(struct kvm_vcpu *vcpu)
