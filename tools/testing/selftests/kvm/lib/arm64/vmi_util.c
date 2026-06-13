@@ -113,6 +113,14 @@ void vmi_ack_event(struct vmi_test_ring *r, uint32_t vcpu_id)
 	TEST_ASSERT(ret == 0, "KVM_VMI_ACK_EVENT failed: %d", ret);
 }
 
+/* Error-tolerant variant for race tests: returns the raw ioctl result. */
+int __vmi_ack_event_err(int vmi_fd, uint32_t vcpu_id)
+{
+	struct kvm_vmi_vcpu ack = { .vcpu_id = vcpu_id };
+
+	return ioctl(vmi_fd, KVM_VMI_ACK_EVENT, &ack);
+}
+
 void vmi_control_event(int vmi_fd, uint32_t event, int enable)
 {
 	struct kvm_vmi_control_event ctl = {};
@@ -321,6 +329,16 @@ void vmi_teardown_ring(struct vmi_test_ring *r)
 		close(r->event_fd);
 	if (r->ack_fd >= 0)
 		close(r->ack_fd);
+}
+
+/*
+ * Issue the KVM_VMI_TEARDOWN_RING ioctl: tear down the kernel-side ring for a
+ * vCPU while the VMI session stays alive. Distinct from vmi_teardown_ring(),
+ * which only releases the userspace mmap and fds. Returns the ioctl result.
+ */
+int vmi_teardown_ring_ioctl(int vmi_fd, uint32_t vcpu_id)
+{
+	return ioctl(vmi_fd, KVM_VMI_TEARDOWN_RING, &vcpu_id);
 }
 
 /*

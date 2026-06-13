@@ -85,6 +85,10 @@ void kvm_arch_vmi_session_reset(struct kvm_vmi *vmi)
  */
 void kvm_arch_vmi_reset_vcpu_state(struct kvm_vcpu *vcpu)
 {
+	struct kvm_vcpu_vmi *vcpu_vmi = vcpu->vmi;
+
+	if (vcpu_vmi)
+		vcpu_vmi->arch.singlestep_active = false;
 }
 
 /**
@@ -160,6 +164,18 @@ void kvm_arch_vmi_update(struct kvm *kvm)
 
 void kvm_arch_vmi_set_singlestep(struct kvm_vcpu *vcpu, bool enable)
 {
+	struct kvm_vcpu_vmi *vcpu_vmi = vcpu->vmi;
+
+	if (!vcpu_vmi || vcpu_vmi->arch.singlestep_active == enable)
+		return;
+
+	vcpu_vmi->arch.singlestep_active = enable;
+	/*
+	 * Defer the hardware arm/disarm to kvm_vmi_apply_state (the single VMI
+	 * sync point). The one-shot disarm in kvm_vmi_singlestep also requests
+	 * this, so apply_state always reconciles the final state after a response.
+	 */
+	kvm_make_request(KVM_REQ_VMI_UPDATE, vcpu);
 }
 
 /*
@@ -233,10 +249,13 @@ void kvm_vmi_apply_state(struct kvm_vcpu *vcpu)
 		*vcpu_hcr(vcpu) &= ~HCR_TVM;
 
 	/* VMI breakpoint OR singlestep keeps the debug-exception trap (TDE) on. */
-	if (kvm_vmi_bp_monitoring(vcpu->kvm))
+	if (kvm_vmi_bp_monitoring(vcpu->kvm) || kvm_vmi_singlestep_active(vcpu))
 		vcpu->arch.mdcr_el2 |= MDCR_EL2_TDE;
 	else if (!vcpu->guest_debug)
 		vcpu->arch.mdcr_el2 &= ~MDCR_EL2_TDE;
+
+	/* Arm/disarm hardware single-step (MDSCR_EL1.SS + PSTATE.SS), live. */
+	kvm_vmi_apply_singlestep(vcpu);
 
 	if (has_vhe()) {
 		preempt_disable();
@@ -626,6 +645,17 @@ bool kvm_vmi_bp_monitoring(struct kvm *kvm)
 	return active;
 }
 
+/*
+ * True if a hardware single-step is armed/pending on @vcpu. Read from the debug
+ * fast paths and kvm_vmi_apply_state to drive MDSCR_EL1.SS / PSTATE.SS / TDE.
+ */
+bool kvm_vmi_singlestep_active(struct kvm_vcpu *vcpu)
+{
+	struct kvm_vcpu_vmi *vcpu_vmi = vcpu->vmi;
+
+	return vcpu_vmi && vcpu_vmi->arch.singlestep_active;
+}
+
 /**
  * kvm_vmi_sysreg_write - Deliver a SYSREG event for a monitored VM-reg write.
  * @vcpu:    The vCPU performing the write (trapped in access_vm_reg).
@@ -792,6 +822,35 @@ int kvm_vmi_breakpoint(struct kvm_vcpu *vcpu)
 	return 1;
 }
 
+/*
+ * Software-step exception trapped to EL2 (MDCR_EL2.TDE) for a step this vCPU
+ * armed. One-shot: disarm now (the agent re-arms via RESPONSE_SINGLESTEP). If
+ * this was a fast singlestep (RESPONSE_SINGLESTEP_FAST), switch back to the
+ * restore view and suppress the event. Otherwise deliver a SINGLESTEP event
+ * carrying the stepped-to IPA. The disarm also requests KVM_REQ_VMI_UPDATE, so
+ * kvm_vmi_apply_state reconciles the final (re-armed or disarmed) state after
+ * the agent responds. Always returns 1.
+ */
+int kvm_vmi_singlestep(struct kvm_vcpu *vcpu)
+{
+	struct kvm_vmi_ring_event ring_event = {};
+	gpa_t gpa;
+
+	kvm_arch_vmi_set_singlestep(vcpu, false);
+
+	if (!kvm_vmi_event_enabled(vcpu, KVM_VMI_EVENT_SINGLESTEP))
+		return 1;
+
+	gpa = kvm_vmi_pc_to_ipa(vcpu, *vcpu_pc(vcpu));
+
+	ring_event.type = KVM_VMI_EVENT_SINGLESTEP;
+	ring_event.vcpu_id = vcpu->vcpu_id;
+	ring_event.singlestep.gpa = gpa;
+	trace_kvm_vmi_event_deliver(vcpu->vcpu_id, KVM_VMI_EVENT_SINGLESTEP, gpa);
+	kvm_vmi_deliver_via_ring(vcpu, &ring_event);
+	return 1;
+}
+
 /**
  * kvm_vmi_capture_regs - Copy vCPU register state into a ring event
  * @vcpu: The vCPU whose registers to capture.
@@ -930,8 +989,4 @@ int kvm_vmi_inject_event(struct kvm_vcpu *vcpu,
 	default:
 		return -EINVAL;
 	}
-}
-
-void kvm_arch_vmi_restore_singlestep(struct kvm_vcpu *vcpu)
-{
 }

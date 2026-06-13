@@ -52,10 +52,11 @@ static void kvm_arm_setup_mdcr_el2(struct kvm_vcpu *vcpu)
 				MDCR_EL2_TDOSA);
 
 	/*
-	 * Route software debug exceptions to EL2 for userspace debug or VMI
-	 * BRK.
+	 * Route software debug exceptions to EL2 for userspace debug, VMI BRK,
+	 * or VMI single-step.
 	 */
-	if (vcpu->guest_debug || kvm_vmi_bp_monitoring(vcpu->kvm))
+	if (vcpu->guest_debug || kvm_vmi_bp_monitoring(vcpu->kvm) ||
+	    kvm_vmi_singlestep_active(vcpu))
 		vcpu->arch.mdcr_el2 |= MDCR_EL2_TDE;
 
 	/*
@@ -139,7 +140,8 @@ static void setup_external_mdscr(struct kvm_vcpu *vcpu)
 							   MDSCR_EL1_MDE |
 							   MDSCR_EL1_KDE);
 
-	if (vcpu->guest_debug & KVM_GUESTDBG_SINGLESTEP)
+	if ((vcpu->guest_debug & KVM_GUESTDBG_SINGLESTEP) ||
+	    kvm_vmi_singlestep_active(vcpu))
 		mdscr |= MDSCR_EL1_SS;
 
 	if (vcpu->guest_debug & KVM_GUESTDBG_USE_HW)
@@ -155,8 +157,16 @@ void kvm_vcpu_load_debug(struct kvm_vcpu *vcpu)
 	/* Must be called before kvm_vcpu_load_vhe() */
 	KVM_BUG_ON(vcpu_get_flag(vcpu, SYSREGS_ON_CPU), vcpu->kvm);
 
-	if (has_vhe())
+	if (has_vhe()) {
 		*host_data_ptr(host_debug_state.mdcr_el2) = read_sysreg(mdcr_el2);
+		/*
+		 * Snapshot the genuine host MDSCR_EL1 before any VMI single-step
+		 * setup can write the live, VHE-shared register. Restored
+		 * unconditionally in kvm_vcpu_put_debug() so the host never
+		 * resumes EL0 with a leaked MDSCR_EL1.SS.
+		 */
+		*host_data_ptr(host_debug_state.mdscr_el1) = read_sysreg(mdscr_el1);
+	}
 
 	/*
 	 * Determine which of the possible debug states we're in:
@@ -172,7 +182,7 @@ void kvm_vcpu_load_debug(struct kvm_vcpu *vcpu)
 	 *    context needs to be loaded on the CPU.
 	 */
 	if (vcpu->guest_debug || kvm_vcpu_os_lock_enabled(vcpu) ||
-	    kvm_vmi_bp_monitoring(vcpu->kvm)) {
+	    kvm_vmi_bp_monitoring(vcpu->kvm) || kvm_vmi_singlestep_active(vcpu)) {
 		vcpu->arch.debug_owner = VCPU_DEBUG_HOST_OWNED;
 		setup_external_mdscr(vcpu);
 
@@ -180,7 +190,8 @@ void kvm_vcpu_load_debug(struct kvm_vcpu *vcpu)
 		 * Steal the guest's single-step state machine if userspace wants
 		 * single-step the guest.
 		 */
-		if (vcpu->guest_debug & KVM_GUESTDBG_SINGLESTEP) {
+		if ((vcpu->guest_debug & KVM_GUESTDBG_SINGLESTEP) ||
+		    kvm_vmi_singlestep_active(vcpu)) {
 			if (*vcpu_cpsr(vcpu) & DBG_SPSR_SS)
 				vcpu_clear_flag(vcpu, GUEST_SS_ACTIVE_PENDING);
 			else
@@ -205,10 +216,22 @@ void kvm_vcpu_load_debug(struct kvm_vcpu *vcpu)
 
 void kvm_vcpu_put_debug(struct kvm_vcpu *vcpu)
 {
-	if (has_vhe())
+	if (has_vhe()) {
 		write_sysreg(*host_data_ptr(host_debug_state.mdcr_el2), mdcr_el2);
+		/*
+		 * VMI single-step may have written MDSCR_EL1.SS into the live,
+		 * VHE-shared register (kvm_vmi_apply_singlestep()). Restore the
+		 * genuine host value before the early return below: the
+		 * plain-singlestep ring-block path disarms
+		 * kvm_vmi_singlestep_active() before this runs, so the early
+		 * return would otherwise skip the restore and leave the host
+		 * resuming EL0 with single-step armed.
+		 */
+		write_sysreg(*host_data_ptr(host_debug_state.mdscr_el1), mdscr_el1);
+	}
 
-	if (likely(!(vcpu->guest_debug & KVM_GUESTDBG_SINGLESTEP)))
+	if (likely(!(vcpu->guest_debug & KVM_GUESTDBG_SINGLESTEP) &&
+		   !kvm_vmi_singlestep_active(vcpu)))
 		return;
 
 	/*
@@ -225,6 +248,117 @@ void kvm_vcpu_put_debug(struct kvm_vcpu *vcpu)
 	else
 		*vcpu_cpsr(vcpu) |= DBG_SPSR_SS;
 }
+
+#ifdef CONFIG_KVM_VMI
+/*
+ * Asynchronous exceptions (SError/IRQ/FIQ) the VMI single-step masks in the
+ * guest's PSTATE for the duration of the one-instruction step window. PSTATE.D
+ * is deliberately left untouched: the step is routed to EL2 via MDCR_EL2.TDE,
+ * so a lower-EL debug mask cannot gate it, and masking it would only risk
+ * suppressing the step we are trying to take.
+ */
+#define VMI_SS_DAIF_MASK	(PSR_A_BIT | PSR_I_BIT | PSR_F_BIT)
+
+/*
+ * Mask the guest's async exceptions (A/I/F) for a VMI single-step window.
+ *
+ * VMI steps a LIVE guest. If an interrupt is taken between arming PSTATE.SS
+ * and the step trapping to EL2, hardware saves SPSR_EL1.SS=1 into the
+ * interrupted thread's context in guest RAM (beyond KVM's reach), so that
+ * thread later takes a spurious software-step exception (seen in a Windows
+ * guest as a stray STATUS_SINGLE_STEP). Masking makes the step atomic: one
+ * instruction traps with no preemption to leak SS. The masked interrupts stay
+ * pending in the vGIC and are taken once DAIF is restored at disarm.
+ */
+static void kvm_vmi_mask_singlestep_daif(struct kvm_vcpu *vcpu)
+{
+	struct kvm_vcpu_vmi *vcpu_vmi = vcpu->vmi;
+
+	if (!vcpu_vmi || vcpu_vmi->arch.daif_masked)
+		return;
+
+	vcpu_vmi->arch.saved_daif = *vcpu_cpsr(vcpu) & VMI_SS_DAIF_MASK;
+	*vcpu_cpsr(vcpu) |= VMI_SS_DAIF_MASK;
+	vcpu_vmi->arch.daif_masked = true;
+}
+
+/* Restore the guest's pre-step DAIF, undoing kvm_vmi_mask_singlestep_daif(). */
+static void kvm_vmi_unmask_singlestep_daif(struct kvm_vcpu *vcpu)
+{
+	struct kvm_vcpu_vmi *vcpu_vmi = vcpu->vmi;
+
+	if (!vcpu_vmi || !vcpu_vmi->arch.daif_masked)
+		return;
+
+	*vcpu_cpsr(vcpu) &= ~VMI_SS_DAIF_MASK;
+	*vcpu_cpsr(vcpu) |= vcpu_vmi->arch.saved_daif;
+	vcpu_vmi->arch.daif_masked = false;
+}
+
+/*
+ * Arm or disarm VMI hardware single-step on @vcpu, materialized LIVE because
+ * under VHE MDSCR_EL1 is loaded only at vcpu_load. Called from
+ * kvm_vmi_apply_state() on KVM_REQ_VMI_UPDATE. Shares MDSCR_EL1.SS / PSTATE.SS
+ * and the guest-SS save/restore with userspace KVM_GUESTDBG_SINGLESTEP so the
+ * two coexist without corruption.
+ */
+void kvm_vmi_apply_singlestep(struct kvm_vcpu *vcpu)
+{
+	bool want = kvm_vmi_singlestep_active(vcpu);
+
+	/*
+	 * Restore any guest DAIF masked for a step window BEFORE the
+	 * host-ownership early-return below, else a vCPU torn down mid-step
+	 * (teardown drops debug ownership) would resume with A/I/F masked ->
+	 * interrupts disabled -> silent hang. Runs on the vCPU's own thread
+	 * with vcpu->vmi still valid, idempotent (guarded by daif_masked).
+	 */
+	if (!want)
+		kvm_vmi_unmask_singlestep_daif(vcpu);
+
+	/*
+	 * Skip only when not arming now and not already host-owned. Keying off
+	 * host-ownership (not guest_debug) is essential for DISARM: a step
+	 * armed by a prior apply_state must fall through to clear MDSCR_EL1.SS,
+	 * else the guest keeps stepping into exceptions singlestep_active no
+	 * longer claims.
+	 */
+	if (!want && !kvm_host_owns_debug_regs(vcpu))
+		return;
+
+	if (want)
+		vcpu->arch.debug_owner = VCPU_DEBUG_HOST_OWNED;
+
+	setup_external_mdscr(vcpu);	/* sets MDSCR_EL1.SS iff (want || udbg_ss) */
+
+	if (want) {
+		*vcpu_cpsr(vcpu) |= DBG_SPSR_SS;
+		kvm_vmi_mask_singlestep_daif(vcpu);
+	} else if (!(vcpu->guest_debug & KVM_GUESTDBG_SINGLESTEP))
+		*vcpu_cpsr(vcpu) &= ~DBG_SPSR_SS;
+
+	if (has_vhe()) {
+		preempt_disable();
+		write_sysreg(vcpu->arch.external_mdscr_el1, mdscr_el1);
+		preempt_enable();
+	}
+}
+
+/*
+ * Teardown-time restore of a guest DAIF masked for an in-flight VMI step.
+ *
+ * A session teardown frees vcpu->vmi (where saved_daif lives) before a later
+ * apply can restore DAIF, which would strand the guest with interrupts disabled
+ * (silent hang). kvm_vmi_release() calls this from the agent thread with
+ * vcpu->mutex held, the vCPU parked, and vcpu->vmi still valid; the unmask is
+ * idempotent (guarded by daif_masked). HW step bits are cleared later by the
+ * post-teardown apply, so only DAIF needs restoring here.
+ */
+void kvm_arch_vmi_restore_singlestep(struct kvm_vcpu *vcpu)
+{
+	kvm_vmi_unmask_singlestep_daif(vcpu);
+}
+#endif /* CONFIG_KVM_VMI */
 
 /*
  * Updates ownership of the debug registers after a trapped guest access to a
