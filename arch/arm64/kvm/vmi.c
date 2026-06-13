@@ -49,9 +49,16 @@ bool kvm_arch_vmi_has_paging_write(void)
 	return false;
 }
 
+/*
+ * arm64 can retire a denied data access in the kernel by single-stepping it on
+ * the default view (the fast-singlestep machinery). This backs the
+ * KVM_VMI_SET_MEM_ACCESS autostep_mask, which lets a 16K stage-2 leaf hide a
+ * breakpoint without storming userspace on every access to the guest-4K pages
+ * fused into the same host page.
+ */
 bool kvm_arch_vmi_has_auto_step(void)
 {
-	return false;
+	return true;
 }
 
 void kvm_arch_vmi_session_init(struct kvm_vmi *vmi)
@@ -90,6 +97,7 @@ void kvm_arch_vmi_reset_vcpu_state(struct kvm_vcpu *vcpu)
 	if (vcpu_vmi) {
 		vcpu_vmi->arch.singlestep_active = false;
 		vcpu_vmi->fast_singlestep_active = false;
+		vcpu_vmi->arch.atomic_step_active = false;
 	}
 }
 
@@ -454,6 +462,31 @@ bool kvm_vmi_view_denies(struct kvm_vcpu *vcpu, gfn_t gfn, u8 attempted)
 }
 
 /*
+ * Sub-page auto-step mask for @gfn in the vCPU's active view: the set of 4K
+ * sub-pages (within the host page) whose denied data accesses the abort path
+ * single-steps in the kernel instead of delivering MEM_ACCESS. The mask is
+ * packed above the access byte in the access_overrides value entry (see
+ * kvm_vmi_set_gfn_access). Returns 0 on view 0 or when @gfn has no override.
+ */
+u16 kvm_vmi_view_autostep_mask(struct kvm_vcpu *vcpu, gfn_t gfn)
+{
+	struct kvm_vcpu_vmi *vcpu_vmi = vcpu->vmi;
+	struct kvm_vmi_view_data *view;
+	void *entry;
+
+	if (!vcpu_vmi)
+		return 0;
+	/* Fault path: the abort handler holds kvm->srcu (mmu.c). */
+	view = srcu_dereference(vcpu_vmi->current_view, &vcpu->kvm->srcu);
+	if (!view)
+		return 0;
+	entry = xa_load(&view->access_overrides, gfn);
+	if (!entry)
+		return 0;
+	return (xa_to_value(entry) >> 8) & 0xffff;
+}
+
+/*
  * Resolve a per-GFN remap (change_gfn) for the vCPU's active view. The generic
  * core stores gfn_overrides[gfn] as the raw target HPA cast to a pointer; the
  * fault path maps that HPA instead of the host PFN. View 0 (NULL current_view)
@@ -782,6 +815,182 @@ static gpa_t kvm_vmi_pc_to_ipa(struct kvm_vcpu *vcpu, u64 pc)
 
 	vcpu_write_sys_reg(vcpu, saved_par, PAR_EL1);
 	return ipa;
+}
+
+/*
+ * Read the 4-byte A64 instruction at guest VA @va into @insn. Translates the VA
+ * through the guest stage-1 (AT S1E1R, as in kvm_vmi_pc_to_ipa) and reads the
+ * bytes from the canonical memslot. Returns false on a translation or read
+ * failure so the caller can fall back rather than act on a garbage opcode.
+ */
+static bool
+kvm_vmi_read_guest_insn(struct kvm_vcpu *vcpu, u64 va, u32 *insn)
+{
+	gpa_t ipa = kvm_vmi_pc_to_ipa(vcpu, va);
+	__le32 raw;
+
+	if (ipa == INVALID_GPA)
+		return false;
+	if (kvm_read_guest(vcpu->kvm, ipa, &raw, sizeof(raw)))
+		return false;
+
+	*insn = le32_to_cpu(raw);
+	return true;
+}
+
+/* Bounded forward scan for the store-exclusive. Same idea as arm64 kprobes'
+ * bounded atomic-region scan, but a distinct, smaller bound: kprobes'
+ * MAX_ATOMIC_CONTEXT_SIZE scans up to 32 instructions (128 bytes) backward
+ * from a probe point, whereas a real LDXR..STXR sequence is only a handful of
+ * forward instructions -- 16 is an ample cap that also stops a misdecode from
+ * running away.
+ */
+#define VMI_ATOMIC_MAX_SPAN	16
+
+/*
+ * If the instruction at @pc is part of an LDXR..STXR exclusive sequence, set
+ * @end_va to the VA just past the store-exclusive (where the atomic write has
+ * completed) and return true. The auto-step runs the whole sequence on the
+ * default view and regains control at @end_va via a one-shot breakpoint, instead
+ * of single-stepping it - a step exception inside the sequence clears the local
+ * exclusive monitor and the STXR can never succeed (atomics/spinlocks livelock).
+ * The status check / retry branch after the store-exclusive does not touch the
+ * protected data, so stopping right after the store-exclusive is sufficient; a
+ * spurious STXR failure just re-faults the load-exclusive and re-arms the step.
+ *
+ * Uses the in-tree aarch64_insn_is_load_ex/_store_ex predicates (the same ones
+ * arm64 kprobes uses to detect atomic regions). Returns false (caller falls
+ * back, never single-steps an exclusive) if @pc is not an exclusive load/store
+ * or no store-exclusive is found within the bound.
+ */
+static bool
+kvm_vmi_atomic_region_end(struct kvm_vcpu *vcpu, u64 pc, u64 *end_va)
+{
+	u32 insn;
+	int i;
+
+	if (!kvm_vmi_read_guest_insn(vcpu, pc, &insn))
+		return false;
+	if (!aarch64_insn_is_load_ex(insn) && !aarch64_insn_is_store_ex(insn))
+		return false;
+
+	for (i = 0; i < VMI_ATOMIC_MAX_SPAN; i++) {
+		u64 va = pc + (u64)i * AARCH64_INSN_SIZE;
+
+		if (!kvm_vmi_read_guest_insn(vcpu, va, &insn))
+			return false;
+		if (aarch64_insn_is_store_ex(insn)) {
+			*end_va = va + AARCH64_INSN_SIZE;
+			return true;
+		}
+	}
+
+	return false;
+}
+
+/* True if @vcpu->vmi has an in-kernel atomic step in flight. */
+bool kvm_vmi_atomic_step_active(struct kvm_vcpu *vcpu)
+{
+	struct kvm_vcpu_vmi *vcpu_vmi = vcpu->vmi;
+
+	return vcpu_vmi && vcpu_vmi->arch.atomic_step_active;
+}
+
+/*
+ * Arm an in-kernel atomic step for a denied exclusive (LDXR/STXR) access whose
+ * faulting instruction is at the guest PC. Runs the whole LDXR..STXR sequence on
+ * the default view (where the data is accessible, so the exclusive monitor is not
+ * disturbed by stage-2 faults) and regains control at the region end via a
+ * one-shot HW breakpoint, rather than single-stepping (a step exception inside
+ * the sequence clears the monitor -> the STXR can never succeed -> livelock).
+ *
+ * The view save + switch-to-0 and the disarm restore reuse the generic
+ * fast-singlestep machinery (begin/complete_fast_singlestep). Returns false
+ * (caller must NOT single-step the exclusive; deliver MEM_ACCESS instead) when
+ * userspace owns the HW debug registers or the region end cannot be resolved.
+ */
+static bool kvm_vmi_begin_atomic_step(struct kvm_vcpu *vcpu)
+{
+	struct kvm_vcpu_vmi *vcpu_vmi = vcpu->vmi;
+	u64 end_va;
+
+	if (!vcpu_vmi)
+		return false;
+
+	/* Userspace HW debug owns external_debug_state / the breakpoint regs. */
+	if (vcpu->guest_debug & KVM_GUESTDBG_USE_HW)
+		return false;
+
+	if (!kvm_vmi_atomic_region_end(vcpu, *vcpu_pc(vcpu), &end_va))
+		return false;
+
+	vcpu_vmi->arch.atomic_step_active = true;
+	vcpu_vmi->arch.atomic_step_end_va = end_va;
+	kvm_vmi_arm_atomic_step_bp(vcpu, end_va);
+
+	/*
+	 * Switch to the default view and request the debug re-apply. This sets
+	 * singlestep_active (shared host-owned-debug / MDCR_EL2.TDE plumbing) but
+	 * kvm_vmi_apply_singlestep() suppresses PSTATE.SS for an atomic step and
+	 * enables the breakpoint via MDSCR_EL1.MDE instead.
+	 */
+	kvm_vmi_begin_fast_singlestep(vcpu, 0);
+	return true;
+}
+
+/*
+ * Retire a denied auto-step access in the kernel (arm64 stage-2 fault path).
+ *
+ * Unreadable instruction: return false so the caller delivers MEM_ACCESS,
+ * never single-step it. It may be an exclusive (LDXR/STXR), and stepping one
+ * clears the local monitor (the step-ERET) so the STXR can never succeed ->
+ * livelock; an unread instruction must not be assumed non-exclusive. (This
+ * only arises for a live demand-paged or transiently-unbacked code page; an
+ * executing EL1 instruction is always readable via AT S1E1R.)
+ *
+ * Readable exclusive: arm an atomic step; if that is not possible (userspace
+ * HW debug, or an unresolvable region) return false to deliver MEM_ACCESS
+ * instead. Readable non-exclusive: single-step it on the default view.
+ *
+ * Returns true if the access was retired in the kernel (caller falls through
+ * to map the leaf on the default view), false if it must be delivered to
+ * userspace.
+ */
+bool kvm_vmi_autostep_retire(struct kvm_vcpu *vcpu)
+{
+	u32 insn;
+
+	if (!kvm_vmi_read_guest_insn(vcpu, *vcpu_pc(vcpu), &insn))
+		return false;	/* unreadable: never single-step (may be exclusive) */
+
+	if (aarch64_insn_is_load_ex(insn) || aarch64_insn_is_store_ex(insn))
+		return kvm_vmi_begin_atomic_step(vcpu);
+
+	kvm_vmi_begin_fast_singlestep(vcpu, 0);
+	return true;
+}
+
+/*
+ * Complete an in-kernel atomic step when its region-end HW breakpoint traps. The
+ * LDXR..STXR has run atomically on the default view; switch back to the alt view
+ * and disarm. Returns true if this breakpoint was the atomic-step region end.
+ */
+bool kvm_vmi_complete_atomic_step(struct kvm_vcpu *vcpu)
+{
+	struct kvm_vcpu_vmi *vcpu_vmi = vcpu->vmi;
+
+	if (!vcpu_vmi || !vcpu_vmi->arch.atomic_step_active)
+		return false;
+	if (*vcpu_pc(vcpu) != vcpu_vmi->arch.atomic_step_end_va)
+		return false;
+
+	kvm_vmi_disarm_atomic_step_bp(vcpu);
+	vcpu_vmi->arch.atomic_step_active = false;
+	/* Disarm the shared single-step plumbing (clears MDSCR_EL1.MDE on apply). */
+	kvm_arch_vmi_set_singlestep(vcpu, false);
+	/* Restore the view the vCPU was on (generic fast-singlestep machinery). */
+	kvm_vmi_complete_fast_singlestep(vcpu);
+	return true;
 }
 
 /*

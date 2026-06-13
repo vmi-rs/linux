@@ -79,6 +79,19 @@ struct kvm_arch_vcpu_vmi {
 	bool singlestep_active;
 	bool daif_masked;
 	u64  saved_daif;
+
+	/*
+	 * In-kernel "atomic step": retire a denied exclusive (LDXR/STXR) access
+	 * without single-stepping it. A step exception inside an LDXR..STXR
+	 * sequence clears the local exclusive monitor, so the STXR can never
+	 * succeed (atomics/spinlocks livelock). Instead the access is run whole on
+	 * the default view and control is regained at @atomic_step_end_va (the VA
+	 * just past the store-exclusive) via a one-shot internal HW breakpoint,
+	 * GDB-style. The view save/restore reuses the generic fast-singlestep
+	 * machinery (fast_singlestep_restore_view).
+	 */
+	bool atomic_step_active;
+	u64  atomic_step_end_va;
 };
 
 #ifdef CONFIG_KVM_VMI
@@ -128,12 +141,27 @@ void kvm_vmi_apply_singlestep(struct kvm_vcpu *vcpu);
 int  kvm_vmi_singlestep(struct kvm_vcpu *vcpu);
 
 /*
+ * In-kernel atomic step (LDXR/STXR retire). kvm_vmi_atomic_step_active() is read
+ * from the debug fast paths to keep host-owned debug / MDCR_EL2.TDE on.
+ * kvm_vmi_autostep_retire() is called from the stage-2 fault path instead of
+ * single-stepping a denied exclusive access; kvm_vmi_complete_atomic_step()
+ * finishes it on the region-end breakpoint. kvm_vmi_arm/disarm_atomic_step_bp()
+ * program the one-shot internal HW breakpoint in external_debug_state.
+ */
+bool kvm_vmi_atomic_step_active(struct kvm_vcpu *vcpu);
+bool kvm_vmi_autostep_retire(struct kvm_vcpu *vcpu);
+bool kvm_vmi_complete_atomic_step(struct kvm_vcpu *vcpu);
+void kvm_vmi_arm_atomic_step_bp(struct kvm_vcpu *vcpu, u64 end_va);
+void kvm_vmi_disarm_atomic_step_bp(struct kvm_vcpu *vcpu);
+
+/*
  * Per-GFN access enforcement for alternate views, reached from the arm64
  * stage-2 fault path (arch/arm64/kvm/mmu.c).
  */
 void kvm_vmi_clamp_view_prot(struct kvm_vcpu *vcpu, gfn_t gfn,
 			     enum kvm_pgtable_prot *prot);
 bool kvm_vmi_view_denies(struct kvm_vcpu *vcpu, gfn_t gfn, u8 attempted);
+u16  kvm_vmi_view_autostep_mask(struct kvm_vcpu *vcpu, gfn_t gfn);
 int  kvm_vmi_mem_access(struct kvm_vcpu *vcpu, gpa_t gpa, u8 attempted);
 bool kvm_vmi_view_force_pte(struct kvm_vcpu *vcpu);
 bool kvm_vmi_view_remap(struct kvm_vcpu *vcpu, gfn_t gfn, hpa_t *hpa);
@@ -152,10 +180,15 @@ static inline int  kvm_vmi_breakpoint(struct kvm_vcpu *vcpu) { return 1; }
 static inline bool kvm_vmi_singlestep_active(struct kvm_vcpu *vcpu) { return false; }
 static inline void kvm_vmi_apply_singlestep(struct kvm_vcpu *vcpu) {}
 static inline int  kvm_vmi_singlestep(struct kvm_vcpu *vcpu) { return 1; }
+static inline bool kvm_vmi_atomic_step_active(struct kvm_vcpu *vcpu) { return false; }
+static inline bool kvm_vmi_autostep_retire(struct kvm_vcpu *vcpu) { return false; }
+static inline bool kvm_vmi_complete_atomic_step(struct kvm_vcpu *vcpu) { return false; }
 static inline void kvm_vmi_clamp_view_prot(struct kvm_vcpu *vcpu, gfn_t gfn,
 					   enum kvm_pgtable_prot *prot) {}
 static inline bool kvm_vmi_view_denies(struct kvm_vcpu *vcpu, gfn_t gfn,
 				       u8 attempted) { return false; }
+static inline u16 kvm_vmi_view_autostep_mask(struct kvm_vcpu *vcpu,
+					     gfn_t gfn) { return 0; }
 static inline int kvm_vmi_mem_access(struct kvm_vcpu *vcpu, gpa_t gpa,
 				     u8 attempted) { return 0; }
 static inline bool kvm_vmi_view_force_pte(struct kvm_vcpu *vcpu) { return false; }

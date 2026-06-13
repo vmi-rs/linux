@@ -969,7 +969,7 @@ use ``KVM_VMI_RESPONSE_SWITCH_VIEW`` in a ring response instead. Errors:
                 __u64 gfn;
                 __u8  access;
                 __u8  pad;
-                __u16 autostep_mask;   /* must be 0 on x86 */
+                __u16 autostep_mask;   /* arm64 only; see below */
                 __u8  pad2[4];
             };
             /* batch mode (nr > 1) */
@@ -1020,12 +1020,18 @@ Convenience combinations ``KVM_VMI_ACCESS_RW/RX/WX/RWX`` are also defined.
    ``-EOPNOTSUPP`` unless EPT paging-write hardware is present). There is no
    per-frame "revert to the view default" operation.
 
-``autostep_mask`` (single-GFN mode) must be 0 on x86; a non-zero value returns
-``-EOPNOTSUPP`` (x86 has no auto-step support). Batch mode never sets a mask.
+``autostep_mask`` (**arm64 only**, single-GFN mode): a bitmask of 4K sub-pages
+within the GFN's host page. For a set bit, a denied data access to that sub-page
+is retired in the kernel by single-stepping it on the default view, instead of
+delivering a ``MEM_ACCESS`` event. This lets a single large stage-2 leaf (e.g.
+a 16K host page fusing four 4K guest pages) hide a breakpoint on one sub-page
+without storming the agent for accesses to the neighbours. It is only honoured
+where the architecture supports auto-step (arm64); on x86 a non-zero
+``autostep_mask`` returns ``-EOPNOTSUPP``. Batch mode never sets a mask.
 
 Errors: ``-EINVAL`` (no session, view 0, or W-without-R), ``-ENOENT`` (unknown
-view), ``-EOPNOTSUPP`` (PW without hardware, or non-zero ``autostep_mask``),
-``-EFAULT`` (NULL batch pointers or copy failure), ``-ENOMEM``.
+view), ``-EOPNOTSUPP`` (PW without hardware, or ``autostep_mask`` without arch
+support), ``-EFAULT`` (NULL batch pointers or copy failure), ``-ENOMEM``.
 
 **KVM_VMI_GET_MEM_ACCESS** (``_IOWR(KVMIO, 0xf7, struct kvm_vmi_mem_access)``)
 
