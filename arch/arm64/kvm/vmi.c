@@ -295,6 +295,112 @@ void kvm_arch_vmi_invalidate_gfn_revert(struct kvm *kvm,
 }
 
 /*
+ * Resolve a view's effective per-GFN access. The generic core stores
+ * per-GFN overrides as xa_mk_value(access) in @access_overrides; absent an
+ * override the view's default applies. The generic resolver is static, so
+ * mirror it here (matching x86).
+ */
+static u8 kvm_vmi_view_gfn_access(struct kvm_vmi_view_data *view, gfn_t gfn)
+{
+	void *entry;
+
+	if (!view)
+		return KVM_VMI_ACCESS_RWX;
+	entry = xa_load(&view->access_overrides, gfn);
+	if (entry)
+		return (u8)xa_to_value(entry);
+	return view->default_access;
+}
+
+/*
+ * Clamp the stage-2 leaf permissions about to be installed for @gfn down to
+ * what the vCPU's active view allows. Called from the fault path with the
+ * finalized prot; only ever narrows, never widens. View 0 (NULL current_view)
+ * is the unrestricted host view.
+ */
+void kvm_vmi_clamp_view_prot(struct kvm_vcpu *vcpu, gfn_t gfn,
+			     enum kvm_pgtable_prot *prot)
+{
+	struct kvm_vcpu_vmi *vcpu_vmi = vcpu->vmi;
+	struct kvm_vmi_view_data *view;
+	u8 access;
+
+	if (!vcpu_vmi)
+		return;
+	/* Fault path: the abort handler holds kvm->srcu (mmu.c). */
+	view = srcu_dereference(vcpu_vmi->current_view, &vcpu->kvm->srcu);
+	if (!view)
+		return;
+	access = kvm_vmi_view_gfn_access(view, gfn);
+	if (!(access & KVM_VMI_ACCESS_R))
+		*prot &= ~KVM_PGTABLE_PROT_R;
+	if (!(access & KVM_VMI_ACCESS_W))
+		*prot &= ~KVM_PGTABLE_PROT_W;
+	if (!(access & KVM_VMI_ACCESS_X))
+		*prot &= ~KVM_PGTABLE_PROT_X;
+}
+
+/*
+ * Report whether the vCPU's active view denies @attempted (R/W/X bits) for
+ * @gfn. Used by the abort handler to distinguish a real VMI access violation
+ * from an ordinary stage-2 fault. View 0 never denies.
+ */
+bool kvm_vmi_view_denies(struct kvm_vcpu *vcpu, gfn_t gfn, u8 attempted)
+{
+	struct kvm_vcpu_vmi *vcpu_vmi = vcpu->vmi;
+	struct kvm_vmi_view_data *view;
+
+	if (!vcpu_vmi)
+		return false;
+	/* Fault path: the abort handler holds kvm->srcu (mmu.c). */
+	view = srcu_dereference(vcpu_vmi->current_view, &vcpu->kvm->srcu);
+	if (!view)
+		return false;
+	return (kvm_vmi_view_gfn_access(view, gfn) & attempted) != attempted;
+}
+
+/*
+ * Deliver a KVM_VMI_EVENT_MEM_ACCESS event for a view access violation and
+ * block until the agent acks. mem_access is implicitly enabled (it is not
+ * gated on enabled_events), but with no ring attached there is no agent to
+ * consult, so return 0 (CONTINUE) and let the clamped leaf stand.
+ *
+ * Return: the agent's response flags (>= 0), or 0 (CONTINUE) if no ring.
+ */
+int kvm_vmi_mem_access(struct kvm_vcpu *vcpu, gpa_t gpa, u8 attempted)
+{
+	struct kvm_vmi_ring_event ring_event = {};
+	struct kvm_vmi_view_data *view;
+	u8 trace_access;
+	int ret, srcu_idx;
+
+	if (!vcpu->vmi || !READ_ONCE(vcpu->vmi->ring))
+		return 0;
+
+	ring_event.type = KVM_VMI_EVENT_MEM_ACCESS;
+	ring_event.vcpu_id = vcpu->vcpu_id;
+	ring_event.insn_len = 0;
+	ring_event.mem_access.gpa = gpa;
+	ring_event.mem_access.access = attempted;
+
+	/*
+	 * The abort path has already dropped kvm->srcu before this blocking
+	 * delivery, so take a brief local SRCU section to deref current_view
+	 * for the tracepoint, then unlock before blocking on the ring (holding
+	 * srcu across the wait would stall synchronize_srcu()).
+	 */
+	srcu_idx = srcu_read_lock(&vcpu->kvm->srcu);
+	view = srcu_dereference(vcpu->vmi->current_view, &vcpu->kvm->srcu);
+	trace_access = kvm_vmi_view_gfn_access(view, gpa_to_gfn(gpa));
+	srcu_read_unlock(&vcpu->kvm->srcu, srcu_idx);
+
+	trace_kvm_vmi_mem_violation(vcpu->vcpu_id, gpa, attempted, trace_access);
+	ret = kvm_vmi_deliver_via_ring(vcpu, &ring_event);
+
+	return ret;
+}
+
+/*
  * kvm_vmi_event_enabled - true if @event_type can be delivered on @vcpu.
  *
  * Requires session VMI state, the event enabled in the session bitmap,

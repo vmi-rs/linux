@@ -408,8 +408,9 @@ depends on the event (and the architecture) - see the per-event sections.
      - Switch this vCPU to ``slot->view_id`` on resume.
    * - ``KVM_VMI_RESPONSE_EMULATE``
      - 1 << 3
-     - Emulate the faulting instruction in software (applicable to
-       ``MEM_ACCESS``, ``CPUID`` and ``DESC_ACCESS``).
+     - **x86 only.** Emulate the faulting instruction in software (applicable to
+       ``MEM_ACCESS``, ``CPUID`` and ``DESC_ACCESS``). Silently ignored on
+       arm64.
    * - ``KVM_VMI_RESPONSE_REINJECT``
      - 1 << 4
      - Deliver the intercepted exception to the guest instead of consuming it:
@@ -587,7 +588,8 @@ KVM_VMI_EVENT_MEM_ACCESS (0)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 :Trigger: a vCPU on an alternate view accesses a frame whose per-view
-          permissions deny the access type (EPT violation)
+          permissions deny the access type (EPT violation on x86, stage-2
+          permission fault on arm64)
 :Data: ``struct kvm_vmi_event_mem_access``
 :Enabled by: implicit (no ``CONTROL_EVENT``); fires whenever a ring exists and
              the vCPU is on an alternate view
@@ -595,20 +597,23 @@ KVM_VMI_EVENT_MEM_ACCESS (0)
 ::
 
     struct kvm_vmi_event_mem_access {
-        __u64 gpa;     /* faulting guest physical address */
+        __u64 gpa;     /* faulting guest physical address (IPA on arm64) */
         __u32 access;  /* denied access bits: KVM_VMI_ACCESS_R/W/X */
         __u32 pad;
     };
 
-``access`` is a bitmask of the attempted-but-denied access types; x86 may set
-several bits at once (the EPT-violation read/write/instruction bits are OR-ed
-together), so an agent should test bits rather than compare for equality.
+``access`` is a bitmask of the attempted-but-denied access types. arm64 reports
+exactly one bit (``X``, else ``W``, else ``R``); x86 may set several bits at
+once (the EPT-violation read/write/instruction bits are OR-ed together), so an
+agent should test bits rather than compare for equality.
 
-Responses: ``SET_REGS``, ``SWITCH_VIEW``, ``SINGLESTEP``, ``SINGLESTEP_FAST``.
-``EMULATE`` emulates the faulting instruction so it completes without relaxing
-the view's permissions. A bare ``CONTINUE`` does not by itself resolve the fault
-(the access is re-attempted); the agent must widen the permission, emulate, or
-step past it (``SINGLESTEP_FAST``) to make progress.
+Responses: ``SET_REGS``, ``SWITCH_VIEW``, ``SINGLESTEP``, ``SINGLESTEP_FAST``
+apply on both architectures. ``EMULATE`` (x86 only) emulates the faulting
+instruction so it completes without relaxing the view's permissions. On arm64,
+``DENY`` injects a guest permission abort. A bare ``CONTINUE`` does not by
+itself resolve the fault (the access is re-attempted); the agent must widen the
+permission, emulate (x86), or step past it (``SINGLESTEP_FAST``) to make
+progress.
 
 KVM_VMI_EVENT_SINGLESTEP (1)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -942,9 +947,10 @@ Access flags:
      - Allow execute
    * - ``KVM_VMI_ACCESS_PW``
      - 1 << 3
-     - Allow CPU paging-write (A/D-bit updates) without a violation while
-       software writes still trap. Requires ``KVM_CAP_VMI_EPT_PW``; otherwise
-       ``-EOPNOTSUPP``.
+     - **x86 only.** Allow CPU paging-write (A/D-bit updates) without a
+       violation while software writes still trap. Requires
+       ``KVM_CAP_VMI_EPT_PW``; otherwise ``-EOPNOTSUPP``. arm64 has no
+       equivalent and always rejects PW with ``-EOPNOTSUPP``.
 
 Convenience combinations ``KVM_VMI_ACCESS_RW/RX/WX/RWX`` are also defined.
 

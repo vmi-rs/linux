@@ -20,6 +20,7 @@
 #include <asm/kvm_pkvm.h>
 #include <asm/kvm_asm.h>
 #include <asm/kvm_emulate.h>
+#include <asm/kvm_vmi.h>
 #include <asm/virt.h>
 
 #include "trace.h"
@@ -1897,6 +1898,10 @@ static int user_mem_abort(struct kvm_vcpu *vcpu, phys_addr_t fault_ipa,
 	if (nested)
 		adjust_nested_exec_perms(kvm, nested, &prot);
 
+	/* VMI: clamp to the active view's per-GFN permissions, if any. */
+	if (vcpu->arch.hw_mmu != &vcpu->kvm->arch.mmu)
+		kvm_vmi_clamp_view_prot(vcpu, gfn, &prot);
+
 	/*
 	 * Under the premise of getting a FSC_PERM fault, we just need to relax
 	 * permissions only if vma_pagesize equals fault_granule. Otherwise,
@@ -2126,6 +2131,43 @@ int kvm_handle_guest_abort(struct kvm_vcpu *vcpu)
 
 		ipa = kvm_s2_trans_output(&nested_trans);
 		nested = &nested_trans;
+	}
+
+	/*
+	 * VMI: a stage-2 permission fault against an alt view may violate
+	 * the view's per-GFN access. Consult it, and on a violation deliver
+	 * MEM_ACCESS. The delivery blocks on the agent's ack, so drop
+	 * kvm->srcu first (holding it across the wait would stall
+	 * synchronize_srcu()).
+	 */
+	if (esr_fsc_is_permission_fault(esr) &&
+	    vcpu->arch.hw_mmu != &vcpu->kvm->arch.mmu) {
+		bool is_exec_fault = kvm_vcpu_trap_is_exec_fault(vcpu);
+		bool is_write = kvm_is_write_fault(vcpu);
+		u8 attempted = is_exec_fault ? KVM_VMI_ACCESS_X :
+			       is_write      ? KVM_VMI_ACCESS_W : KVM_VMI_ACCESS_R;
+
+		if (kvm_vmi_view_denies(vcpu, fault_ipa >> PAGE_SHIFT, attempted)) {
+			int resp;
+
+			srcu_read_unlock(&vcpu->kvm->srcu, idx);
+			resp = kvm_vmi_mem_access(vcpu, fault_ipa, attempted);
+			idx = srcu_read_lock(&vcpu->kvm->srcu);
+
+			if (resp & KVM_VMI_RESPONSE_DENY) {
+				kvm_inject_dabt_with_fsc(vcpu, is_exec_fault,
+							 fault_ipa,
+							 ESR_ELx_FSC_PERM_L(3),
+							 is_write);
+				ret = 1;
+				goto out_unlock;
+			}
+			/*
+			 * CONTINUE: fall through and remap the leaf with the
+			 * view's current (clamped) perms. If access was not
+			 * widened it faults again - the agent's loop to break.
+			 */
+		}
 	}
 
 	gfn = ipa >> PAGE_SHIFT;
