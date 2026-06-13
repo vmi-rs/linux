@@ -50,10 +50,12 @@ struct kvm_arch_vcpu_vmi {
  * later commits extend.
  */
 void kvm_vmi_apply_state(struct kvm_vcpu *vcpu);
+int kvm_vmi_hypercall(struct kvm_vcpu *vcpu);
 
 #else /* !CONFIG_KVM_VMI */
 
 static inline void kvm_vmi_apply_state(struct kvm_vcpu *vcpu) {}
+static inline int kvm_vmi_hypercall(struct kvm_vcpu *vcpu) { return 0; }
 
 #endif /* CONFIG_KVM_VMI */
 
