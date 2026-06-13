@@ -53,6 +53,12 @@ struct kvm_vmi_ring_event *vmi_wait_event_timeout(struct vmi_test_ring *r,
 void vmi_ack_event(struct vmi_test_ring *r, uint32_t vcpu_id);
 void vmi_control_event(int vmi_fd, uint32_t event, int enable);
 int vmi_control_event_err(int vmi_fd, uint32_t event, int enable);
+/*
+ * Enable/disable monitoring of one VM system register (KVM_VMI_SYSREG_*),
+ * with optional onchangeonly + bitmask filtering. Asserts the ioctl succeeds.
+ */
+void vmi_control_sysreg(int vmi_fd, uint8_t reg, uint8_t onchangeonly,
+			uint64_t bitmask, int enable);
 uint32_t vmi_create_view(int vmi_fd, uint8_t default_access);
 void vmi_destroy_view(int vmi_fd, uint32_t view_id);
 int vmi_destroy_view_err(int vmi_fd, uint32_t view_id);

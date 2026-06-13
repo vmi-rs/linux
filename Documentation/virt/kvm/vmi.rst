@@ -391,10 +391,11 @@ depends on the event (and the architecture) - see the per-event sections.
        re-fault - see the per-event notes.
    * - ``KVM_VMI_RESPONSE_DENY``
      - 1 << 0
-     - Suppress the intercepted operation. For deferred-write events (CR/MSR)
-       the write is simply never applied (the old value was never overwritten)
-       and RIP is advanced past the instruction. For CPUID/descriptor/IO the
-       instruction is skipped.
+     - Suppress the intercepted operation. For deferred-write events (CR/MSR on
+       x86, SYSREG on arm64) the write is simply never applied (the old value
+       was never overwritten) and RIP/PC is advanced past the instruction. For
+       CPUID/descriptor/IO the instruction is skipped. On arm64 ``MEM_ACCESS``,
+       DENY injects a guest abort.
    * - ``KVM_VMI_RESPONSE_SET_REGS``
      - 1 << 1
      - Write back the agent's modified general-purpose registers, instruction
@@ -518,7 +519,8 @@ and 0 for MEM_ACCESS.
 
 Enables or disables monitoring of an event VM-wide. Enabling causes the event to
 be intercepted on all vCPUs, but events only fire on vCPUs that have a ring set
-up. The ``arch`` union carries event-specific parameters (x86 CR/MSR). ``-EINVAL`` is returned for an out-of-range event id.
+up. The ``arch`` union carries event-specific parameters (x86 CR/MSR, arm64
+SYSREG). ``-EINVAL`` is returned for an out-of-range event id.
 
 ``KVM_VMI_EVENT_MEM_ACCESS`` is **not** controlled through this ioctl: it is
 implicitly enabled and fires whenever a vCPU on an alternate view touches a
@@ -817,6 +819,41 @@ KVM_VMI_EVENT_IO (14)
         __u8  pad[3];
     };
 
+6.5 arm64 architecture events
+-----------------------------
+
+arm64 arch event parameters use ``union kvm_vmi_arch_control_data`` /
+``union kvm_vmi_arch_event_data`` from the arm64 ``<asm/kvm_vmi.h>``.
+
+KVM_VMI_EVENT_SYSREG (8)
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+:Trigger: guest write to a monitored EL1 VM system register (before the write
+          is applied), trapped via ``HCR_EL2.TVM``
+:Data: ``struct kvm_vmi_event_sysreg``
+:Responses: CONTINUE (allow), DENY (suppress + advance PC), SET_REGS
+
+::
+
+    struct kvm_vmi_event_sysreg {
+        __u32 reg;         /* KVM_VMI_SYSREG_* that was written */
+        __u32 pad;
+        __u64 old_value;
+        __u64 new_value;   /* value being written (observe-only) */
+    };
+
+Monitorable registers (``KVM_VMI_SYSREG_*``): ``SCTLR_EL1`` (0), ``TTBR0_EL1``
+(1), ``TTBR1_EL1`` (2), ``TCR_EL1`` (3), ``CONTEXTIDR_EL1`` (4), ``MAIR_EL1``
+(5). Control parameters (``arch.sysreg``): ``reg``, ``onchangeonly``, and
+``bitmask`` (0 = any change fires; otherwise fire iff
+``((old ^ new) & bitmask) != 0``). An out-of-range ``reg`` returns ``-EINVAL``.
+Each register is monitored independently; the event stays active while at least
+one is monitored.
+
+The write is deferred: ``DENY`` skips it (the register keeps ``old_value``) and
+advances PC. ``new_value`` is observe-only - direct sysreg write-back is not
+supported, so ``SET_REGS`` is treated like ``DENY`` for the sysreg write itself
+(GP/PC/PSTATE write-back still applies).
 7. Alternate memory views
 =========================
 
