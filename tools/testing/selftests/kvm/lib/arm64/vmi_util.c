@@ -212,17 +212,25 @@ void vmi_set_mem_access(int vmi_fd, uint32_t view_id, uint64_t gfn,
 	TEST_ASSERT(ret == 0, "KVM_VMI_SET_MEM_ACCESS failed: %d", ret);
 }
 
+int __vmi_change_gfn_err(int vmi_fd, uint32_t view_id, uint64_t old_gfn,
+			 uint64_t new_gfn)
+{
+	struct kvm_vmi_change_gfn change = {
+		.view_id = view_id,
+		.old_gfn = old_gfn,
+		.new_gfn = new_gfn,
+	};
+
+	if (ioctl(vmi_fd, KVM_VMI_CHANGE_GFN, &change) < 0)
+		return -errno;
+	return 0;
+}
+
 void vmi_change_gfn(int vmi_fd, uint32_t view_id, uint64_t old_gfn,
 		    uint64_t new_gfn)
 {
-	struct kvm_vmi_change_gfn change = {};
-	int ret;
+	int ret = __vmi_change_gfn_err(vmi_fd, view_id, old_gfn, new_gfn);
 
-	change.view_id = view_id;
-	change.old_gfn = old_gfn;
-	change.new_gfn = new_gfn;
-
-	ret = ioctl(vmi_fd, KVM_VMI_CHANGE_GFN, &change);
 	TEST_ASSERT(ret == 0, "KVM_VMI_CHANGE_GFN failed: %d", ret);
 }
 
