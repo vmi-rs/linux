@@ -388,6 +388,7 @@ int kvm_vm_ioctl_check_extension(struct kvm *kvm, long ext)
 #ifdef CONFIG_KVM_VMI
 	case KVM_CAP_VMI:
 	case KVM_CAP_VMI_GUEST_MMAP:
+	case KVM_CAP_VMI_PAUSE:
 		r = kvm_vmi_has_cap();
 		break;
 #endif
@@ -1111,6 +1112,17 @@ static int check_vcpu_requests(struct kvm_vcpu *vcpu)
 		if (kvm_check_request(KVM_REQ_VM_DEAD, vcpu))
 			return -EIO;
 
+		/*
+		 * Clear KVM_REQ_UNBLOCK, which is used to force the vCPU out
+		 * of an idle/blocked state (e.g. when a VMI agent pauses the
+		 * VM and kicks all vCPUs).  Once we reach the run loop the
+		 * unblock has served its purpose; if it is left pending,
+		 * kvm_vcpu_exit_request() keeps returning true and the vCPU
+		 * spins without ever entering the guest.  x86 clears it in
+		 * vcpu_run() after vcpu_enter_guest() returns, for the same reason.
+		 */
+		kvm_clear_request(KVM_REQ_UNBLOCK, vcpu);
+
 		if (kvm_check_request(KVM_REQ_SLEEP, vcpu))
 			kvm_vcpu_sleep(vcpu);
 
@@ -1268,6 +1280,9 @@ int kvm_arch_vcpu_ioctl_run(struct kvm_vcpu *vcpu)
 	run->exit_reason = KVM_EXIT_UNKNOWN;
 	run->flags = 0;
 	while (ret > 0) {
+		if (kvm_vmi_vcpu_paused(vcpu))
+			kvm_vmi_vcpu_pause_wait(vcpu);
+
 		/*
 		 * Check conditions before entering the guest
 		 */
