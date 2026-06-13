@@ -213,6 +213,10 @@ static int kvm_handle_guest_debug(struct kvm_vcpu *vcpu)
 	if (ec == ESR_ELx_EC_SOFTSTP_LOW && kvm_vmi_singlestep_active(vcpu))
 		return kvm_vmi_singlestep(vcpu);
 
+	/* VMI atomic step claims the region-end HW breakpoint it armed. */
+	if (ec == ESR_ELx_EC_BREAKPT_LOW && kvm_vmi_complete_atomic_step(vcpu))
+		return 1;
+
 	/*
 	 * Non-BRK debug classes cannot originate from the guest while VMI
 	 * owns MDSCR (guest debug is neutralized via VCPU_DEBUG_HOST_OWNED,

@@ -69,6 +69,14 @@ void vmi_switch_view(int vmi_fd, uint32_t view_id);
 int __vmi_switch_view_err(int vmi_fd, uint32_t view_id);
 void vmi_set_mem_access(int vmi_fd, uint32_t view_id, uint64_t gfn,
 			uint8_t access);
+/*
+ * Set a per-GFN access override plus a sub-page auto-step mask: bit i means the
+ * 4K sub-page at offset i*4K within @gfn's host page is single-stepped in the
+ * kernel on a denied data access instead of delivering MEM_ACCESS. Asserts the
+ * ioctl succeeds (it fails with -EOPNOTSUPP on arches without auto-step).
+ */
+void vmi_set_mem_access_autostep(int vmi_fd, uint32_t view_id, uint64_t gfn,
+				 uint8_t access, uint16_t autostep_mask);
 void vmi_change_gfn(int vmi_fd, uint32_t view_id, uint64_t old_gfn,
 		    uint64_t new_gfn);
 int __vmi_change_gfn_err(int vmi_fd, uint32_t view_id, uint64_t old_gfn,

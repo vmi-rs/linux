@@ -2193,25 +2193,47 @@ int kvm_handle_guest_abort(struct kvm_vcpu *vcpu)
 			       is_write      ? KVM_VMI_ACCESS_W : KVM_VMI_ACCESS_R;
 
 		if (kvm_vmi_view_denies(vcpu, fault_ipa >> PAGE_SHIFT, attempted)) {
-			int resp;
+			u16 autostep = kvm_vmi_view_autostep_mask(vcpu,
+						fault_ipa >> PAGE_SHIFT);
+			unsigned int subpage = (fault_ipa & (PAGE_SIZE - 1)) >> 12;
 
-			srcu_read_unlock(&vcpu->kvm->srcu, idx);
-			resp = kvm_vmi_mem_access(vcpu, fault_ipa, attempted);
-			idx = srcu_read_lock(&vcpu->kvm->srcu);
-
-			if (resp & KVM_VMI_RESPONSE_DENY) {
-				kvm_inject_dabt_with_fsc(vcpu, is_exec_fault,
-							 fault_ipa,
-							 ESR_ELx_FSC_PERM_L(3),
-							 is_write);
-				ret = 1;
-				goto out_unlock;
-			}
 			/*
-			 * CONTINUE: fall through and remap the leaf with the
-			 * view's current (clamped) perms. If access was not
-			 * widened it faults again - the agent's loop to break.
+			 * 16K/4K page fusion: this 4K sub-page shares a
+			 * stage-2 leaf with a protected page but is not the
+			 * access the agent wants. Retire it in the kernel with
+			 * no ring round-trip (autostep_retire single-steps a
+			 * normal access, atomic-steps an exclusive LDXR/STXR),
+			 * then fall through to map the leaf on view 0. An
+			 * exclusive that cannot be atomic-stepped returns false
+			 * and is delivered below, not single-stepped: a step
+			 * clears the exclusive monitor and would livelock.
 			 */
+			if (attempted != KVM_VMI_ACCESS_X &&
+			    (autostep & (1u << subpage)) &&
+			    kvm_vmi_autostep_retire(vcpu)) {
+				/* retired in-kernel; fall through to map on view 0 */
+			} else {
+				int resp;
+
+				srcu_read_unlock(&vcpu->kvm->srcu, idx);
+				resp = kvm_vmi_mem_access(vcpu, fault_ipa, attempted);
+				idx = srcu_read_lock(&vcpu->kvm->srcu);
+
+				if (resp & KVM_VMI_RESPONSE_DENY) {
+					kvm_inject_dabt_with_fsc(vcpu, is_exec_fault,
+								 fault_ipa,
+								 ESR_ELx_FSC_PERM_L(3),
+								 is_write);
+					ret = 1;
+					goto out_unlock;
+				}
+				/*
+				 * CONTINUE: fall through and remap the leaf
+				 * with the view's current (clamped) perms. If
+				 * access was not widened it faults again - the
+				 * agent's loop to break.
+				 */
+			}
 		}
 	}
 
