@@ -27,7 +27,25 @@
  * events start at KVM_VMI_ARCH_EVENT(0) and are added by their
  * implementing commits. KVM_VMI_NUM_EVENTS is one past the last.
  */
-#define KVM_VMI_NUM_EVENTS		KVM_VMI_ARCH_EVENT(0)
+/* arm64 arch-specific event IDs (start at KVM_VMI_ARCH_EVENT(0) == 8). */
+#define KVM_VMI_EVENT_SYSREG		KVM_VMI_ARCH_EVENT(0)	/* = 8 */
+
+/* One past the last defined arm64 event. */
+#define KVM_VMI_NUM_EVENTS		KVM_VMI_ARCH_EVENT(1)	/* = 9 */
+
+/*
+ * Identifiers for the monitorable EL1 VM system registers, the set routed
+ * through access_vm_reg() and trapped by HCR_EL2.TVM. Stable ABI: each value
+ * is explicit and never reordered. Used in
+ * kvm_vmi_control_event.arch.sysreg.reg and kvm_vmi_event_sysreg.reg.
+ */
+#define KVM_VMI_SYSREG_SCTLR_EL1	0
+#define KVM_VMI_SYSREG_TTBR0_EL1	1
+#define KVM_VMI_SYSREG_TTBR1_EL1	2
+#define KVM_VMI_SYSREG_TCR_EL1		3
+#define KVM_VMI_SYSREG_CONTEXTIDR_EL1	4
+#define KVM_VMI_SYSREG_MAIR_EL1		5
+#define KVM_VMI_NR_SYSREG_MONITORS	6
 
 /* kvm_vmi_inject_event.type */
 #define KVM_VMI_INJECT_SERROR	0	/* asynchronous virtual SError */
@@ -93,14 +111,35 @@ struct kvm_vmi_regs {
 };
 
 /*
+ * Per-event payloads for arch-specific events. Embedded by value in the
+ * generic struct kvm_vmi_ring_event; members are added by the
+ * sysreg-write and breakpoint commits.
+ */
+/* KVM_VMI_EVENT_SYSREG payload (delivered as ring_event.arch.sysreg). */
+struct kvm_vmi_event_sysreg {
+	__u32 reg;		/* KVM_VMI_SYSREG_* that was written */
+	__u32 pad;
+	__u64 old_value;	/* value before the (deferred) write */
+	__u64 new_value;	/* value the guest is writing (observe-only) */
+};
+
+/*
  * Per-event control parameters for arch-specific events. Embedded by
  * value in the generic struct kvm_vmi_control_event; members are added
  * by the system-register monitoring commit.
  */
 union kvm_vmi_arch_control_data {
+	struct {
+		__u8  reg;		/* KVM_VMI_SYSREG_* to monitor */
+		__u8  onchangeonly;	/* 1 = skip no-change writes */
+		__u8  pad[6];
+		__u64 bitmask;		/* 0 = any change fires; else fire iff
+					 * ((old ^ new) & bitmask) != 0 */
+	} sysreg;
 };
 
 union kvm_vmi_arch_event_data {
+	struct kvm_vmi_event_sysreg	sysreg;
 };
 
 #endif /* _UAPI_ASM_ARM64_KVM_VMI_H */
