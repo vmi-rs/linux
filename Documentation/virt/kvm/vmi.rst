@@ -816,8 +816,9 @@ KVM_VMI_EVENT_IO (14)
 =========================
 
 An alternate view is an independent guest-physical address space with its own
-per-frame access permissions and frame remapping. A view is a separate EPT root
-(with an EPTP value). A view starts empty and is populated lazily from the host
+per-frame access permissions and frame remapping. On x86 a view is a separate
+EPT root (with an EPTP value); on arm64 it is a private stage-2 translation
+(with its own VMID). A view starts empty and is populated lazily from the host
 mapping on first access.
 
 View 0 is the default host view and always exists. It cannot be created,
@@ -863,7 +864,7 @@ cannot be encoded), ``-EOPNOTSUPP`` (``PW`` requested without hardware support),
 :Parameters: ``struct kvm_vmi_view`` (``view_id`` IN)
 :Returns: 0 on success, < 0 on error
 
-Destroys a view and frees its EPT root. Errors: ``-EINVAL`` (no session,
+Destroys a view and frees its EPT/stage-2 root. Errors: ``-EINVAL`` (no session,
 or ``view_id`` 0), ``-ENOENT`` (unknown view), ``-EBUSY`` (a vCPU is currently
 on the view).
 
