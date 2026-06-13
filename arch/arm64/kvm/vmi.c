@@ -341,6 +341,24 @@ void kvm_vmi_clamp_view_prot(struct kvm_vcpu *vcpu, gfn_t gfn,
 }
 
 /*
+ * True if the active alt view has per-GFN access overrides, so the fault
+ * path must map at PTE granularity - otherwise a hugepage leaf would apply
+ * one gfn's access to the whole block and defeat per-GFN control. Views with
+ * only a uniform default_access (no overrides) can keep block mappings.
+ */
+bool kvm_vmi_view_force_pte(struct kvm_vcpu *vcpu)
+{
+	struct kvm_vcpu_vmi *vcpu_vmi = vcpu->vmi;
+	struct kvm_vmi_view_data *view;
+
+	if (!vcpu_vmi)
+		return false;
+	/* Fault path: the abort handler holds kvm->srcu (mmu.c). */
+	view = srcu_dereference(vcpu_vmi->current_view, &vcpu->kvm->srcu);
+	return view && !xa_empty(&view->access_overrides);
+}
+
+/*
  * Report whether the vCPU's active view denies @attempted (R/W/X bits) for
  * @gfn. Used by the abort handler to distinguish a real VMI access violation
  * from an ordinary stage-2 fault. View 0 never denies.
@@ -357,6 +375,73 @@ bool kvm_vmi_view_denies(struct kvm_vcpu *vcpu, gfn_t gfn, u8 attempted)
 	if (!view)
 		return false;
 	return (kvm_vmi_view_gfn_access(view, gfn) & attempted) != attempted;
+}
+
+/*
+ * Resolve a per-GFN remap (change_gfn) for the vCPU's active view. The generic
+ * core stores gfn_overrides[gfn] as the raw target HPA cast to a pointer; the
+ * fault path maps that HPA instead of the host PFN. View 0 (NULL current_view)
+ * never remaps.
+ *
+ * Return: true and *hpa set if @gfn is remapped in the active view.
+ */
+bool kvm_vmi_view_remap(struct kvm_vcpu *vcpu, gfn_t gfn, hpa_t *hpa)
+{
+	struct kvm_vcpu_vmi *vcpu_vmi = vcpu->vmi;
+	struct kvm_vmi_view_data *view;
+	void *entry;
+
+	if (!vcpu_vmi)
+		return false;
+	/* Fault path: the abort handler holds kvm->srcu (mmu.c). */
+	view = srcu_dereference(vcpu_vmi->current_view, &vcpu->kvm->srcu);
+	if (!view)
+		return false;
+	entry = xa_load(&view->gfn_overrides, gfn);
+	if (!entry)
+		return false;
+	*hpa = (hpa_t)(unsigned long)entry;
+	return true;
+}
+
+/*
+ * Stage-2 block size in host pages. At the 16K granule PMD_SIZE is 32 MB
+ * (PMD_SHIFT == 25), so a block spans PMD_SIZE >> PAGE_SHIFT host pages. Always
+ * derive from PMD_SIZE; never hardcode.
+ */
+#define VMI_BLOCK_PAGES		(PMD_SIZE >> PAGE_SHIFT)
+
+/*
+ * True if the fault for @gfn must be mapped at PTE (page) granularity in the
+ * active view. Two reasons: (1) the view has per-GFN access overrides
+ * (preserved via kvm_vmi_view_force_pte); or (2) @gfn is itself
+ * remapped, or a remapped GFN shares its 32 MB PMD block - a block leaf would
+ * otherwise map the remapped GFN with the original (non-override) HPA.
+ */
+bool kvm_vmi_view_force_pte_gfn(struct kvm_vcpu *vcpu, gfn_t gfn)
+{
+	struct kvm_vcpu_vmi *vcpu_vmi = vcpu->vmi;
+	struct kvm_vmi_view_data *view;
+	gfn_t block_start, block_end;
+	unsigned long idx;
+	void *entry;
+
+	if (kvm_vmi_view_force_pte(vcpu))	/* access overrides */
+		return true;
+	if (!vcpu_vmi)
+		return false;
+	/* Fault path: the abort handler holds kvm->srcu (mmu.c). */
+	view = srcu_dereference(vcpu_vmi->current_view, &vcpu->kvm->srcu);
+	if (!view)
+		return false;
+	if (xa_load(&view->gfn_overrides, gfn))
+		return true;
+	block_start = ALIGN_DOWN(gfn, VMI_BLOCK_PAGES);
+	block_end = block_start + VMI_BLOCK_PAGES;
+	xa_for_each_range(&view->gfn_overrides, idx, entry,
+			  block_start, block_end - 1)
+		return true;
+	return false;
 }
 
 /*

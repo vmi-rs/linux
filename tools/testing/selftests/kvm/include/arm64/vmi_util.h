@@ -62,6 +62,8 @@ void vmi_set_mem_access(int vmi_fd, uint32_t view_id, uint64_t gfn,
 			uint8_t access);
 void vmi_change_gfn(int vmi_fd, uint32_t view_id, uint64_t old_gfn,
 		    uint64_t new_gfn);
+int __vmi_change_gfn_err(int vmi_fd, uint32_t view_id, uint64_t old_gfn,
+			 uint64_t new_gfn);
 uint64_t vmi_alloc_gfn(int vmi_fd);
 void vmi_free_gfn(int vmi_fd, uint64_t gfn);
 void vmi_pause_vm(int vmi_fd);
