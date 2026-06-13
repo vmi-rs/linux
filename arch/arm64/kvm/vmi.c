@@ -187,17 +187,136 @@ void kvm_arch_vmi_invalidate_gfn_revert(struct kvm *kvm,
 {
 }
 
-void kvm_vmi_capture_regs(struct kvm_vcpu *vcpu, struct kvm_vmi_regs *regs)
+/*
+ * kvm_vmi_event_enabled - true if @event_type can be delivered on @vcpu.
+ *
+ * Requires session VMI state, the event enabled in the session bitmap,
+ * and a ring set up on this vCPU. Mirrors the x86 helper; all fields are
+ * generic.
+ */
+static bool kvm_vmi_event_enabled(struct kvm_vcpu *vcpu, u32 event_type)
 {
+	struct kvm_vmi *vmi;
+	bool enabled;
+	int srcu_idx;
+
+	/* Run-loop fast path; arm64 holds no kvm->srcu here (unlike x86 whose run loop holds it across guest execution). */
+	srcu_idx = srcu_read_lock(&vcpu->kvm->srcu);
+	vmi = kvm_vmi_get(vcpu->kvm);
+	enabled = vmi && (vmi->enabled_events & BIT_ULL(event_type)) &&
+		  vcpu->vmi && vcpu->vmi->ring;
+	srcu_read_unlock(&vcpu->kvm->srcu, srcu_idx);
+
+	return enabled;
 }
 
+/**
+ * kvm_vmi_hypercall - Deliver a HYPERCALL event for a trapped guest HVC.
+ * @vcpu: The vCPU that executed HVC.
+ *
+ * Captures the register snapshot (x0..x7 carry the SMCCC function id and
+ * arguments) plus the HVC immediate, delivers via the ring, and blocks
+ * until the agent acks. Uses the deferred pattern: return 0 so the caller
+ * runs the normal SMCCC dispatch, unless the agent responded DENY or
+ * SET_REGS, in which case return 1 so the caller skips dispatch.
+ *
+ * The HVC exception return address is already past the instruction, so no
+ * PC advance is needed on any response.
+ *
+ * Return: 1 if the caller should skip SMCCC dispatch, 0 otherwise.
+ */
+int kvm_vmi_hypercall(struct kvm_vcpu *vcpu)
+{
+	struct kvm_vmi_ring_event ring_event = {};
+	int ret;
+
+	if (!kvm_vmi_event_enabled(vcpu, KVM_VMI_EVENT_HYPERCALL))
+		return 0;
+
+	ring_event.type = KVM_VMI_EVENT_HYPERCALL;
+	ring_event.vcpu_id = vcpu->vcpu_id;
+	ring_event.insn_len = 4;	/* HVC is a 4-byte instruction */
+	ring_event.hypercall.imm = kvm_vcpu_hvc_get_imm(vcpu);
+
+	trace_kvm_vmi_event_deliver(vcpu->vcpu_id, KVM_VMI_EVENT_HYPERCALL, 0);
+	ret = kvm_vmi_deliver_via_ring(vcpu, &ring_event);
+
+	return (ret > 0 && (ret & (KVM_VMI_RESPONSE_DENY |
+				   KVM_VMI_RESPONSE_SET_REGS))) ? 1 : 0;
+}
+
+/**
+ * kvm_vmi_capture_regs - Copy vCPU register state into a ring event
+ * @vcpu: The vCPU whose registers to capture.
+ * @regs: Destination register snapshot in the ring event.
+ *
+ * Provides the agent with a full register capture without needing vCPU
+ * ioctls (which require the vcpu mutex held by the blocked vCPU). System
+ * registers are read with vcpu_read_sys_reg() rather than the raw
+ * __vcpu_sys_reg()/ctxt_sys_reg() because under VHE/NV they may be live
+ * on-CPU or VNCR-backed.
+ */
+void kvm_vmi_capture_regs(struct kvm_vcpu *vcpu, struct kvm_vmi_regs *regs)
+{
+	int i;
+
+	/* GP registers, stack, PC, processor state */
+	for (i = 0; i < 31; i++)
+		regs->regs[i] = vcpu_gp_regs(vcpu)->regs[i];
+	regs->sp_el0 = vcpu_gp_regs(vcpu)->sp;
+	regs->pc = *vcpu_pc(vcpu);
+	regs->pstate = *vcpu_cpsr(vcpu);
+
+	/*
+	 * System registers - vcpu_read_sys_reg(), not the raw
+	 * __vcpu_sys_reg()/ctxt_sys_reg(): under VHE/NV these may be live
+	 * on-CPU or VNCR-backed, and the raw accessor would read stale memory.
+	 */
+	regs->sp_el1        = vcpu_read_sys_reg(vcpu, SP_EL1);
+	regs->ttbr0_el1     = vcpu_read_sys_reg(vcpu, TTBR0_EL1);
+	regs->ttbr1_el1     = vcpu_read_sys_reg(vcpu, TTBR1_EL1);
+	regs->tcr_el1       = vcpu_read_sys_reg(vcpu, TCR_EL1);
+	regs->sctlr_el1     = vcpu_read_sys_reg(vcpu, SCTLR_EL1);
+	regs->mair_el1      = vcpu_read_sys_reg(vcpu, MAIR_EL1);
+	regs->vbar_el1      = vcpu_read_sys_reg(vcpu, VBAR_EL1);
+	regs->contextidr_el1 = vcpu_read_sys_reg(vcpu, CONTEXTIDR_EL1);
+	regs->elr_el1       = vcpu_read_sys_reg(vcpu, ELR_EL1);
+	regs->spsr_el1      = vcpu_read_sys_reg(vcpu, SPSR_EL1);
+	regs->esr_el1       = vcpu_read_sys_reg(vcpu, ESR_EL1);
+	regs->far_el1       = vcpu_read_sys_reg(vcpu, FAR_EL1);
+	regs->tpidr_el0     = vcpu_read_sys_reg(vcpu, TPIDR_EL0);
+	regs->tpidr_el1     = vcpu_read_sys_reg(vcpu, TPIDR_EL1);
+	regs->tpidrro_el0   = vcpu_read_sys_reg(vcpu, TPIDRRO_EL0);
+}
+
+/**
+ * kvm_vmi_restore_regs - Copy registers from a ring event back to the vCPU
+ * @vcpu: The vCPU whose registers to update.
+ * @regs: Source register snapshot from the ring event.
+ *
+ * Only general-purpose registers, SP_EL0, PC, and PSTATE are restored.
+ * System registers (translation, exception, thread regs) are deliberately
+ * not written back here: modifying them without validation could crash the
+ * host. The agent uses KVM_SET_ONE_REG for those if needed.
+ */
 void kvm_vmi_restore_regs(struct kvm_vcpu *vcpu, struct kvm_vmi_regs *regs)
 {
+	int i;
+
+	for (i = 0; i < 31; i++)
+		vcpu_gp_regs(vcpu)->regs[i] = regs->regs[i];
+	vcpu_gp_regs(vcpu)->sp = regs->sp_el0;
+	*vcpu_pc(vcpu) = regs->pc;
+	*vcpu_cpsr(vcpu) = regs->pstate;
 }
 
 void kvm_vmi_handle_event_response(struct kvm_vcpu *vcpu, u32 event_type,
 				   u32 resp)
 {
+	switch (event_type) {
+	default:
+		break;
+	}
 }
 
 int kvm_vmi_inject_event(struct kvm_vcpu *vcpu,
