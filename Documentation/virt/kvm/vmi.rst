@@ -1142,9 +1142,13 @@ Pause/unpause a single vCPU with the same refcount semantics. Errors:
 :Parameters: ``struct kvm_vmi_inject_event`` (architecture specific)
 :Returns: 0 on success, < 0 on error
 
-Injects an event into a guest vCPU. The ioctl resolves the target by
+Injects an event into a guest vCPU. The injection model and the structure are
+**entirely different per architecture**. The ioctl resolves the target by
 ``vcpu_id`` (``-EINVAL`` if unknown or without VMI state). Requires
 ``KVM_CAP_VMI_INJECT``.
+
+10.1 x86 injection
+------------------
 
 ::
 
@@ -1193,3 +1197,35 @@ Injects an event into a guest vCPU. The ioctl resolves the target by
 
 A non-zero ``pad`` or an out-of-range type/vector/insn_len/has_error returns
 ``-EINVAL``.
+
+10.2 arm64 injection
+--------------------
+
+::
+
+    struct kvm_vmi_inject_event {
+        __u32 vcpu_id;
+        __u32 type;       /* KVM_VMI_INJECT_SERROR / KVM_VMI_INJECT_ABORT */
+        __u64 addr;       /* faulting VA -> FAR_EL1 (FAR_EL2 for NV at EL2) */
+        __u64 esr;        /* ISS/syndrome, valid iff has_esr (requires RAS) */
+        __u8  iabt;       /* 1 = instruction abort, 0 = data abort */
+        __u8  has_esr;
+        __u8  fsc;        /* fault status code (ESR_ELx_FSC_*) */
+        __u8  write;      /* data-abort WnR: 1 = write fault */
+        __u8  pad[4];     /* must be 0 */
+    };
+
+Two injection types:
+
+- ``KVM_VMI_INJECT_SERROR`` (0): asynchronous virtual SError. The abort-only
+  fields (``addr``/``iabt``/``fsc``/``write``) must be 0. If ``has_esr`` is set,
+  the host must have the RAS extension and ``esr`` must fit the ISS field; the
+  SError then carries that syndrome. Otherwise a plain virtual SError is pended.
+- ``KVM_VMI_INJECT_ABORT`` (1): synchronous abort to EL1. ``has_esr``/``esr``
+  must be 0; ``iabt`` and ``write`` are mutually exclusive (WnR is data-abort
+  only); ``fsc`` must be an acceptable fault class (translation/permission/
+  access-flag fault, external abort, or SEA on a table walk). ``addr`` is
+  written to ``FAR_EL1`` (or ``FAR_EL2`` for an NV guest running at EL2).
+
+An unknown ``type`` or non-zero ``pad`` returns ``-EINVAL``; invalid
+field combinations or a missing RAS extension return ``-EINVAL``.
